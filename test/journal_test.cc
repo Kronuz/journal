@@ -21,7 +21,7 @@
  */
 
 #include "journal/journal.h"
-#include "journal/posix.h"
+#include "completion/posix.h"
 #include "journal/store.h"
 #include <set>
 #include <algorithm>

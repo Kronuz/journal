@@ -23,7 +23,7 @@
 #pragma once
 
 #include "codec.h"
-#include "io.h"
+#include "completion/io.h"
 #include <array>
 #include <random>
 

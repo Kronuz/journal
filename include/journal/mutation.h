@@ -23,7 +23,8 @@
 #pragma once
 
 #include "artifact.h"
-#include "operation.h"
+#include "primitives.h"
+#include "completion/operation.h"
 #include <exception>
 #include <vector>
 

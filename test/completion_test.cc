@@ -20,7 +20,7 @@
  * THE SOFTWARE.
  */
 
-#include "journal/native_completion.h"
+#include "completion/native_completion.h"
 #include "journal/journal.h"
 #include "journal/store.h"
 #include <algorithm>

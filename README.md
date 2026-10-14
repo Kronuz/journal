@@ -1,6 +1,6 @@
 # Durable opaque batches
 
-`kronuz::journal::Journal` appends bounded opaque storage batches and publishes a checksummed durable frontier. It has no Raft, reactor, socket, or application-state dependency. This module is additive to the legacy cluster API and can later move into `Kronuz/storage` without moving consensus policy with it.
+`journal::journal::Journal` appends bounded opaque storage batches and publishes a checksummed durable frontier. It has no Raft, reactor, socket, or application-state dependency. This module is additive to the legacy cluster API and can later move into `Kronuz/storage` without moving consensus policy with it.
 
 ```sh
 cmake -S journal -B .scratch/journal -DCMAKE_BUILD_TYPE=Release

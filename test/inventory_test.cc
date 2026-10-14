@@ -21,7 +21,7 @@
  */
 
 #include "journal/inventory.h"
-#include "journal/posix.h"
+#include "completion/posix.h"
 #include <filesystem>
 #include <iostream>
 #include <vector>

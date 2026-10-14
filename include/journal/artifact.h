@@ -22,7 +22,8 @@
 
 #pragma once
 
-#include "operation.h"
+#include "primitives.h"
+#include "completion/operation.h"
 #include <algorithm>
 #include <limits>
 #include <memory>

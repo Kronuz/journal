@@ -20,7 +20,7 @@
  * THE SOFTWARE.
  */
 
-#include "journal/linux_completion.h"
+#include "completion/linux_completion.h"
 #include <filesystem>
 #include <iostream>
 #include <sys/wait.h>

@@ -20,8 +20,8 @@
  * THE SOFTWARE.
  */
 
-#include "journal.h"
-#include "linux_completion.h"
+#include "journal/journal.h"
+#include "completion/linux_completion.h"
 #include <algorithm>
 #include <charconv>
 #include <ctime>

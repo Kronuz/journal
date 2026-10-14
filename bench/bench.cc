@@ -20,8 +20,8 @@
  * THE SOFTWARE.
  */
 
-#include "journal.h"
-#include "posix.h"
+#include "journal/journal.h"
+#include "completion/posix.h"
 #include <algorithm>
 #include <chrono>
 #include <filesystem>

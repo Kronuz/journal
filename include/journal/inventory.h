@@ -22,7 +22,7 @@
 
 #pragma once
 
-#include "io.h"
+#include "completion/io.h"
 #include <limits>
 
 namespace kronuz::journal {
