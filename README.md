@@ -1,11 +1,11 @@
 # Durable opaque batches
 
-`journal::journal::Journal` appends bounded opaque storage batches and publishes a checksummed durable frontier. It has no Raft, reactor, socket, or application-state dependency. This module is additive to the legacy cluster API and can later move into `Kronuz/storage` without moving consensus policy with it.
+`kronuz::journal::Journal` appends bounded opaque storage batches and publishes a checksummed durable frontier. It has no Raft, reactor, socket, or application-state dependency. This module is additive to the legacy cluster API and can later move into `Kronuz/storage` without moving consensus policy with it.
 
 ```sh
-cmake -S journal -B .scratch/journal -DCMAKE_BUILD_TYPE=Release
-cmake --build .scratch/journal -j4
-ctest --test-dir .scratch/journal --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
 ```
 
 ## Contract
@@ -130,7 +130,7 @@ The injected filesystem tests track visible and durable file contents separately
 | 32 | 8,192 | 4.020624 | 0.076460 | 509.373713 | 62.886624 | 65.350456 |
 | 256 | 65,536 | 4.021802 | 0.090530 | 4,073.795345 | 62.942453 | 64.144920 |
 
-This measures durability-barrier amortization, with no transaction encoding, replication, networking, or application execution. The maximum of 64 samples is the reported empirical p99; it cannot characterize a production tail. CPU time is measured using `getrusage`, and no hosting-price or power measurement is available to convert it into cost. The standalone demo occupies 44,544 bytes on disk; the benchmark occupies 42,248 bytes. These executable sizes are not incremental daemon footprint measurements. Run `.scratch/journal/journal_bench` from the repository root to reproduce the workload; it creates and removes dedicated directories under `.scratch/`.
+This measures durability-barrier amortization, with no transaction encoding, replication, networking, or application execution. The maximum of 64 samples is the reported empirical p99; it cannot characterize a production tail. CPU time is measured using `getrusage`, and no hosting-price or power measurement is available to convert it into cost. The standalone demo occupies 44,544 bytes on disk; the benchmark occupies 42,248 bytes. These executable sizes are not incremental daemon footprint measurements. Run `build/journal_bench` from the repository root to reproduce the workload; it creates and removes dedicated directories under `.scratch/`.
 
 ## Checkpoint pause measurement
 
@@ -141,7 +141,7 @@ The initial `checkpoint_bench` separately measured preparing two opaque artifact
 | 1,048,576 | 1,048,576 | 0.054763 | 0.010354 | 0.069765 | 0.007462 |
 | 67,108,864 | 67,108,864 | 0.470017 | 0.361971 | 0.385382 | 0.321468 |
 
-At revision `b497af6`, publication included rereading and validating both artifacts before the durable generation cutover. The approximately 385 ms sample for 128 MiB of artifacts is a material pause when setting election deadlines; it is not a tail bound. These opaque bytes do not represent a measured Detent key corpus or actual suffix encoder. Run `.scratch/journal/checkpoint_bench` from the repository root; initialization is excluded, and the workload removes only its own dedicated scratch directories. No cost or power conversion is available.
+At revision `b497af6`, publication included rereading and validating both artifacts before the durable generation cutover. The approximately 385 ms sample for 128 MiB of artifacts is a material pause when setting election deadlines; it is not a tail bound. These opaque bytes do not represent a measured Detent key corpus or actual suffix encoder. Run `build/journal_checkpoint_bench` from the repository root; initialization is excluded, and the workload removes only its own dedicated scratch directories. No cost or power conversion is available.
 
 The version 2 Release demo occupies 57,008 bytes, versus 44,544 bytes for the initial version 1 build (+12,464 bytes). The append benchmark occupies 49,032 bytes versus 42,248 (+6,784 bytes); the new checkpoint benchmark occupies 64,448 bytes. These are standalone executable file sizes from the same local toolchain, not measured runtime memory or integrated daemon footprint.
 
@@ -163,7 +163,7 @@ For the 128 MiB case, the single local publication sample fell from 385 ms to 64
 | 1,048,576 | 4,194,843 | 2,097,460 | 2,097,383 | 4 | 0.021816 | 0.001311 |
 | 67,108,864 | 268,435,995 | 134,218,036 | 134,217,959 | 4 | 0.030882 | 0.010203 |
 
-The obsolete payloads are intentionally not read; ownership headers establish eligibility. These results at revision `d93d88e` measure a nine-file directory and its deletion barrier, not large-directory throughput, physical space recovery, or production tails. Run `.scratch/journal/reclaim_bench` from the repository root. Fixture creation is excluded, and only each workload's own scratch directory is removed afterward.
+The obsolete payloads are intentionally not read; ownership headers establish eligibility. These results at revision `d93d88e` measure a nine-file directory and its deletion barrier, not large-directory throughput, physical space recovery, or production tails. Run `build/journal_reclaim_bench` from the repository root. Fixture creation is excluded, and only each workload's own scratch directory is removed afterward.
 
 ## Durable staging ownership measurement
 
@@ -211,7 +211,7 @@ The optional `asio_completion.h` adapter retains its driver and operation across
 
 The real-file fixture writes a 150,000-byte batch using five native writes and five fallback primitives, then recovers an append completed after its facade and original caller disappear. The Asio fixture holds a completion for 100 ms while the owner services timers and UDP loopback traffic, verifies no early frontier publication, and emits cancellation while persistence continues. Both native and ASan/UBSan tests pass on the Intel Mac. All ten root cluster CTests and all 30 Detent CTests pass after integration. Standalone Release fixture executables occupy 125,000 bytes (backend) and 426,592 bytes (Asio); these include their test programs and do not measure incremental daemon footprint or resident memory. The existing service Worker still runs synchronous storage; backend qualification alone does not establish an asynchronous authority service.
 
-Link `cluster::journal_completion` for native backend use. The journal's standalone build still fetches no Asio or reactor dependency; the Asio fixture is built only in the root cluster build. Run `ctest --test-dir .scratch/build -R 'cluster_completion' --output-on-failure` for both backend and coroutine checks.
+Link `journal::journal`; the native completion backends come with `completion`. The journal fetches no Asio or reactor; the Asio fixture lives in `consensus`. Run `ctest --test-dir build -R journal_completion --output-on-failure` for the backend checks.
 
 ### Completion-driven Store appends
 
