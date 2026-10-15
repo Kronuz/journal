@@ -1,5 +1,7 @@
 # Durable opaque batches
 
+[![CI](https://github.com/Kronuz/journal/actions/workflows/ci.yml/badge.svg)](https://github.com/Kronuz/journal/actions/workflows/ci.yml)
+
 `kronuz::journal::Journal` appends bounded opaque storage batches and publishes a checksummed durable frontier. It has no Raft, reactor, socket, or application-state dependency. This module is additive to the legacy cluster API and can later move into `Kronuz/storage` without moving consensus policy with it.
 
 ```sh
