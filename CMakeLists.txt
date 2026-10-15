@@ -22,6 +22,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME journal_${t} COMMAND journal_${t}_test)
 		set_tests_properties(journal_${t} PROPERTIES TIMEOUT 30)
 	endforeach()
+	set_tests_properties(journal_turn_log PROPERTIES TIMEOUT 120)  # a full flush per turn on macOS
 	if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD" OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		add_executable(journal_completion_test test/completion_test.cc)
 		target_link_libraries(journal_completion_test PRIVATE journal::journal)

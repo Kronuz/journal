@@ -184,10 +184,45 @@ void stale_bytes() {
 	j::TurnLog log(io, identity, recovered, small);
 	check(!recovered.damaged && recovered.groups == model, "a recycled file's earlier bytes are not current");
 }
+
+// Groups that checkpoint let their segments go; an idle group's record moves forward
+// instead of pinning the oldest segment; reopening after reclamation reads the same state.
+void reclamation(std::uint64_t seed) {
+	Directory directory("reclaim"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	j::TurnRecovery recovered; Model model; std::mt19937_64 random(seed);
+	j::TurnLogOptions options = small; options.retain_segments = 3; options.forward_bytes = 600;
+	auto run = [&](j::TurnLog& log, unsigned turns) {
+		for (unsigned t = 0; t < turns; ++t) {
+			std::vector<j::TurnRecord> batch;
+			auto group = random() % 4 + 1; auto sequence = log.sequence(group) + 1;
+			auto kind = random() % 5 == 0 ? j::TurnRecordKind::Checkpoint : j::TurnRecordKind::Batch;
+			batch.push_back(record(group, sequence, random() % 400 + 1, kind));
+			log.append(batch);
+			if (kind == j::TurnRecordKind::Checkpoint) { model[group].clear(); }
+			model[group].push_back(batch.back());
+		}
+	};
+	{
+		j::TurnLog log(io, identity, recovered, options);
+		log.append(std::vector{record(9, 1, 100)}); model[9].push_back(record(9, 1, 100));  // never writes again
+		run(log, 150);
+		check(log.data_segments().size() <= options.retain_segments + 1, "segments stay within the retention bound");
+		check(*log.data_segments().begin() > 1 && log.stats().forwarded_records > 0, "the idle group's record moved forward and the first segment went");
+		check(log.stats().segments_recycled > 0, "released segments are recycled into the spare pool");
+	}
+	for (unsigned round = 0; round < 3; ++round) {
+		j::TurnLog log(io, identity, recovered, options);
+		check(!recovered.damaged && recovered.lost.empty() && recovered.groups == model, "reopening after reclamation reads every group's live records");
+		run(log, 60);
+	}
+	std::size_t files = 0;
+	for (auto& entry : std::filesystem::directory_iterator(directory.path)) { files += j::turn_log_detail::segment_number(entry.path().filename().string()).has_value(); }
+	check(files <= options.retain_segments + 1 + options.spare_segments + 1, "segment files stay bounded across reopenings");
+}
 }  // namespace
 
 int main() {
-	try { round_trip(); torn_tail(); damage(); checkpoints_and_guards(); stale_bytes(); }
+	try { round_trip(); torn_tail(); damage(); checkpoints_and_guards(); stale_bytes(); for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " turn log checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
