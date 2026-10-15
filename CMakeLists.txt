@@ -16,7 +16,7 @@ add_library(journal::journal ALIAS journal)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
-	foreach(t journal inventory admission)
+	foreach(t journal inventory admission turn_log)
 		add_executable(journal_${t}_test test/${t}_test.cc)
 		target_link_libraries(journal_${t}_test PRIVATE journal::journal)
 		add_test(NAME journal_${t} COMMAND journal_${t}_test)
