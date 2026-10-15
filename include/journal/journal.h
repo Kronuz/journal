@@ -707,6 +707,8 @@ private:
 		return result;
 	}
 	static Frontier decode_manifest(std::string_view bytes) {
+		// The decoder checks its own length: a shared group's record reaches it unchecked.
+		if (bytes.size() != manifest_size && (bytes.size() < manifest_v2_size || bytes.size() > maximum_manifest_size)) { throw Corruption("invalid manifest size"); }
 		if (crc32c(bytes.substr(0, bytes.size() - 4)) != checksum_at_end(bytes)) { throw Corruption("manifest checksum mismatch"); }
 		auto length = bytes.size(); auto magic = get64(bytes);
 		if ((magic != manifest_magic && magic != manifest_v2_magic) ||
