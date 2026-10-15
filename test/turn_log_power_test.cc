@@ -25,6 +25,7 @@
 // namespace changes persist only after a directory sync. Power is cut after every I/O
 // operation of each run, and at every third point again during the recovery that follows.
 // Segments recycle, so stale blocks from an earlier use are present (condition 10).
+#include "journal/memory_io.h"
 #include "journal/turn_log.h"
 #include <cstdlib>
 #include <iostream>
@@ -40,107 +41,7 @@ void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
 }
-struct PowerLoss {};
-constexpr std::size_t sector = 512;
-
-// Inodes hold durable bytes and pending sector writes; names map to inodes, with the
-// durable namespace changing only at sync_directory.
-struct Disk {
-	struct Inode { std::string durable; std::map<std::uint64_t, std::string> pending; std::uint64_t size = 0; };
-	std::map<std::uint64_t, Inode> inodes; std::map<std::string, std::uint64_t> names, durable_names;
-	std::uint64_t next_inode = 1, operations = 0, cut = std::numeric_limits<std::uint64_t>::max();
-	std::mt19937_64 random{0};
-	void tick() { if (++operations == cut) { throw PowerLoss{}; } }
-	std::string content(const Inode& inode) const {
-		std::string bytes = inode.durable; bytes.resize(inode.size, '\0');
-		for (const auto& [s, data] : inode.pending) {
-			const std::size_t at = static_cast<std::size_t>(s) * sector;
-			if (at < bytes.size()) { auto count = std::min(sector, bytes.size() - at); bytes.replace(at, count, data.substr(0, count)); }
-		}
-		return bytes;
-	}
-	// The state after power loss: the durable namespace, and each pending sector kept or not.
-	void power_loss() {
-		std::map<std::uint64_t, Inode> survived;
-		for (const auto& [name, id] : durable_names) {
-			auto& inode = inodes.at(id); auto& after = survived[id];
-			after.durable = inode.durable; after.size = std::max<std::uint64_t>(inode.durable.size(), 0);
-			for (const auto& [s, data] : inode.pending) {
-				if (random() % 2) { continue; }
-				auto end = s * sector + data.size();
-				if (after.durable.size() < end) { after.durable.resize(end, '\0'); }
-				after.durable.replace(s * sector, data.size(), data);
-			}
-			after.size = after.durable.size();
-		}
-		inodes = std::move(survived); names = durable_names;
-		cut = std::numeric_limits<std::uint64_t>::max();
-	}
-};
-
-class MemoryFile final : public j::File {
-public:
-	MemoryFile(Disk& disk, std::uint64_t inode) : disk_(disk), inode_(inode) {}
-	std::uint64_t size() override { return node().size; }
-	std::size_t read_at(std::uint64_t offset, std::span<char> bytes) override {
-		auto content = disk_.content(node());
-		if (offset >= content.size()) { return 0; }
-		auto count = std::min<std::size_t>(bytes.size(), content.size() - offset);
-		std::copy_n(content.data() + offset, count, bytes.data()); return count;
-	}
-	std::size_t write_at(std::uint64_t offset, std::string_view bytes) override {
-		disk_.tick();
-		auto& inode = node(); auto content = disk_.content(inode);
-		if (content.size() < offset + bytes.size()) { content.resize(offset + bytes.size(), '\0'); }
-		content.replace(offset, bytes.size(), bytes);
-		inode.size = content.size();
-		for (auto s = offset / sector; s * sector < offset + bytes.size(); ++s) { inode.pending[s] = content.substr(s * sector, sector); }
-		return bytes.size();
-	}
-	void truncate(std::uint64_t size) override { disk_.tick(); sync(); node().durable.resize(size, '\0'); node().size = size; }
-	void sync() override {
-		disk_.tick();
-		auto& inode = node(); inode.durable = disk_.content(inode); inode.pending.clear();
-	}
-private:
-	Disk::Inode& node() { return disk_.inodes.at(inode_); }
-	Disk& disk_; std::uint64_t inode_;
-};
-class MemoryCursor final : public j::DirectoryCursor {
-public:
-	explicit MemoryCursor(std::vector<std::string> names) : names_(std::move(names)) {}
-	std::optional<std::string> next() override { if (at_ == names_.size()) { return std::nullopt; } return names_[at_++]; }
-private:
-	std::vector<std::string> names_; std::size_t at_ = 0;
-};
-class MemoryIO final : public j::IO {
-public:
-	explicit MemoryIO(Disk& disk) : disk_(disk) {}
-	std::unique_ptr<j::OwnerLock> acquire_owner(bool) override { return std::make_unique<j::OwnerLock>(); }
-	std::unique_ptr<j::File> open_existing(std::string_view name) override {
-		auto found = disk_.names.find(std::string(name));
-		if (found == disk_.names.end()) { throw std::runtime_error("no such file"); }
-		return std::make_unique<MemoryFile>(disk_, found->second);
-	}
-	std::unique_ptr<j::File> create_exclusive(std::string_view name) override {
-		disk_.tick();
-		if (disk_.names.contains(std::string(name))) { throw std::runtime_error("file exists"); }
-		auto id = disk_.next_inode++; disk_.inodes[id]; disk_.names[std::string(name)] = id;
-		return std::make_unique<MemoryFile>(disk_, id);
-	}
-	void replace(std::string_view source, std::string_view destination) override {
-		disk_.tick();
-		auto id = disk_.names.at(std::string(source)); disk_.names.erase(std::string(source)); disk_.names[std::string(destination)] = id;
-	}
-	void remove(std::string_view name) override { disk_.tick(); disk_.names.erase(std::string(name)); }
-	std::unique_ptr<j::DirectoryCursor> scan_directory() override {
-		std::vector<std::string> names; for (const auto& [name, _] : disk_.names) { names.push_back(name); }
-		return std::make_unique<MemoryCursor>(std::move(names));
-	}
-	void sync_directory() override { disk_.tick(); disk_.durable_names = disk_.names; }
-private:
-	Disk& disk_;
-};
+using namespace j::testing;
 
 const j::Identity identity{'P', 'O', 'W', 'E', 'R'};
 using Model = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
