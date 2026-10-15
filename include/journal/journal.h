@@ -26,6 +26,7 @@
 #include "mutation.h"
 #include "resources.h"
 #include "reclamation.h"
+#include "turn_driver.h"
 #include <array>
 #include <limits>
 #include <random>
@@ -98,6 +99,29 @@ public:
 		: Journal(owned_io(io), maximum_batch, maximum_artifact) {
 		io_lifetime_ = std::move(io); owner_->io_lifetime = io_lifetime_;
 	}
+	// The shared backend: the group's batches and checkpoint records live in a core's turn
+	// log (D11); its directory holds only the owner lock and the artifacts.
+	Journal(std::shared_ptr<IO> io, TurnDriver& turns, std::uint64_t group, std::size_t maximum_batch = 64u * 1024 * 1024,
+		std::uint64_t maximum_artifact = 512ull * 1024 * 1024)
+		: Journal(std::move(io), maximum_batch, maximum_artifact) {
+		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
+		turns_ = &turns; group_ = group;
+	}
+	bool shared() const noexcept { return turns_ != nullptr; }
+	bool migrating() const noexcept { return migrating_; }
+	// What a group directory holds: nothing yet, a per-group journal, or a shared group
+	// (the turn log is authoritative once `journal.shared` exists, R20).
+	enum class Layout { Empty, Legacy, Shared };
+	static Layout layout(IO& io) {
+		bool legacy = false;
+		auto cursor = io.scan_directory();
+		while (auto name = cursor->next()) {
+			if (*name == shared_name) { return Layout::Shared; }
+			legacy |= *name == manifest_name;
+		}
+		return legacy ? Layout::Legacy : Layout::Empty;
+	}
+	std::uint64_t group() const noexcept { return group_; }
 	bool fenced() const noexcept { return owner_->failed; }
 	bool mutation_pending() const noexcept { return owner_->mutation_active; }
 	// Trusted owning host: uncertainty outside a Journal method must fence
@@ -118,6 +142,9 @@ public:
 	MutationPlan append_plan(std::size_t payload_bound) const {
 		available();
 		if (payload_bound > maximum_batch_) { throw std::length_error("journal batch exceeds configured bound"); }
+		// The turn log, not the group's directory, holds a shared group's batches: the
+		// reservation covers the staged record until its barrier, and nothing is added.
+		if (shared()) { return {{std::uint64_t(payload_bound) + 1, 0}, {}, {}}; }
 		auto plan = append_footprint(payload_bound);
 		auto growth = plan.added.logical_bytes;
 		if (frontier_.sequence == std::numeric_limits<std::uint64_t>::max() || frontier_.offset > maximum_offset - growth) {
@@ -141,6 +168,11 @@ public:
 		}
 		Frontier target = frontier_; target.version = 2; target.checkpoint = ArtifactDescriptor{};
 		target.dependencies.assign(payload_bounds.size() - 1, ArtifactDescriptor{});
+		if (shared()) {
+			StorageResources artifacts;
+			for (auto bound : payload_bounds) { artifacts = detail::resources_add(artifacts, artifact_footprint(bound)); }
+			return {artifacts, artifacts, {}};
+		}
 		StorageResources added{std::uint64_t(file_header_v2_size) + encode_manifest(target).size(), 2};
 		for (auto bound : payload_bounds) { added = detail::resources_add(added, artifact_footprint(bound)); }
 		return {added, added, {encode_manifest(frontier_).size(), 1}};
@@ -200,8 +232,47 @@ public:
 		auto result = operation->result(); reclaim_cursor_ = operation->cursor_; operation->settled(); reclaim_job_.reset(); return result;
 	}
 
+	// R20: moves this directory's per-group journal into the turn log. Stages the group's
+	// checkpoint record (the old frontier at its base) and its retained batches; once a
+	// turn has made them durable, finish_migration() makes the turn log authoritative.
+	// Artifacts stay where they are. A crash before that leaves the old journal
+	// authoritative, and migrating again supersedes the earlier records. replay and restore
+	// see the old journal's state as recover's would.
+	template <class Replay, class Restore>
+	Frontier migrate(Replay&& replay, Restore&& restore) {
+		unused();
+		if (!shared()) { throw std::logic_error("migration needs a shared journal"); }
+		std::vector<std::string> batches;
+		Frontier legacy;
+		{
+			Journal old(owned_backend(), maximum_batch_, maximum_artifact_);
+			legacy = old.recover([&](std::uint64_t sequence, std::string_view bytes) { replay(sequence, bytes); batches.emplace_back(bytes); },
+				[&](const Frontier& frontier, ArtifactReader& checkpoint, std::span<ArtifactReader> dependencies) { restore(frontier, checkpoint, dependencies); });
+		}
+		try {
+			owner_->lock = io_.acquire_owner(false);
+			Frontier base = legacy; base.sequence = legacy.base_sequence;
+			record_sequence_ = turns_->sequence(group_);
+			turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(base)});
+			for (auto& batch : batches) { turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Batch, std::move(batch)}); }
+			frontier_ = legacy; migrating_ = true; ready_ = true;
+			return frontier_;
+		} catch (...) { owner_->failed = true; throw; }
+	}
+	// After the migration's turns are durable: the marker, then the old journal's files go.
+	void finish_migration() {
+		available();
+		if (!migrating_) { throw std::logic_error("no migration to finish"); }
+		if (!turns_->idle() || turns_->in_flight() || turns_->failed()) { throw std::logic_error("the migration's records are not durable yet"); }
+		try {
+			mark_shared();
+			remove_legacy();
+			migrating_ = false;
+		} catch (...) { owner_->failed = true; throw; }
+	}
 	Frontier create(Identity identity) {
 		unused();
+		if (shared()) { return create_shared(identity); }
 		try {
 			owner_->lock = io_.acquire_owner(true);
 			// Reserve the final metadata name exclusively. A damaged existing
@@ -229,6 +300,7 @@ public:
 	template <class Replay, class Restore>
 	Frontier recover(Replay&& replay, Restore&& restore) {
 		unused();
+		if (shared()) { return recover_shared(replay, restore); }
 		try {
 			owner_->lock = io_.acquire_owner(false);
 			auto manifest = io_.open_existing(manifest_name);
@@ -318,6 +390,13 @@ public:
 		frontier_ = std::move(*append_target_); append_target_.reset();
 		operation->settled(); append_operation_.reset(); return frontier_;
 	}
+	// A shared journal's append or checkpoint: hands its record, with the operation that
+	// owns it, to the turn driver.
+	void enqueue_turn(std::shared_ptr<IOOperation> operation, MutationToken token) {
+		if (!shared() || !turn_record_) { throw std::logic_error("no turn record staged"); }
+		auto record = std::move(*turn_record_); turn_record_.reset();
+		turns_->stage(std::move(record), std::move(operation), token);
+	}
 private:
 	friend class Store;
 	std::shared_ptr<AppendMutation> start_append(std::string_view batch, bool asynchronous) {
@@ -325,6 +404,15 @@ private:
 		if (asynchronous && !io_lifetime_) { throw std::logic_error("asynchronous append requires owned IO"); }
 		if (owner_->mutation_sequence == std::numeric_limits<std::uint64_t>::max()) {
 			throw std::length_error("storage operation identity exhausted");
+		}
+		if (shared()) {
+			if (!asynchronous) { throw std::logic_error("a shared journal appends through its turn driver"); }
+			Frontier next = frontier_; ++next.sequence;
+			auto operation = std::shared_ptr<AppendMutation>(new AppendMutation(owned_backend(), owner_,
+				{owner_->mutation_identity, owner_->mutation_sequence + 1, 1}, AppendMutation::Turn{}));
+			turn_record_ = TurnRecord{group_, ++record_sequence_, TurnRecordKind::Batch, std::string(batch)};
+			append_target_ = std::move(next); append_operation_ = operation; ++owner_->mutation_sequence;
+			return operation;
 		}
 		auto growth = append_plan(batch.size()).added.logical_bytes;
 		Frontier next = frontier_;
@@ -358,7 +446,7 @@ public:
 		operation->result();
 		// Both metadata copies were allocated before submission. Terminal
 		// publication settlement moves them without allocating a return copy.
-		frontier_ = std::move(checkpoint_target_->selected); data_ = operation->file_;
+		frontier_ = std::move(checkpoint_target_->selected); if (!shared()) { data_ = operation->file_; }
 		auto result = std::move(checkpoint_target_->returned); checkpoint_target_.reset();
 		operation->settled(); checkpoint_operation_.reset(); return result;
 	}
@@ -388,6 +476,14 @@ private:
 		std::vector<PreparedArtifact> retained; retained.reserve(dependencies.size() + 1); retained.push_back(checkpoint);
 		for (const auto& dependency : dependencies) { retained.push_back(dependency); }
 		CheckpointTarget target{next, next};
+		if (shared()) {
+			if (!asynchronous) { throw std::logic_error("a shared journal publishes through its turn driver"); }
+			// Condition 25: the artifacts are sealed, so they and their names are durable.
+			auto operation = std::shared_ptr<CheckpointMutation>(new CheckpointMutation(owned_backend(), owner_, std::move(retained),
+				{owner_->mutation_identity, owner_->mutation_sequence + 1, 1}, CheckpointMutation::Turn{}));
+			turn_record_ = TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(next)};
+			checkpoint_target_.emplace(std::move(target)); checkpoint_operation_ = operation; ++owner_->mutation_sequence; return operation;
+		}
 		auto backend = io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {});
 		auto operation = std::shared_ptr<CheckpointMutation>(new CheckpointMutation(std::move(backend), owner_, data_name(next), file_header(next), encode_manifest(next), std::move(retained), {owner_->mutation_identity, owner_->mutation_sequence + 1, 1}));
 		checkpoint_target_.emplace(std::move(target)); checkpoint_operation_ = operation; ++owner_->mutation_sequence; return operation;
@@ -401,6 +497,7 @@ private:
 		return frontier.version == 1 ? detail::generation_name(frontier.generation) : "generation-" + detail::hexadecimal(frontier.journal_identity);
 	}
 	static constexpr std::string_view manifest_name = "manifest";
+	static constexpr std::string_view shared_name = "journal.shared";
 	static constexpr std::uint64_t manifest_magic = 0x31464d4a5a4e524bull; // KRNZJMF1
 	static constexpr std::uint64_t file_magic = 0x314154444a5a4e4bull;     // KNZJDTA1
 	static constexpr std::uint64_t manifest_v2_magic = 0x32464d4a5a4e524bull;
@@ -441,6 +538,7 @@ private:
 		name.remove_prefix(prefix.size());
 		return std::all_of(name.begin(), name.end(), [](unsigned char byte) { return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f'); });
 	}
+	static bool reclaim_artifact_name(std::string_view name) { return hexadecimal_name(name, "artifact-", 32); }
 	static bool reclaim_name(std::string_view name) {
 		return name == "journal-0000000000000001" || hexadecimal_name(name, "generation-", 32) ||
 			hexadecimal_name(name, "artifact-", 32) || hexadecimal_name(name, "manifest.pending-", 32);
@@ -449,12 +547,13 @@ private:
 		writable();
 		if (!budget || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
 		if (asynchronous && !owner_->io_lifetime) { throw std::logic_error("completion reclamation requires owned IO"); }
-		std::vector<std::string> roots{std::string(manifest_name), "owner.lock", data_name(frontier_)};
+		std::vector<std::string> roots{"owner.lock"};
+		if (!shared()) { roots.push_back(std::string(manifest_name)); roots.push_back(data_name(frontier_)); }
 		if (frontier_.checkpoint) { roots.push_back(artifact_name(*frontier_.checkpoint)); }
 		for (const auto& artifact : frontier_.dependencies) { roots.push_back(artifact_name(artifact)); }
 		auto io = owner_->io_lifetime ? owner_->io_lifetime : std::shared_ptr<IO>(&io_, [](IO*) {});
 		auto operation = std::shared_ptr<ReclaimMutation>(new ReclaimMutation(std::move(io), owner_, frontier_.identity,
-			reclaim_cursor_, std::move(roots), budget, maximum_manifest_size, reclaim_name, reclaim_header_extent, owned_candidate_bytes));
+			reclaim_cursor_, std::move(roots), budget, maximum_manifest_size, shared() ? reclaim_artifact_name : reclaim_name, reclaim_header_extent, owned_candidate_bytes));
 		reclaim_job_ = operation; return operation;
 	}
 	static std::size_t reclaim_header_extent(std::string_view name, std::uint64_t length) {
@@ -496,6 +595,74 @@ private:
 			}
 			return magic == file_magic && name == "journal-0000000000000001";
 		} catch (const Corruption&) { return false; }
+	}
+	std::shared_ptr<IO> owned_backend() const { return io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {}); }
+	// The group's first record names its identity, so a group recovers before its first
+	// checkpoint; it rides the turn of the group's first batch.
+	Frontier create_shared(Identity identity) {
+		try {
+			// A group created again after its first turn was lost keeps its old lock file.
+			try { owner_->lock = io_.acquire_owner(true); } catch (...) { owner_->lock = io_.acquire_owner(false); }
+			mark_shared();
+			frontier_ = Frontier{}; frontier_.identity = identity;
+			turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(frontier_)});
+			ready_ = true;
+			return frontier_;
+		} catch (...) { owner_->failed = true; throw; }
+	}
+	// The group's records start at its latest checkpoint record; each batch after it is
+	// the checkpoint's sequence plus its distance from the checkpoint record.
+	template <class Replay, class Restore>
+	Frontier recover_shared(Replay& replay, Restore& restore) {
+		try {
+			if (turns_->lost(group_)) { throw Corruption("the turn log lost this group"); }
+			const auto& records = turns_->records(group_);
+			if (records.empty() || records.front().kind != TurnRecordKind::Checkpoint) { throw Corruption("the group has no checkpoint record"); }
+			owner_->lock = io_.acquire_owner(false);
+			frontier_ = decode_manifest(records.front().payload);
+			if (frontier_.sequence != frontier_.base_sequence) { throw Corruption("checkpoint record covers an unaligned sequence"); }
+			if (frontier_.checkpoint) {
+				validate_artifact_bound(*frontier_.checkpoint);
+				ArtifactReader checkpoint(io_, owner_, frontier_.identity, *frontier_.checkpoint);
+				std::vector<ArtifactReader> dependencies;
+				for (const auto& descriptor : frontier_.dependencies) {
+					validate_artifact_bound(descriptor);
+					dependencies.push_back(ArtifactReader(io_, owner_, frontier_.identity, descriptor));
+				}
+				restore(frontier_, checkpoint, std::span<ArtifactReader>(dependencies));
+			}
+			const auto base = records.front().sequence;
+			for (std::size_t i = 1; i < records.size(); ++i) {
+				const auto& record = records[i];
+				if (record.kind != TurnRecordKind::Batch || record.sequence != base + i) { throw Corruption("unexpected record after the checkpoint record"); }
+				if (record.payload.size() > maximum_batch_) { throw Corruption("invalid durable batch length"); }
+				replay(frontier_.sequence + 1, std::string_view(record.payload));
+				++frontier_.sequence;
+			}
+			record_sequence_ = records.back().sequence;
+			turns_->release(group_);
+			remove_legacy();  // a crash between the marker and the old files' removal
+			io_.sync_directory();
+			ready_ = true;
+			return frontier_;
+		} catch (...) { owner_->failed = true; throw; }
+	}
+	// The directory belongs to a shared group: durable before its first record can be.
+	void mark_shared() {
+		if (layout(io_) != Layout::Shared) { io_.create_exclusive(shared_name)->sync(); }
+		io_.sync_directory();
+	}
+	static bool legacy_name(std::string_view name) {
+		return name == manifest_name || name == "journal-0000000000000001" || hexadecimal_name(name, "generation-", 32) ||
+			hexadecimal_name(name, "manifest.pending-", 32);
+	}
+	void remove_legacy() {
+		std::vector<std::string> names;
+		auto cursor = io_.scan_directory();
+		while (auto name = cursor->next()) { if (legacy_name(*name)) { names.push_back(*name); } }
+		cursor.reset();
+		for (const auto& name : names) { io_.remove(name); }
+		if (!names.empty()) { io_.sync_directory(); }
 	}
 	void unused() const {
 		if (owner_->lock || ready_ || owner_->failed) { throw std::logic_error("journal already initialized or fenced"); }
@@ -608,7 +775,10 @@ private:
 	Frontier frontier_;
 	std::shared_ptr<DirectoryCursor> reclaim_cursor_;
 	std::weak_ptr<ReclaimMutation> reclaim_job_;
-	bool ready_ = false;
+	TurnDriver* turns_ = nullptr;
+	std::uint64_t group_ = 0, record_sequence_ = 0;
+	std::optional<TurnRecord> turn_record_;  // staged by start_append or start_checkpoint
+	bool ready_ = false, migrating_ = false;
 };
 
 } // namespace kronuz::journal

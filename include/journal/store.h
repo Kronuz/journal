@@ -325,8 +325,20 @@ public:
 		InventoryStats empty; empty.complete = true;
 		Admission validate(empty, limits);
 	}
+	// The shared backend (D11): batches and checkpoint records go to the core's turn
+	// driver, artifacts to this group's directory. Appends and publication complete at
+	// their turn's barrier, so the host drives them through the driver, never as IO.
+	Store(std::shared_ptr<IO> io, TurnDriver& turns, std::uint64_t group, AdmissionLimits limits,
+		std::size_t maximum_batch = 64u * 1024 * 1024, std::uint64_t maximum_artifact = 512ull * 1024 * 1024)
+		: io_(owned_io(io)), limits_(limits), journal_(std::make_shared<Journal>(std::move(io), turns, group, maximum_batch, maximum_artifact)) {
+		InventoryStats empty; empty.complete = true;
+		Admission validate(empty, limits);
+	}
 	Store(const Store&) = delete;
 	Store& operator=(const Store&) = delete;
+	bool shared() const noexcept { return journal_->shared(); }
+	Journal::Layout layout() const { return Journal::layout(io_); }
+	bool migrating() const noexcept { return journal_->migrating(); }
 	~Store() {
 		if (replacement_ && replacement_->active_job) { replacement_->detached = true; replacement_.reset(); }
 		if (replacement_ && replacement_->disposed) { replacement_.reset(); }
@@ -354,8 +366,12 @@ public:
 		try {
 			// Trusted caller excludes external mutations during bootstrap. Reject
 			// every existing name before the first owned namespace change.
+			// A shared group whose first turn never became durable is created again over its
+			// lock and unreferenced artifacts, which reclamation removes.
 			auto cursor = io_.scan_directory();
-			if (cursor->next()) { throw std::invalid_argument("bootstrap requires an empty directory"); }
+			while (auto name = cursor->next()) {
+				if (!shared() || (*name != "owner.lock" && *name != "journal.shared" && !name->starts_with("artifact-"))) { throw std::invalid_argument("bootstrap requires an empty directory"); }
+			}
 			cursor.reset(); auto result = journal_->create(identity);
 			opened_ = true; inventory_.emplace(io_); return result;
 		} catch (...) { fence(); throw; }
@@ -371,6 +387,16 @@ public:
 		return recover(std::move(replay), [](const Frontier&, ArtifactReader&, std::span<ArtifactReader>) {
 			throw Corruption("checkpoint restore callback required");
 		});
+	}
+	// R20 (shared backend): see Journal::migrate and Journal::finish_migration.
+	template <class Replay, class Restore> Frontier migrate(Replay replay, Restore restore) {
+		unopened();
+		try { auto result = journal_->migrate(std::move(replay), std::move(restore)); opened_ = true; inventory_.emplace(io_); return result; }
+		catch (...) { fence(); throw; }
+	}
+	void finish_migration() {
+		healthy();
+		try { journal_->finish_migration(); } catch (...) { fence(); throw; }
 	}
 	InventoryStats inventory_step(std::size_t budget = 128) {
 		healthy();
@@ -525,14 +551,20 @@ private:
 		if (reservation.owner_ != owner_ || bytes.size() > reservation.bound_) { throw std::invalid_argument("foreign or oversized append reservation"); }
 		auto plan = journal_->append_plan(bytes.size());
 		auto append = journal_->start_append(bytes, asynchronous);
-		return std::shared_ptr<StoreAppend>(new StoreAppend(journal_, std::move(append), std::move(reservation), plan));
+		auto token = append->token();
+		auto operation = std::shared_ptr<StoreAppend>(new StoreAppend(journal_, std::move(append), std::move(reservation), plan));
+		if (shared()) { journal_->enqueue_turn(operation, token); }
+		return operation;
 	}
 	std::shared_ptr<StorePublication> start_publication(const ReplacementId& id, std::uint64_t expected_sequence, bool asynchronous) {
 		mutation_ready(); auto& cycle = replacement(id); auto current = journal_->frontier();
 		if (cycle.builder || !cycle.prepared[0] || !cycle.prepared[1] || expected_sequence != current.sequence || current.generation == std::numeric_limits<std::uint64_t>::max()) { throw std::invalid_argument("unfinished or stale replacement"); }
 		std::array<std::uint64_t, 2> lengths{cycle.lengths[1], cycle.lengths[0]}; auto plan = journal_->checkpoint_plan(lengths);
 		auto publication = journal_->start_checkpoint(*cycle.prepared[1], std::span<const PreparedArtifact>(&*cycle.prepared[0], 1), expected_sequence, asynchronous);
-		return std::shared_ptr<StorePublication>(new StorePublication(journal_, replacement_, std::move(publication), plan));
+		auto token = publication->token();
+		auto operation = std::shared_ptr<StorePublication>(new StorePublication(journal_, replacement_, std::move(publication), plan));
+		if (shared()) { journal_->enqueue_turn(operation, token); }
+		return operation;
 	}
 	std::shared_ptr<StoreReclaim> start_reclaim(std::size_t budget, bool asynchronous) {
 		mutation_ready();

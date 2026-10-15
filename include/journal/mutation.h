@@ -38,6 +38,7 @@ class PublicationSteps {
   public:
 	PublicationSteps(std::string encoded)
 		: encoded_(std::move(encoded)), temporary_("manifest.pending-" + hexadecimal(random_identity())) {}
+	PublicationSteps() = default;  // unused: a turn record publishes through its turn's barrier
 	bool done() const noexcept { return phase_ == Phase::Done; }
 	MutationRequest request() const {
 		MutationRequest result;
@@ -137,8 +138,12 @@ class AppendMutation : public IOOperation {
 		if (done()) {
 			throw std::logic_error("append mutation is complete");
 		}
+		if (phase_ == Phase::Turn) {
+			throw std::logic_error("a turn record completes through its turn driver, not an IO primitive");
+		}
 		return request_;
 	}
+	MutationToken token() const noexcept { return request_.token; }
 	void submitted() override {
 		if (in_flight_ || done() || owner_->failed) {
 			throw std::logic_error("append submission is not available");
@@ -157,7 +162,9 @@ class AppendMutation : public IOOperation {
 			if (completion.error) {
 				std::rethrow_exception(completion.error);
 			}
-			if (phase_ == Phase::Publication) {
+			if (phase_ == Phase::Turn) {
+				turned_ = true;
+			} else if (phase_ == Phase::Publication) {
 				publication_.complete(std::move(completion));
 			} else if (phase_ == Phase::Sync) {
 				phase_ = Phase::Publication;
@@ -183,7 +190,7 @@ class AppendMutation : public IOOperation {
 		}
 		return true;
 	}
-	bool done() const noexcept override { return error_ || (phase_ == Phase::Publication && publication_.done()); }
+	bool done() const noexcept override { return error_ || turned_ || (phase_ == Phase::Publication && publication_.done()); }
 	bool in_flight() const noexcept override { return in_flight_; }
 	void result() const {
 		if (!done() || in_flight_) {
@@ -210,8 +217,19 @@ class AppendMutation : public IOOperation {
 		refresh_request();
 		owner_->mutation_active = true;
 	}
+	// A turn record: the batch is one record of the core's turn log, durable at its turn's
+	// barrier; the turn driver submits and completes it.
+	struct Turn {};
+	AppendMutation(std::shared_ptr<IO> io, std::shared_ptr<detail::OwnerSession> owner, MutationToken token, Turn)
+		: io_(std::move(io)), owner_(std::move(owner)), offset_(0), phase_(Phase::Turn) {
+		request_.token = token;
+		owner_->mutation_active = true;
+	}
 	void refresh_request() {
 		auto token = request_.token;
+		if (phase_ == Phase::Turn) {
+			return;
+		}
 		if (phase_ == Phase::Publication) {
 			request_ = publication_.request();
 		} else {
@@ -226,7 +244,7 @@ class AppendMutation : public IOOperation {
 		}
 		request_.token = token;
 	}
-	enum class Phase { Header, Payload, Sync, Publication };
+	enum class Phase { Header, Payload, Sync, Publication, Turn };
 	std::shared_ptr<IO> io_;
 	std::shared_ptr<detail::OwnerSession> owner_;
 	std::shared_ptr<File> data_;
@@ -236,7 +254,7 @@ class AppendMutation : public IOOperation {
 	MutationRequest request_;
 	std::size_t written_ = 0;
 	Phase phase_ = Phase::Header;
-	bool started_ = false, in_flight_ = false, active_ = true;
+	bool started_ = false, in_flight_ = false, active_ = true, turned_ = false;
 	std::exception_ptr error_;
 };
 
@@ -253,8 +271,10 @@ public:
 	}
 	const MutationRequest& request() const override {
 		if (done()) { throw std::logic_error("checkpoint publication has completed"); }
+		if (phase_ == Phase::Turn) { throw std::logic_error("a turn record completes through its turn driver, not an IO primitive"); }
 		return request_;
 	}
+	MutationToken token() const noexcept { return request_.token; }
 	void submitted() override {
 		if (in_flight_ || done() || owner_->failed) { throw std::logic_error("checkpoint submission unavailable"); }
 		started_ = in_flight_ = true;
@@ -266,6 +286,7 @@ public:
 			if (owner_->failed) { throw std::runtime_error("storage owner fenced during checkpoint publication"); }
 			if (completion.error) { std::rethrow_exception(completion.error); }
 			switch (phase_) {
+			case Phase::Turn: turned_ = true; break;
 			case Phase::Create:
 				if (!completion.file) { throw std::runtime_error("generation create returned no file"); }
 				file_ = std::move(completion.file); phase_ = Phase::Header; break;
@@ -282,7 +303,7 @@ public:
 		} catch (...) { error_ = std::current_exception(); owner_->failed = true; }
 		return true;
 	}
-	bool done() const noexcept override { return error_ || (phase_ == Phase::Publication && publication_.done()); }
+	bool done() const noexcept override { return error_ || turned_ || (phase_ == Phase::Publication && publication_.done()); }
 	bool in_flight() const noexcept override { return in_flight_; }
 	IO& io() const noexcept override { return *io_; }
 	void result() const {
@@ -295,6 +316,13 @@ private:
 		std::string name, std::string header, std::string manifest, std::vector<PreparedArtifact> artifacts, MutationToken token)
 		: io_(std::move(io)), owner_(std::move(owner)), artifacts_(std::move(artifacts)), name_(std::move(name)), header_(std::move(header)), publication_(std::move(manifest)) {
 		request_.token = token; refresh_request(); owner_->mutation_active = true;
+	}
+	// A turn record: the checkpoint record is one record of the core's turn log, staged
+	// after its artifacts are durable; the artifacts stay pinned until its barrier.
+	struct Turn {};
+	CheckpointMutation(std::shared_ptr<IO> io, std::shared_ptr<detail::OwnerSession> owner, std::vector<PreparedArtifact> artifacts, MutationToken token, Turn)
+		: io_(std::move(io)), owner_(std::move(owner)), artifacts_(std::move(artifacts)), phase_(Phase::Turn) {
+		request_.token = token; owner_->mutation_active = true;
 	}
 	void settled() noexcept { owner_->mutation_active = false; gated_ = false; }
 	void refresh_request() {
@@ -309,12 +337,12 @@ private:
 				request_.bytes = std::string_view(header_).substr(written_); break;
 			case Phase::Sync: request_.kind = PrimitiveKind::Sync; request_.file = file_; break;
 			case Phase::DirectorySync: request_.kind = PrimitiveKind::DirectorySync; break;
-			case Phase::Publication: break;
+			case Phase::Publication: case Phase::Turn: break;
 			}
 		}
 		request_.token = token;
 	}
-	enum class Phase { Create, Header, Sync, DirectorySync, Publication };
+	enum class Phase { Create, Header, Sync, DirectorySync, Publication, Turn };
 	std::shared_ptr<IO> io_;
 	std::shared_ptr<detail::OwnerSession> owner_;
 	std::vector<PreparedArtifact> artifacts_;
@@ -325,7 +353,7 @@ private:
 	Phase phase_ = Phase::Create;
 	std::size_t written_ = 0;
 	std::exception_ptr error_;
-	bool started_ = false, in_flight_ = false, gated_ = true;
+	bool started_ = false, in_flight_ = false, gated_ = true, turned_ = false;
 };
 
 inline void drive_synchronously(AppendMutation &operation) {

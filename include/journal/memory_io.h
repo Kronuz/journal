@@ -115,33 +115,50 @@ public:
 private:
 	std::vector<std::string> names_; std::size_t at_ = 0;
 };
+// One directory of the disk: names under `prefix`, so several directories share one disk
+// and one power cut. sync_directory makes only this directory's namespace durable.
 class MemoryIO final : public j::IO {
 public:
-	explicit MemoryIO(Disk& disk) : disk_(disk) {}
+	explicit MemoryIO(Disk& disk, std::string prefix = {}) : disk_(disk), prefix_(std::move(prefix)) {}
 	std::unique_ptr<j::OwnerLock> acquire_owner(bool) override { return std::make_unique<j::OwnerLock>(); }
 	std::unique_ptr<j::File> open_existing(std::string_view name) override {
-		auto found = disk_.names.find(std::string(name));
+		auto found = disk_.names.find(path(name));
 		if (found == disk_.names.end()) { throw std::runtime_error("no such file"); }
 		return std::make_unique<MemoryFile>(disk_, found->second);
 	}
 	std::unique_ptr<j::File> create_exclusive(std::string_view name) override {
 		disk_.tick();
-		if (disk_.names.contains(std::string(name))) { throw std::runtime_error("file exists"); }
-		auto id = disk_.next_inode++; disk_.inodes[id]; disk_.names[std::string(name)] = id;
+		if (disk_.names.contains(path(name))) { throw std::runtime_error("file exists"); }
+		auto id = disk_.next_inode++; disk_.inodes[id]; disk_.names[path(name)] = id;
 		return std::make_unique<MemoryFile>(disk_, id);
 	}
 	void replace(std::string_view source, std::string_view destination) override {
 		disk_.tick();
-		auto id = disk_.names.at(std::string(source)); disk_.names.erase(std::string(source)); disk_.names[std::string(destination)] = id;
+		auto id = disk_.names.at(path(source)); disk_.names.erase(path(source)); disk_.names[path(destination)] = id;
 	}
-	void remove(std::string_view name) override { disk_.tick(); disk_.names.erase(std::string(name)); }
+	void remove(std::string_view name) override { disk_.tick(); disk_.names.erase(path(name)); }
 	std::unique_ptr<j::DirectoryCursor> scan_directory() override {
-		std::vector<std::string> names; for (const auto& [name, _] : disk_.names) { names.push_back(name); }
+		std::vector<std::string> names;
+		for (const auto& [name, _] : disk_.names) { if (mine(name)) { names.push_back(name.substr(prefix_.size())); } }
 		return std::make_unique<MemoryCursor>(std::move(names));
 	}
-	void sync_directory() override { disk_.tick(); disk_.durable_names = disk_.names; }
+	std::optional<j::EntryFootprint> entry_footprint(std::string_view name) override {
+		auto found = disk_.names.find(path(name));
+		if (found == disk_.names.end()) { return std::nullopt; }
+		j::EntryFootprint footprint; footprint.kind = j::EntryKind::Regular; footprint.logical_bytes = disk_.inodes.at(found->second).size;
+		return footprint;
+	}
+	void sync_directory() override {
+		disk_.tick();
+		std::erase_if(disk_.durable_names, [&](const auto& entry) { return mine(entry.first); });
+		for (const auto& [name, id] : disk_.names) { if (mine(name)) { disk_.durable_names[name] = id; } }
+	}
 private:
+	std::string path(std::string_view name) const { return prefix_ + std::string(name); }
+	// A name of this directory, not of a nested one.
+	bool mine(const std::string& name) const { return name.starts_with(prefix_) && name.find('/', prefix_.size()) == std::string::npos; }
 	Disk& disk_;
+	std::string prefix_;
 };
 
 
