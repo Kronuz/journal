@@ -222,10 +222,30 @@ void reclamation(std::uint64_t seed) {
 	for (auto& entry : std::filesystem::directory_iterator(directory.path)) { files += j::turn_log_detail::segment_number(entry.path().filename().string()).has_value(); }
 	check(files <= options.retain_segments + 1 + options.spare_segments + 1, "segment files stay bounded across reopenings");
 }
+
+// The two-step append a completion driver uses: one turn in flight; nothing visible until
+// its barrier returns; a failed write fails the log.
+void staged_turns() {
+	Directory directory("staged"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	j::TurnRecovery recovered;
+	{
+		j::TurnLog log(io, identity, recovered, small);
+		auto write = log.stage(std::vector{record(1, 1, 100)});
+		check(log.sequence(1) == 0 && log.last_turn() == 0 && write.turn == 1, "a staged turn changes nothing visible");
+		check(throws([&] { log.stage(std::vector{record(2, 1, 10)}); }), "one turn is in flight at a time (condition 7)");
+		check(write.file->write_at(write.offset, write.bytes) == write.bytes.size(), "the host writes the staged bytes");
+		write.file->sync_data(); log.completed();
+		check(log.sequence(1) == 1 && log.last_turn() == 1 && throws([&] { log.completed(); }), "completion makes the turn visible, once");
+		log.stage(std::vector{record(1, 2, 10)}); log.failed();
+		check(throws([&] { log.append(std::vector{record(1, 2, 10)}); }), "a failed write fails the log");
+	}
+	j::TurnLog log(io, identity, recovered, small);
+	check(recovered.groups[1] == std::vector{record(1, 1, 100)}, "the completed turn recovers; the failed one does not");
+}
 }  // namespace
 
 int main() {
-	try { round_trip(); torn_tail(); damage(); checkpoints_and_guards(); stale_bytes(); for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }
+	try { round_trip(); torn_tail(); damage(); checkpoints_and_guards(); stale_bytes(); staged_turns(); for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " turn log checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

@@ -265,12 +265,27 @@ public:
 	// Appends one turn and makes it durable. Each group's sequence continues its last one; a
 	// new group starts at 1 or with a checkpoint. A lost group rejoins under a new id.
 	std::uint64_t append(std::span<const TurnRecord> records) {
+		auto write = stage(records);
+		try {
+			if (write.file->write_at(write.offset, write.bytes) != write.bytes.size()) { throw std::runtime_error("short turn log write"); }
+			write.file->sync_data();
+		} catch (...) { failed(); throw; }
+		completed();
+		return write.turn;
+	}
+	// The write a staged turn needs: its bytes at an offset of a segment, then one
+	// File::sync_data. A host driving completion I/O issues them and reports back.
+	struct TurnWrite { File* file; std::uint64_t offset; std::string_view bytes; std::uint64_t turn; };
+	// Encodes a turn; one is in flight at a time (condition 7). Nothing it changes is
+	// visible until completed().
+	TurnWrite stage(std::span<const TurnRecord> records) {
 		if (failed_) { throw std::logic_error("turn log failed"); }
-		std::map<std::uint64_t, std::uint64_t> next;
+		if (staged_) { throw std::logic_error("a turn is already in flight"); }
+		Staged turn; turn.turn = turn_ + 1;
 		for (const auto& record : records) {
 			if (!record.group) { throw std::invalid_argument("group 0 is reserved"); }
 			if (lost_.contains(record.group)) { throw std::invalid_argument("a lost group rejoins under a new id"); }
-			auto [found, fresh] = next.try_emplace(record.group, sequence(record.group));
+			auto [found, fresh] = turn.next.try_emplace(record.group, sequence(record.group));
 			auto& last = found->second;
 			bool start = fresh && !sequences_.contains(record.group) && record.kind == TurnRecordKind::Checkpoint && record.sequence;
 			if (record.sequence != last + 1 && !start) {
@@ -278,31 +293,42 @@ public:
 			}
 			last = record.sequence;
 		}
-		const auto turn = turn_ + 1;
+		for (const auto& record : records) { turn.notes.push_back({record.group, record.sequence, record.kind, record.payload.size(), false}); }
 		auto copies = forward_slice();
 		std::vector<std::uint64_t> offsets;
 		auto emit = [&](turn_log_detail::Emitter& emitter) {
 			offsets.clear();
-			for (const auto& record : records) { offsets.push_back(emitter.record(static_cast<std::uint8_t>(record.kind), turn, record.group, record.sequence, record.payload)); }
-			for (const auto& copy : copies) { offsets.push_back(emitter.record(static_cast<std::uint8_t>(copy.kind), turn, copy.group, copy.sequence, copy.payload)); }
+			for (const auto& record : records) { offsets.push_back(emitter.record(static_cast<std::uint8_t>(record.kind), turn.turn, record.group, record.sequence, record.payload)); }
+			for (const auto& copy : copies) { offsets.push_back(emitter.record(static_cast<std::uint8_t>(copy.kind), turn.turn, copy.group, copy.sequence, copy.payload)); }
 			std::string count; put32(count, static_cast<std::uint32_t>(records.size() + copies.size()));
-			emitter.record(turn_log_detail::end_of_turn, turn, 0, 0, count);
+			emitter.record(turn_log_detail::end_of_turn, turn.turn, 0, 0, count);
 		};
 		// Copies ride along only where the turn still fits in a segment.
 		if (!copies.empty() && !fits(emit)) { copies.clear(); }
-		write({emit});
-		turn_ = turn; ++stats_.turns;
-		for (const auto& [group, sequence] : next) { sequences_[group] = sequence; }
-		for (std::size_t i = 0; i < records.size(); ++i) { note(records[i].group, records[i].sequence, records[i].kind, offsets[i]); stats_.bytes_appended += records[i].payload.size(); }
-		for (std::size_t i = 0; i < copies.size(); ++i) {
-			// A copy replaces its original unless a checkpoint in this turn superseded both.
-			if (index_[copies[i].group].contains(copies[i].sequence)) { note(copies[i].group, copies[i].sequence, copies[i].kind, offsets[records.size() + i], true); }
-			stats_.forwarded_bytes += copies[i].payload.size();
-		}
-		stats_.forwarded_records += copies.size();
-		reclaim();
-		return turn;
+		for (const auto& copy : copies) { turn.notes.push_back({copy.group, copy.sequence, copy.kind, copy.payload.size(), true}); }
+		auto emitter = encode(emit);
+		for (std::size_t i = 0; i < turn.notes.size(); ++i) { turn.notes[i].offset = offsets[i]; }
+		turn.offset = offset_; turn.end = emitter.position(); turn.filling = emitter.filling(); turn.bytes = emitter.bytes();
+		staged_ = std::move(turn);
+		return {file_.get(), staged_->offset, staged_->bytes, staged_->turn};
 	}
+	// The staged turn's barrier returned: its records are durable.
+	void completed() {
+		if (!staged_) { throw std::logic_error("no turn in flight"); }
+		auto turn = std::move(*staged_); staged_.reset();
+		offset_ = turn.end; filling_ = turn.filling; ++stats_.barriers; stats_.bytes_written += turn.bytes.size();
+		turn_ = turn.turn; ++stats_.turns;
+		for (const auto& [group, sequence] : turn.next) { sequences_[group] = sequence; }
+		for (const auto& n : turn.notes) {
+			if (!n.copy) { note(n.group, n.sequence, n.kind, n.offset); stats_.bytes_appended += n.bytes; continue; }
+			// A copy replaces its original unless a checkpoint in this turn superseded both.
+			if (index_[n.group].contains(n.sequence)) { note(n.group, n.sequence, n.kind, n.offset, true); }
+			stats_.forwarded_bytes += n.bytes; ++stats_.forwarded_records;
+		}
+		reclaim();
+	}
+	// The staged turn's write or barrier failed: what it reached is unknown, so the log fails.
+	void failed() noexcept { staged_.reset(); failed_ = true; }
 	std::uint64_t epoch() const noexcept { return epoch_; }
 	std::uint64_t last_turn() const noexcept { return turn_; }
 	std::uint64_t segment() const noexcept { return segment_; }
@@ -386,18 +412,21 @@ private:
 		data_segments_.insert(segment_);
 	}
 	// A turn never crosses a segment: one that does not fit starts the next one.
-	void write(Body body) {
+	turn_log_detail::Emitter encode(const std::function<void(turn_log_detail::Emitter&)>& emit) {
 		turn_log_detail::Emitter emitter(identity_, options_.block_bytes, segment_, epoch_, offset_, filling_);
-		body.emit(emitter);
+		emit(emitter);
 		if (emitter.position() > options_.segment_bytes) {
 			turn_log_detail::Emitter fresh(identity_, options_.block_bytes, segment_, epoch_, 0, filling_);
-			body.emit(fresh);
+			emit(fresh);
 			if (fresh.position() > options_.segment_bytes) { throw std::length_error("turn exceeds a segment"); }
 			begin_segment();
 			emitter = turn_log_detail::Emitter(identity_, options_.block_bytes, segment_, epoch_, 0, filling_);
-			body.emit(emitter);
-			if (emitter.position() > options_.segment_bytes) { throw std::length_error("turn exceeds a segment"); }
+			emit(emitter);
 		}
+		return emitter;
+	}
+	void write(Body body) {
+		auto emitter = encode(body.emit);
 		try {
 			if (file_->write_at(offset_, emitter.bytes()) != emitter.bytes().size()) { throw std::runtime_error("short turn log write"); }
 			file_->sync_data();
@@ -413,6 +442,9 @@ private:
 	std::map<std::uint64_t, std::map<std::uint64_t, Live>> index_; std::map<std::uint64_t, std::size_t> live_counts_;
 	std::set<std::uint64_t> data_segments_; std::map<std::uint64_t, std::unique_ptr<File>> readers_;
 	turn_log_detail::Manifest filling_;  // unknown until the first block this open enters
+	struct Note { std::uint64_t group, sequence; TurnRecordKind kind; std::size_t bytes; bool copy; std::uint64_t offset = 0; };
+	struct Staged { std::uint64_t turn = 0, offset = 0, end = 0; std::map<std::uint64_t, std::uint64_t> next; std::vector<Note> notes; turn_log_detail::Manifest filling; std::string bytes; };
+	std::optional<Staged> staged_;
 	TurnLogStats stats_; bool failed_ = false;
 };
 
