@@ -1,0 +1,231 @@
+/*
+ * Copyright (c) 2026 Germán Méndez Bravo (Kronuz)
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+// T9 (strata Track C): RFTW0001 under power loss. A randomized multi-group workload over
+// an in-memory filesystem whose unsynced 512-byte sectors each persist or not, and whose
+// namespace changes persist only after a directory sync. Power is cut after every I/O
+// operation of each run, and at every third point again during the recovery that follows.
+// Segments recycle, so stale blocks from an earlier use are present (condition 10).
+#include "journal/turn_log.h"
+#include <iostream>
+#include <map>
+#include <random>
+
+namespace j = kronuz::journal;
+
+namespace {
+int checks = 0, failures = 0;
+void check(bool value, const std::string& what) {
+	++checks;
+	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
+}
+struct PowerLoss {};
+constexpr std::size_t sector = 512;
+
+// Inodes hold durable bytes and pending sector writes; names map to inodes, with the
+// durable namespace changing only at sync_directory.
+struct Disk {
+	struct Inode { std::string durable; std::map<std::uint64_t, std::string> pending; std::uint64_t size = 0; };
+	std::map<std::uint64_t, Inode> inodes; std::map<std::string, std::uint64_t> names, durable_names;
+	std::uint64_t next_inode = 1, operations = 0, cut = std::numeric_limits<std::uint64_t>::max();
+	std::mt19937_64 random{0};
+	void tick() { if (++operations == cut) { throw PowerLoss{}; } }
+	std::string content(const Inode& inode) const {
+		std::string bytes = inode.durable; bytes.resize(inode.size, '\0');
+		for (const auto& [s, data] : inode.pending) {
+			const std::size_t at = static_cast<std::size_t>(s) * sector;
+			if (at < bytes.size()) { auto count = std::min(sector, bytes.size() - at); bytes.replace(at, count, data.substr(0, count)); }
+		}
+		return bytes;
+	}
+	// The state after power loss: the durable namespace, and each pending sector kept or not.
+	void power_loss() {
+		std::map<std::uint64_t, Inode> survived;
+		for (const auto& [name, id] : durable_names) {
+			auto& inode = inodes.at(id); auto& after = survived[id];
+			after.durable = inode.durable; after.size = std::max<std::uint64_t>(inode.durable.size(), 0);
+			for (const auto& [s, data] : inode.pending) {
+				if (random() % 2) { continue; }
+				auto end = s * sector + data.size();
+				if (after.durable.size() < end) { after.durable.resize(end, '\0'); }
+				after.durable.replace(s * sector, data.size(), data);
+			}
+			after.size = after.durable.size();
+		}
+		inodes = std::move(survived); names = durable_names;
+		cut = std::numeric_limits<std::uint64_t>::max();
+	}
+};
+
+class MemoryFile final : public j::File {
+public:
+	MemoryFile(Disk& disk, std::uint64_t inode) : disk_(disk), inode_(inode) {}
+	std::uint64_t size() override { return node().size; }
+	std::size_t read_at(std::uint64_t offset, std::span<char> bytes) override {
+		auto content = disk_.content(node());
+		if (offset >= content.size()) { return 0; }
+		auto count = std::min<std::size_t>(bytes.size(), content.size() - offset);
+		std::copy_n(content.data() + offset, count, bytes.data()); return count;
+	}
+	std::size_t write_at(std::uint64_t offset, std::string_view bytes) override {
+		disk_.tick();
+		auto& inode = node(); auto content = disk_.content(inode);
+		if (content.size() < offset + bytes.size()) { content.resize(offset + bytes.size(), '\0'); }
+		content.replace(offset, bytes.size(), bytes);
+		inode.size = content.size();
+		for (auto s = offset / sector; s * sector < offset + bytes.size(); ++s) { inode.pending[s] = content.substr(s * sector, sector); }
+		return bytes.size();
+	}
+	void truncate(std::uint64_t size) override { disk_.tick(); sync(); node().durable.resize(size, '\0'); node().size = size; }
+	void sync() override {
+		disk_.tick();
+		auto& inode = node(); inode.durable = disk_.content(inode); inode.pending.clear();
+	}
+private:
+	Disk::Inode& node() { return disk_.inodes.at(inode_); }
+	Disk& disk_; std::uint64_t inode_;
+};
+class MemoryCursor final : public j::DirectoryCursor {
+public:
+	explicit MemoryCursor(std::vector<std::string> names) : names_(std::move(names)) {}
+	std::optional<std::string> next() override { if (at_ == names_.size()) { return std::nullopt; } return names_[at_++]; }
+private:
+	std::vector<std::string> names_; std::size_t at_ = 0;
+};
+class MemoryIO final : public j::IO {
+public:
+	explicit MemoryIO(Disk& disk) : disk_(disk) {}
+	std::unique_ptr<j::OwnerLock> acquire_owner(bool) override { return std::make_unique<j::OwnerLock>(); }
+	std::unique_ptr<j::File> open_existing(std::string_view name) override {
+		auto found = disk_.names.find(std::string(name));
+		if (found == disk_.names.end()) { throw std::runtime_error("no such file"); }
+		return std::make_unique<MemoryFile>(disk_, found->second);
+	}
+	std::unique_ptr<j::File> create_exclusive(std::string_view name) override {
+		disk_.tick();
+		if (disk_.names.contains(std::string(name))) { throw std::runtime_error("file exists"); }
+		auto id = disk_.next_inode++; disk_.inodes[id]; disk_.names[std::string(name)] = id;
+		return std::make_unique<MemoryFile>(disk_, id);
+	}
+	void replace(std::string_view source, std::string_view destination) override {
+		disk_.tick();
+		auto id = disk_.names.at(std::string(source)); disk_.names.erase(std::string(source)); disk_.names[std::string(destination)] = id;
+	}
+	void remove(std::string_view name) override { disk_.tick(); disk_.names.erase(std::string(name)); }
+	std::unique_ptr<j::DirectoryCursor> scan_directory() override {
+		std::vector<std::string> names; for (const auto& [name, _] : disk_.names) { names.push_back(name); }
+		return std::make_unique<MemoryCursor>(std::move(names));
+	}
+	void sync_directory() override { disk_.tick(); disk_.durable_names = disk_.names; }
+private:
+	Disk& disk_;
+};
+
+const j::Identity identity{'P', 'O', 'W', 'E', 'R'};
+using Model = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
+j::TurnRecord record(std::uint64_t group, std::uint64_t sequence, std::size_t size, j::TurnRecordKind kind) {
+	std::string payload(size, '\0');
+	for (std::size_t i = 0; i < size; ++i) { payload[i] = static_cast<char>('a' + (group * 7 + sequence * 3 + i) % 26); }
+	return {group, sequence, kind, payload};
+}
+struct Workload {
+	std::mt19937_64 random; Model acknowledged; std::vector<j::TurnRecord> in_flight;
+	explicit Workload(std::uint64_t seed) : random(seed) {}
+	// One turn: one to three groups of six, records up to 700 bytes, one in five a checkpoint;
+	// group 9 writes once and then idles, so its record must move forward.
+	std::vector<j::TurnRecord> turn(const j::TurnLog& log) {
+		std::vector<j::TurnRecord> batch; std::map<std::uint64_t, std::uint64_t> next;
+		if (!log.sequence(9) && !acknowledged.contains(9)) { batch.push_back(record(9, 1, 100, j::TurnRecordKind::Batch)); return batch; }
+		for (auto n = random() % 3 + 1; n; --n) {
+			auto group = random() % 6 + 1;
+			auto& sequence = next.try_emplace(group, log.sequence(group)).first->second;
+			batch.push_back(record(group, ++sequence, random() % 700 + 1, random() % 5 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint));
+		}
+		return batch;
+	}
+	void acknowledge(const std::vector<j::TurnRecord>& batch) {
+		for (const auto& r : batch) { if (r.kind == j::TurnRecordKind::Checkpoint) { acknowledged[r.group].clear(); } acknowledged[r.group].push_back(r); }
+	}
+	// Recovery holds every acknowledged record, and the in-flight turn whole or not at all.
+	bool matches(const j::TurnRecovery& recovered) {
+		if (recovered.groups == acknowledged) { return true; }
+		auto with = acknowledged; for (const auto& r : in_flight) { if (r.kind == j::TurnRecordKind::Checkpoint) { with[r.group].clear(); } with[r.group].push_back(r); }
+		if (recovered.groups == with) { acknowledge(in_flight); return true; }
+		return false;
+	}
+};
+const j::TurnLogOptions options{8 * 512, 512, 1, 3, 600};
+
+// Runs `turns` turns, cutting power at operation `cut` (and at `second` during the
+// recovery that follows), then reopens and continues for `after` more turns.
+void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned turns, unsigned after) {
+	Disk disk; disk.random.seed(seed * 7919 + cut); MemoryIO io(disk); Workload work(seed);
+	j::TurnRecovery recovered; bool lost_power = false;
+	try {
+		disk.cut = cut;
+		j::TurnLog log(io, identity, recovered, options);
+		for (unsigned t = 0; t < turns; ++t) {
+			work.in_flight = work.turn(log); log.append(work.in_flight);
+			work.acknowledge(work.in_flight); work.in_flight.clear();
+			log.prepare();
+		}
+	} catch (const PowerLoss&) { lost_power = true; }
+	disk.power_loss();
+	if (second) {
+		disk.cut = disk.operations + second;
+		try { j::TurnLog log(io, identity, recovered, options); } catch (const PowerLoss&) {}
+		disk.power_loss();
+	}
+	try {
+		j::TurnLog log(io, identity, recovered, options);
+		const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut) + " second " + std::to_string(second);
+		check(!recovered.damaged && recovered.lost.empty(), "power loss alone damages nothing and loses no group: " + at);
+		check(work.matches(recovered), "every acknowledged record survives, and the in-flight turn whole or not at all: " + at);
+		work.in_flight.clear();
+		for (unsigned t = 0; t < after; ++t) { auto batch = work.turn(log); log.append(batch); work.acknowledge(batch); }
+	} catch (const std::exception& error) {
+		check(false, "seed " + std::to_string(seed) + " cut " + std::to_string(cut) + ": " + error.what());
+	}
+	(void)lost_power;
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+	const std::uint64_t seeds = argc > 1 ? std::stoull(argv[1]) : 8;
+	std::uint64_t points = 0, seconds = 0;
+	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
+		// How many operations an uninterrupted run makes.
+		Disk disk; MemoryIO io(disk); Workload work(seed); j::TurnRecovery recovered;
+		{
+			j::TurnLog log(io, identity, recovered, options);
+			for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); }
+			check(log.stats().segments_recycled > 0 && log.stats().forwarded_records > 0, "the run recycles segments and moves records forward (condition 10)");
+		}
+		for (std::uint64_t cut = 1; cut <= disk.operations; ++cut, ++points) {
+			const std::uint64_t second = cut % 3 == 0 ? cut % 7 + 1 : 0;
+			seconds += second != 0;
+			run(seed, cut, second, 60, 5);
+		}
+	}
+	std::cout << points << " crash points (" << seconds << " with a second loss in recovery), " << checks << " checks, " << failures << " failures\n";
+	return failures ? 1 : 0;
+}
