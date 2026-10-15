@@ -26,8 +26,10 @@
 // operation of each run, and at every third point again during the recovery that follows.
 // Segments recycle, so stale blocks from an earlier use are present (condition 10).
 #include "journal/turn_log.h"
+#include <cstdlib>
 #include <iostream>
 #include <map>
+#include <set>
 #include <random>
 
 namespace j = kronuz::journal;
@@ -207,6 +209,89 @@ void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned t
 	}
 	(void)lost_power;
 }
+
+// The blocks each record's fragments occupy, on a clean disk: what a damaged block may cost.
+std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> groups_by_block(MemoryIO& io) {
+	namespace d = j::turn_log_detail;
+	std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> result;
+	auto cursor = io.scan_directory();
+	while (auto name = cursor->next()) {
+		auto number = d::segment_number(*name); if (!number) { continue; }
+		auto file = io.open_existing(*name);
+		std::vector<d::Item> items; d::Manifests manifests; d::scan_segment(*file, identity, options, *number, items, manifests);
+		for (const auto& item : items) {
+			if (item.gap || !item.group) { continue; }
+			std::string header(d::fragment_header, '\0');
+			for (std::uint64_t position = item.offset;;) {
+				if (position % options.block_bytes == 0) { std::string c(2, '\0'); file->read_at(position + 56, c); position += d::header_bytes(d::get16(c)); }
+				auto room = options.block_bytes - position % options.block_bytes;
+				if (room < d::fragment_header + 1) { position += room; continue; }
+				file->read_at(position, header);
+				result[{*number, position / options.block_bytes}].insert(item.group);
+				auto type = static_cast<std::uint8_t>(header[6]); position += d::fragment_header + d::get16(std::string_view(header).substr(4));
+				if (type == d::Full || type == d::Last) { break; }
+			}
+		}
+	}
+	return result;
+}
+
+// One corrupted block costs only the groups with records in it: every other group's
+// acknowledged records survive, and the damage is reported.
+void corrupted_blocks(std::uint64_t seed, std::uint64_t& blocks) {
+	Disk clean; MemoryIO clean_io(clean); Workload work(seed); j::TurnRecovery recovered;
+	{ j::TurnLog log(clean_io, identity, recovered, options); for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); } }
+	clean.power_loss();  // everything acknowledged is durable
+	auto truth = groups_by_block(clean_io);
+	if (truth.empty()) { return; }
+	// Damage to the last turn reads as a torn tail: recovery cannot tell it from a turn
+	// never acknowledged, so only blocks before the last turn's first are corrupted.
+	std::pair<std::uint64_t, std::uint64_t> last{std::numeric_limits<std::uint64_t>::max(), 0};
+	{
+		namespace d = j::turn_log_detail;
+		std::uint64_t newest = 0; std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::uint64_t>> firsts;
+		auto cursor = clean_io.scan_directory();
+		while (auto name = cursor->next()) {
+			auto number = d::segment_number(*name); if (!number) { continue; }
+			auto file = clean_io.open_existing(*name);
+			std::vector<d::Item> items; d::Manifests manifests; d::scan_segment(*file, identity, options, *number, items, manifests);
+			for (const auto& item : items) {
+				if (item.gap || item.kind == d::open_record) { continue; }
+				newest = std::max(newest, item.turn); firsts.push_back({{*number, item.offset / options.block_bytes}, item.turn});
+			}
+		}
+		for (const auto& [where, turn] : firsts) { if (turn == newest) { last = std::min(last, where); } }
+	}
+	for (const auto& [where, groups] : truth) {
+		if (where >= last) { continue; }
+		Disk disk = clean; MemoryIO io(disk); ++blocks;
+		auto name = j::turn_log_detail::segment_name(where.first);
+		auto& inode = disk.inodes.at(disk.names.at(name));
+		std::mt19937_64 random(seed * 131 + where.second);
+		const auto offset = where.second * options.block_bytes + random() % options.block_bytes;
+		inode.durable[offset] = static_cast<char>(inode.durable[offset] ^ 0x5a);
+		const auto at = "seed " + std::to_string(seed) + " segment " + std::to_string(where.first) + " block " + std::to_string(where.second);
+		try {
+			j::TurnLog log(io, identity, recovered, options);
+			bool only = std::all_of(recovered.lost.begin(), recovered.lost.end(), [&](std::uint64_t g) { return groups.contains(g); });
+			bool kept = true;
+			for (const auto& [group, records] : work.acknowledged) { if (!recovered.lost.contains(group) && recovered.groups[group] != records) { kept = false; } }
+			check(only, "a corrupted block loses only groups with records in it: " + at);
+			check(kept, "every other group keeps its acknowledged records: " + at);
+			if (!kept && std::getenv("T9_DEBUG")) {
+				std::cerr << "  damaged " << recovered.damaged << " lost:"; for (auto g : recovered.lost) std::cerr << ' ' << g;
+				std::cerr << " truth:"; for (auto g : groups) std::cerr << ' ' << g; std::cerr << '\n';
+				for (const auto& [group, records] : work.acknowledged) {
+					if (recovered.lost.contains(group) || recovered.groups[group] == records) { continue; }
+					auto& got = recovered.groups[group];
+					std::cerr << "  group " << group << " acked " << records.size() << " [" << records.front().sequence << ".." << records.back().sequence << "] got " << got.size();
+					if (!got.empty()) { std::cerr << " [" << got.front().sequence << ".." << got.back().sequence << "]"; }
+					std::cerr << '\n';
+				}
+			}
+		} catch (const std::exception& error) { check(false, at + ": " + error.what()); }
+	}
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -226,6 +311,9 @@ int main(int argc, char** argv) {
 			run(seed, cut, second, 60, 5);
 		}
 	}
+	std::uint64_t blocks = 0;
+	for (std::uint64_t seed = 1; seed <= seeds; ++seed) { corrupted_blocks(seed, blocks); }
+	std::cout << blocks << " corrupted blocks; ";
 	std::cout << points << " crash points (" << seconds << " with a second loss in recovery), " << checks << " checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
 }

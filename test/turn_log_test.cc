@@ -129,19 +129,22 @@ void torn_tail() {
 
 void damage() {
 	Directory directory("damage"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
-	j::TurnRecovery recovered;
+	j::TurnRecovery recovered; std::uint64_t at = 0;
 	{
 		j::TurnLog log(io, identity, recovered, small);
 		log.append(std::vector{record(4, 1, 20)});                   // intact, but nothing later
+		log.append(std::vector{record(6, 1, 700)});                  // ends in the damaged block
+		at = log.position();
 		log.append(std::vector{record(1, 1, 300), record(2, 1, 300)});  // damaged below
 		log.append(std::vector{record(3, 1, 300)});
 		log.append(std::vector{record(1, 2, 300)});
 	}
-	// Turn 2 starts after the open record (97 bytes) and turn 1 (122): flip its first fragment.
-	directory.flip(1, 219 + 10);
+	directory.flip(1, at + 10);  // inside turn 2's first fragment header
 	j::TurnLog log(io, identity, recovered, small);
-	check(recovered.damaged && recovered.lost.contains(1) && !recovered.groups.contains(2), "groups whose records the damage held are lost or absent");
-	check(recovered.lost.contains(4) && !recovered.groups.contains(4), "a group that wrote nothing after the damage cannot show it is whole");
+	check(recovered.damaged && recovered.lost.contains(1), "the groups with records in the damaged block are lost");
+	check(recovered.lost.contains(2) || recovered.groups[2] == std::vector{record(2, 1, 300)}, "a record of the damaged turn that reads back whole is kept");
+	check(recovered.groups.contains(4) && !recovered.lost.contains(4), "a group without records in it is kept: the next block's manifest names the damaged block's groups");
+	check(recovered.lost.contains(6), "a group whose record ends in the damaged block is lost with it");
 	check(recovered.groups.contains(3) && recovered.groups[3] == std::vector{record(3, 1, 300)}, "a group whose records follow the damage is kept");
 	check(throws([&] { log.append(std::vector{record(1, 3, 10)}); }), "a lost group rejoins under a new id");
 }
