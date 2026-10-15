@@ -170,7 +170,7 @@ struct Item {
 	std::uint64_t segment = 0, offset = 0;  // the record's first fragment; a gap's block start
 };
 // Per described block: its groups' highest sequences, and where the header naming them is.
-struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0; std::uint32_t block = 0; };
+struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0, epoch = 0; std::uint32_t block = 0; };
 using Manifests = std::map<std::pair<std::uint64_t, std::uint32_t>, BlockManifest>;
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
 	std::uint64_t here = 0;
@@ -187,7 +187,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		const auto epoch = peek64(view.substr(36));
 		if (count != no_manifest) {
 			auto& manifest = manifests[{peek64(view.substr(44)), peek32(view.substr(52))}];
-			manifest.segment = segment; manifest.block = static_cast<std::uint32_t>(index);
+			manifest.segment = segment; manifest.block = static_cast<std::uint32_t>(index); manifest.epoch = epoch;
 			for (std::size_t i = 0; i < count; ++i) { manifest.groups[peek64(view.substr(header_fixed + 16 * i))] = peek64(view.substr(header_fixed + 16 * i + 8)); }
 		}
 		std::size_t position = size;
@@ -507,7 +507,11 @@ inline TurnRecovery TurnLog::recover() {
 		if (found == manifests.end()) { unknown = std::min(unknown, g); return; }
 		for (const auto& [group, _] : found->second.groups) { named.insert(group); }
 	};
-	std::uint64_t last_turn = 0; std::size_t frontier = items.size();  // the last kept turn's end
+	std::uint64_t last_turn = 0;
+	// Per epoch, the block where its last kept turn ends: a manifest is acknowledged only if
+	// the turn that wrote its header was kept, which in its epoch means at or before there.
+	std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> kept_end;
+	auto keep_end = [&](std::uint64_t epoch, std::size_t i) { kept_end[epoch] = {items[i].segment, items[i].offset / options_.block_bytes}; };
 	for (std::size_t e = 0; e < opens.size(); ++e) {
 		auto& open = opens[e];
 		const bool newest_epoch = e + 1 == opens.size();
@@ -556,12 +560,13 @@ inline TurnRecovery TurnLog::recover() {
 				missing_between(std::min(previous_end, turn.first), next, turn.first + 1);
 				for (auto r : turn.records) { kept_records.push_back(r); }
 				last_turn = number; expected = number + 1; previous_end = std::max(turn.first, turn.end) + 1;
+				keep_end(open.epoch, std::max({turn.first, turn.end, turn.records.empty() ? turn.first : turn.records.back()}));
 				continue;
 			}
 			if (number != expected) { damaged = true; missing_between(previous_end, turn.first, previous_end); }
 			for (auto g : gaps) { if (g < turn.end) { gap_damage(g); } }
 			for (auto r : turn.records) { kept_records.push_back(r); }
-			last_turn = number; expected = number + 1; previous_end = turn.end + 1; frontier = turn.end;
+			last_turn = number; expected = number + 1; previous_end = turn.end + 1; keep_end(open.epoch, turn.end);
 		}
 		if (!newest_epoch && last_turn != limit && limit != std::numeric_limits<std::uint64_t>::max()) {
 			damaged = true; missing_between(previous_end, stop, previous_end);
@@ -603,20 +608,19 @@ inline TurnRecovery TurnLog::recover() {
 		if (!result.lost.contains(group)) { result.groups.emplace(group, std::move(kept)); }
 		else { index_.erase(group); }
 	}
-	// A manifest written at or before the last kept turn names acknowledged records: a group
-	// holding less than it names lost its tail, even where the damage read as a segment's
-	// unwritten end. Manifests past the frontier belong to the torn tail.
-	if (frontier < items.size()) {
-		const std::pair<std::uint64_t, std::uint64_t> end{items[frontier].segment, items[frontier].offset / options_.block_bytes};
-		for (const auto& [described, manifest] : manifests) {
-			if (std::pair<std::uint64_t, std::uint64_t>{manifest.segment, manifest.block} > end) { continue; }
-			for (const auto& [group, sequence] : manifest.groups) {
-				if (result.lost.contains(group)) { continue; }
-				auto found = result.groups.find(group);
-				if (found == result.groups.end() || found->second.back().sequence < sequence) {
-					damaged = true; result.lost.insert(group);
-					if (found != result.groups.end()) { result.groups.erase(found); index_.erase(group); }
-				}
+	// A manifest written by a kept turn names acknowledged records: a group holding less than
+	// it names lost its tail, even where the damage read as a segment's unwritten end.
+	// Manifests a lost turn wrote (the newest epoch's torn tail, or an earlier epoch's turns
+	// past what its next open kept) name nothing acknowledged.
+	for (const auto& [described, manifest] : manifests) {
+		auto end = kept_end.find(manifest.epoch);
+		if (end == kept_end.end() || std::pair<std::uint64_t, std::uint64_t>{manifest.segment, manifest.block} > end->second) { continue; }
+		for (const auto& [group, sequence] : manifest.groups) {
+			if (result.lost.contains(group)) { continue; }
+			auto found = result.groups.find(group);
+			if (found == result.groups.end() || found->second.back().sequence < sequence) {
+				damaged = true; result.lost.insert(group);
+				if (found != result.groups.end()) { result.groups.erase(found); index_.erase(group); }
 			}
 		}
 	}

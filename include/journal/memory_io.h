@@ -22,8 +22,8 @@
 
 // An in-memory filesystem for power-loss tests: each unsynced 512-byte sector of a file
 // persists or not at power loss, and namespace changes persist only after a directory sync.
-// Disk::cut makes the I/O operation of that number throw PowerLoss; power_loss() then
-// leaves the state a crash would. Test support, not a storage backend.
+// Disk::cut makes the I/O operation of that number, and every later one, throw PowerLoss;
+// power_loss() then leaves the state a crash would. Test support, not a storage backend.
 
 #pragma once
 
@@ -52,7 +52,10 @@ struct Disk {
 	std::map<std::uint64_t, Inode> inodes; std::map<std::string, std::uint64_t> names, durable_names;
 	std::uint64_t next_inode = 1, operations = 0, cut = std::numeric_limits<std::uint64_t>::max();
 	std::mt19937_64 random{0};
-	void tick() { if (++operations == cut) { throw PowerLoss{}; } }
+	// From the cut on, every operation fails: a disk without power stays without it, even
+	// when a caller turns the first failure into an error and carries on.
+	void tick() { if (++operations >= cut) { throw PowerLoss{}; } }
+	bool dead() const noexcept { return operations >= cut; }
 	std::string content(const Inode& inode) const {
 		std::string bytes = inode.durable; bytes.resize(inode.size, '\0');
 		for (const auto& [s, data] : inode.pending) {

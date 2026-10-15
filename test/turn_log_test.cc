@@ -127,6 +127,34 @@ void torn_tail() {
 	check(end > 20, "the torn turn spans more than the cut");
 }
 
+// An earlier epoch's torn last turn whose next block's header reached the disk: that
+// header's manifest names the torn record, which no open kept. It names nothing
+// acknowledged, so later opens, past later epochs' turns, lose no group over it.
+void torn_turn_in_earlier_epoch() {
+	Directory directory("torn-earlier"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	j::TurnRecovery recovered; Model model; std::mt19937_64 random(8);
+	std::uint64_t kept = 0;
+	{
+		j::TurnLog log(io, identity, recovered, small);
+		for (std::uint64_t s = 1; s <= 3; ++s) { auto r = record(1, s, 40); log.append(std::vector{r}); model[1].push_back(r); }
+		kept = log.sequence(1);
+		// The turn crosses into the next block; only the bytes from that block on persist.
+		auto write = log.stage(std::vector{record(1, kept + 1, 700)});
+		const auto boundary = (write.offset / small.block_bytes + 1) * small.block_bytes;
+		check(boundary < write.offset + write.bytes.size(), "the torn turn crosses a block boundary");
+		auto tail = write.bytes.substr(static_cast<std::size_t>(boundary - write.offset));
+		check(write.file->write_at(boundary, tail) == tail.size(), "the torn turn's tail is written");
+		write.file->sync_data();
+	}
+	{
+		j::TurnLog log(io, identity, recovered, small);
+		check(!recovered.damaged && recovered.lost.empty() && recovered.groups == model, "the torn last turn is dropped whole");
+		for (std::uint64_t s = 1; s <= 3; ++s) { auto r = record(2, s, 40); log.append(std::vector{r}); model[2].push_back(r); }
+	}
+	j::TurnLog log(io, identity, recovered, small);
+	check(!recovered.damaged && recovered.lost.empty() && recovered.groups == model, "an earlier epoch's torn turn costs no group later");
+}
+
 void damage() {
 	Directory directory("damage"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; std::uint64_t at = 0;
@@ -245,7 +273,7 @@ void staged_turns() {
 }  // namespace
 
 int main() {
-	try { round_trip(); torn_tail(); damage(); checkpoints_and_guards(); stale_bytes(); staged_turns(); for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }
+	try { round_trip(); torn_tail(); torn_turn_in_earlier_epoch(); damage(); checkpoints_and_guards(); stale_bytes(); staged_turns(); for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " turn log checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
