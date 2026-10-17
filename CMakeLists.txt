@@ -4,7 +4,7 @@ project(journal LANGUAGES CXX)
 # Durable record storage over completion I/O: the journal, artifacts, mutations,
 # reclamation, inventory, and storage admission. Header-only; no Asio or reactor.
 include(FetchContent)
-FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG c4fe4fc9855e7c0118157738ea8a44eb091c4b90)
+FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 5251cf9f24350c65548318b54a4be93389df73d0)
 FetchContent_MakeAvailable(completion)
 
 add_library(journal INTERFACE)
