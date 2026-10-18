@@ -436,6 +436,21 @@ public:
 		replacement_ = std::make_shared<Replacement>(std::move(*permit), ++next_replacement_, application_cap, bundle_cap);
 		return ReplacementId(owner_, replacement_->token);
 	}
+	// Funding grows before bundle preparation, without changing the replacement identity.
+	bool grow_replacement(const ReplacementId& id, std::uint64_t minimum_bundle_cap) {
+		auto& cycle = replacement(id);
+		if (cycle.created[1] || cycle.prepared[1] || (cycle.builder && cycle.active == 1) || !cycle.permit) {
+			throw std::logic_error("replacement bundle preparation already started");
+		}
+		if (minimum_bundle_cap <= cycle.caps[1]) { return true; }
+		std::array<std::uint64_t, 2> caps{minimum_bundle_cap, cycle.caps[0]};
+		MutationPlan plan;
+		try { plan = journal_->checkpoint_plan(caps); }
+		catch (const std::length_error&) { return false; }
+		if (!admission_->grow_replacement(*cycle.permit, plan.peak)) { return false; }
+		cycle.caps[1] = minimum_bundle_cap;
+		return true;
+	}
 	std::shared_ptr<StoreArtifactOperation> begin_artifact_operation(const ReplacementId& id, ArtifactPart part) {
 		auto& cycle = replacement(id); auto index = part_index(part);
 		if (cycle.builder || cycle.created[index] || (index == 1 && !cycle.prepared[0])) { throw std::logic_error("invalid artifact preparation order"); }

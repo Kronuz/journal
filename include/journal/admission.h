@@ -189,6 +189,25 @@ public:
 		}
 		++state_->value.tickets; return StoragePermit(state_, peak, kind);
 	}
+	// Grow the same protected ticket, including after known preparation IO.
+	bool grow_replacement(StoragePermit& permit, StorageResources minimum) {
+		if (permit.state_ != state_ || permit.class_ != AdmissionClass::Replacement) {
+			throw std::invalid_argument("foreign or non-replacement storage permit");
+		}
+		if (state_->value.tainted) { throw std::logic_error("storage admission tainted"); }
+		StorageResources target{std::max(minimum.logical_bytes, permit.peak_.logical_bytes),
+			std::max(minimum.entries, permit.peak_.entries)};
+		auto delta = detail::resources_subtract(target, permit.peak_);
+		if (!detail::resources_fit(delta, state_->value.replacement_available)) { return false; }
+		auto outstanding = detail::resources_add(state_->value.outstanding, delta);
+		auto held = detail::resources_add(state_->replacement_held, delta);
+		auto available = detail::resources_subtract(state_->value.replacement_available, delta);
+		state_->value.outstanding = outstanding;
+		state_->replacement_held = held;
+		state_->value.replacement_available = available;
+		permit.peak_ = target;
+		return true;
+	}
 	void credit_durable_reclaim(StorageResources removed) {
 		if (state_->value.tainted) { throw std::logic_error("storage admission tainted"); }
 		if (!detail::resources_fit(removed, state_->value.used)) {

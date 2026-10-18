@@ -183,6 +183,38 @@ void control_pack_slots() {
 	control->mark_started(); control->abandon();
 	check(lifecycle.stats().tainted && lifecycle.stats().tickets == 2, "abandonment releases its slot once while fencing uncertain accounting");
 }
+void replacement_growth() {
+	Admission ledger(census({100, 10}), limits);
+	auto permit = ledger.reserve(AdmissionClass::Replacement, {100, 10});
+	check(permit && ledger.grow_replacement(*permit, {200, 20}), "replacement grows within its protected pool");
+	check(permit->peak() == StorageResources{200, 20} && ledger.stats().tickets == 1,
+		"growth preserves the same ticket");
+	auto before = ledger.stats();
+	check(!ledger.grow_replacement(*permit, {301, 31}), "growth cannot steal ordinary or control capacity");
+	auto after = ledger.stats();
+	check(after.outstanding == before.outstanding && after.replacement_available == before.replacement_available &&
+		after.tickets == before.tickets && !after.tainted, "refused growth changes no accounting");
+	check(ledger.grow_replacement(*permit, {150, 15}) && permit->peak() == StorageResources{200, 20},
+		"growth never shrinks an existing permit");
+	permit->mark_started();
+	check(ledger.grow_replacement(*permit, {250, 25}), "known started preparation permits further funding");
+	bounded(ledger);
+	Admission other(census({100, 10}), limits);
+	check(throws([&] { other.grow_replacement(*permit, {260, 26}); }), "foreign growth is rejected");
+	auto normal = ledger.reserve(AdmissionClass::Normal, {10, 1});
+	check(normal && throws([&] { ledger.grow_replacement(*normal, {20, 2}); }), "normal tickets cannot grow through replacement funding");
+	normal.reset();
+	permit->settle({120, 12});
+	check(ledger.stats().tickets == 0 && ledger.stats().replacement_available == limits.replacement_pool,
+		"settlement refunds the unused grown capacity");
+	check(throws([&] { ledger.grow_replacement(*permit, {260, 26}); }), "settled growth is rejected");
+	permit = ledger.reserve(AdmissionClass::Replacement, {100, 10});
+	check(permit && ledger.grow_replacement(*permit, {300, 30}), "a fresh replacement can grow after settlement");
+	permit.reset();
+	check(ledger.stats().tickets == 0 && ledger.stats().replacement_available == limits.replacement_pool,
+		"unstarted cancellation refunds all grown capacity");
+	bounded(ledger);
+}
 void schedules() {
 	Admission ledger(census({100, 10}), limits); std::mt19937 random(0x504f4f4c); std::vector<StoragePermit> held;
 	for (unsigned step = 0; step < 2000; ++step) {
@@ -201,6 +233,6 @@ void schedules() {
 }
 }
 int main() {
-	try { pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); schedules(); } catch (const std::exception& error) { check(false, error.what()); }
+	try { replacement_growth(); pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); schedules(); } catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " admission checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }

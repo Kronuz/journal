@@ -650,7 +650,7 @@ void store_publication_completions() {
 	}
 }
 
-void store_artifact_completions() {
+void store_artifact_completions(bool grown = false) {
 	for (unsigned phase = 0; phase < 3; ++phase) {
 		for (bool detached : {false, true}) {
 			for (bool uncertain : {false, true}) {
@@ -660,6 +660,7 @@ void store_artifact_completions() {
 				auto id = store->reserve_replacement(128, 128); auto used = store->accounting()->used;
 				check(bool(id), "completion preparation reserves complete replacement cycle");
 				if (!id) { return; }
+				if (grown) { check(store->grow_replacement(*id, 256), "original-completion fixture grows replacement funding"); }
 				auto job = store->begin_artifact_operation(*id, ArtifactPart::Application);
 				if (phase > 0) { drive_synchronously(*job); job->result(); job = store->begin_write_chunk(*id, "payload"); }
 				if (phase > 1) { drive_synchronously(*job); job->result(); job = store->begin_finish_artifact(*id); }
@@ -761,6 +762,48 @@ void store_reclaim_before_inventory() {
 		check(!store.accounting() && store.inventory_stats().entries == 0, "pre-census mutation invalidates the old partial inventory");
 		ready_store(store); store_exact(model, store);
 		check(store.accounting()->used.entries == model.visible.size(), "fresh post-cleanup census charges exactly the surviving namespace");
+	}
+}
+
+void store_replacement_growth() {
+	for (bool owned : {false, true}) {
+		Model model; auto io = std::make_shared<MemoryIO>(model);
+		Store store(io, store_limits, 1024, 8192);
+		store.create(identity()); ready_store(store);
+		auto append = store.reserve_append(AdmissionClass::Normal, 1);
+		store.append(*append, "x");
+		auto id = store.reserve_replacement(16, 16);
+		check(bool(id), "growth fixture reserves one replacement");
+		if (!id) { continue; }
+		if (owned) {
+			auto job = store.begin_artifact_operation(*id, ArtifactPart::Application);
+			check(throws([&] { store.grow_replacement(*id, 128); }), "growth waits for the original preparation quantum");
+			drive_synchronously(*job); job->result(); job.reset();
+		} else { store.begin_artifact(*id, ArtifactPart::Application); }
+		auto operations = model.operations;
+		check(store.grow_replacement(*id, 128) && store.grow_replacement(*id, 64),
+			"started application preparation permits monotonic bundle growth");
+		check(model.operations == operations, "reservation growth performs no IO");
+		auto before = *store.accounting();
+		check(!store.grow_replacement(*id, 4096) && !store.grow_replacement(*id, 8193),
+			"protected capacity and artifact bounds refuse growth");
+		auto after = *store.accounting();
+		check(before.outstanding == after.outstanding && before.replacement_available == after.replacement_available &&
+			before.tickets == after.tickets && !after.tainted && !store.fenced(),
+			"refused growth preserves the live reservation and accounting");
+		store.write_chunk(*id, "app"); store.finish_artifact(*id);
+		store.verify_artifact(*id, ArtifactPart::Application);
+		check(store.grow_replacement(*id, 256), "verified application retains the same growable replacement");
+		store.begin_artifact(*id, ArtifactPart::Bundle);
+		check(throws([&] { store.grow_replacement(*id, 512); }) && !store.fenced(),
+			"bundle preparation closes the funding-growth phase");
+		store.write_chunk(*id, std::string(256, 'b')); store.finish_artifact(*id);
+		store.publish(*id, 1); store_exact(model, store);
+		check(throws([&] { store.grow_replacement(*id, 512); }), "published replacement IDs cannot grow new work");
+		auto canceled = store.reserve_replacement(16, 16);
+		check(canceled && store.grow_replacement(*canceled, 128), "a later cycle grows independently");
+		store.cancel_replacement(*canceled); store_exact(model, store);
+		check(store.accounting()->tickets == 0 && !store.fenced(), "grown unstarted cancellation settles its ticket");
 	}
 }
 
@@ -1695,7 +1738,7 @@ void posix() {
 } // namespace
 
 int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); store_artifact_completions(true); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_replacement_growth(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

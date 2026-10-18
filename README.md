@@ -13,6 +13,8 @@ a write-ahead log with real durability barriers.
 
 ![journal: a Store over the per-group journal and the shared turn log, on completion I/O](docs/journal.svg)
 
+`Store::grow_replacement(id, minimum_bundle_cap)` increases an existing protected checkpoint reservation without I/O or a new replacement identity. It returns false if the additional capacity or backend artifact bound is unavailable, preserving the reservation. Growth may follow settled application preparation, but not pending original I/O or the start of bundle preparation. `Admission::grow_replacement` preserves the same permit and ticket; durable settlement and uncertain-I/O fencing remain unchanged.
+
 ## ✨ Highlights
 
 - **Durable means durable.** Every append returns only after its barriers, and macOS
