@@ -4,13 +4,15 @@ project(journal LANGUAGES CXX)
 # Durable record storage over completion I/O: the journal, artifacts, mutations,
 # reclamation, inventory, and storage admission. Header-only; no Asio or reactor.
 include(FetchContent)
-FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 5251cf9f24350c65548318b54a4be93389df73d0)
-FetchContent_MakeAvailable(completion)
+FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 21809c7ae35d19ee7707692e2d8bae6d8a7a92a8)
+# Fixed-vector reservation accounting shared with managed local storage.
+FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG b7daa52f1b6a316e04bba2817f0f527d64d704eb)
+FetchContent_MakeAvailable(completion allocators)
 
 add_library(journal INTERFACE)
 target_include_directories(journal INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(journal INTERFACE cxx_std_20)
-target_link_libraries(journal INTERFACE completion::completion)
+target_link_libraries(journal INTERFACE completion::completion allocators::resources)
 add_library(journal::journal ALIAS journal)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

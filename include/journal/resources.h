@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <allocators/resources.h>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -32,19 +33,20 @@ struct StorageResources {
 	bool operator==(const StorageResources&) const = default;
 };
 namespace detail {
+inline allocators::ResourceVector<2> resource_vector(StorageResources value) noexcept {
+	return {{value.logical_bytes, value.entries}};
+}
+inline StorageResources storage_resources(allocators::ResourceVector<2> value) noexcept {
+	return {value.values[0], value.values[1]};
+}
 inline bool resources_fit(StorageResources value, StorageResources limit) noexcept {
-	return value.logical_bytes <= limit.logical_bytes && value.entries <= limit.entries;
+	return resource_vector(value).fits(resource_vector(limit));
 }
 inline StorageResources resources_add(StorageResources a, StorageResources b) {
-	constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
-	if (b.logical_bytes > maximum - a.logical_bytes || b.entries > maximum - a.entries) {
-		throw std::overflow_error("storage accounting overflow");
-	}
-	return {a.logical_bytes + b.logical_bytes, a.entries + b.entries};
+	return storage_resources(resource_vector(a).added(resource_vector(b)));
 }
-// Callers establish resources_fit(b, a) before subtraction.
-inline StorageResources resources_subtract(StorageResources a, StorageResources b) noexcept {
-	return {a.logical_bytes - b.logical_bytes, a.entries - b.entries};
+inline StorageResources resources_subtract(StorageResources a, StorageResources b) {
+	return storage_resources(resource_vector(a).subtracted(resource_vector(b)));
 }
 } // namespace detail
 } // namespace kronuz::journal

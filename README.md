@@ -117,3 +117,9 @@ new primitive; read [AGENTS.md](AGENTS.md) first. CI must pass on every platform
 ## 📄 License
 
 MIT, Copyright (c) 2026 Germán Méndez Bravo. See [LICENSE](LICENSE).
+
+## Shared reservation accounting
+
+Journal delegates checked resource arithmetic and committed/reserved counters to `allocators::resources`. Its public storage permits, protected control/replacement pools and slot limits remain Journal policy. Permits retain their admission owner through completion, and known-unstarted cancellation refunds explicitly. Started or uncertain abandonment fences admission and preserves reserved debt. No disk format or I/O backend changes with this extraction.
+
+The shared aliases preserve C++ source names, but their canonical type identities and some internal object layouts change. Rebuild C++ dependents together; do not mix precompiled objects from before and after this extraction. Persisted formats are unchanged by these allocation/accounting moves.

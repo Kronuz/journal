@@ -68,6 +68,15 @@ void uncertainty() {
 	check(!clean.stats().tainted && clean.stats().outstanding == StorageResources{}, "unused tickets cancel before IO");
 	{ auto ticket = clean.reserve(AdmissionClass::Normal, {10, 1}); ticket->mark_started(); }
 	check(clean.stats().tainted && clean.stats().outstanding == StorageResources{10, 1} && !clean.reserve(AdmissionClass::Control, {1, 1}), "lost completion taints accounting and retains uncertain reservation");
+	std::optional<StoragePermit> detached_uncertain;
+	{
+		Admission temporary(census({100, 10}), limits);
+		detached_uncertain = temporary.reserve(AdmissionClass::Normal, {10, 1});
+	}
+	auto detached_peak = detached_uncertain->peak();
+	detached_uncertain->abandon();
+	check(detached_uncertain->peak() == detached_peak,
+		"explicit abandonment preserves permit metadata after facade destruction");
 	Admission explicit_failure(census({100, 10}), limits); auto failure = explicit_failure.reserve(AdmissionClass::Normal, {10, 1}); failure->abandon();
 	check(explicit_failure.stats().tainted, "explicit uncertain failure stops admission");
 	Admission invalid(census({100, 10}), limits); auto ticket = invalid.reserve(AdmissionClass::Normal, {10, 1});
