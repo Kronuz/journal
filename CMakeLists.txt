@@ -5,15 +5,14 @@ project(journal LANGUAGES CXX)
 # reclamation, inventory, and storage admission. Header-only; no Asio or reactor.
 include(FetchContent)
 FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 373f02a219a91e32af035abf6fb909a8211aef8b)
-# CRC-32C only: HASHES_FAMILIES OFF keeps hashes from fetching static-string and char-classify.
-FetchContent_Declare(hashes GIT_REPOSITORY https://github.com/Kronuz/hashes.git GIT_TAG 233254bc6552cd9c718d4120a850c5487825b32a)
-set(HASHES_FAMILIES OFF)
-FetchContent_MakeAvailable(completion hashes)
+# CRC-32C: one implementation, header-only, no dependencies.
+FetchContent_Declare(crc32c GIT_REPOSITORY https://github.com/Kronuz/crc32c.git GIT_TAG 04737c35c6b22f6edf4942757c7b2da084f7bd81)
+FetchContent_MakeAvailable(completion crc32c)
 
 add_library(journal INTERFACE)
 target_include_directories(journal INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(journal INTERFACE cxx_std_20)
-target_link_libraries(journal INTERFACE completion::completion hashes::crc32c)
+target_link_libraries(journal INTERFACE completion::completion crc32c::crc32c)
 add_library(journal::journal ALIAS journal)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
