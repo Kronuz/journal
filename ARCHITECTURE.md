@@ -26,7 +26,7 @@ Append complete batch → sync journal → create/write temporary manifest
 
 The frontier names the storage identity, generation, byte offset, and contiguous batch
 sequence. Batches carry checksums for framing and payload; native structs never reach
-the disk. CRC-32C detects accidental corruption and does not authenticate data; `crc32c()` and `Checksum` forward to `hashes::crc32c`, the one implementation, with the same bytes on disk. The batch
+the disk. CRC-32C detects accidental corruption and does not authenticate data; `crc32c()` and `Checksum` forward to `kronuz::crc32c` (the crc32c library), the one implementation, with the same bytes on disk. The batch
 bound defaults to 64 MiB, and admission rejects an oversized batch before storage
 changes. The `IO` instance outlives the journal and every builder, prepared handle, and
 reader.

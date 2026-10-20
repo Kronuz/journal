@@ -22,7 +22,7 @@
 
 #pragma once
 
-#include "crc32c.hh"
+#include <crc32c/crc32c.hh>
 
 #include <array>
 #include <cstdint>
@@ -37,9 +37,9 @@ public:
 	using std::runtime_error::runtime_error;
 };
 
-// CRC-32C lives in hashes; these names forward to it.
-using Checksum = hashes::Crc32c;
-inline std::uint32_t crc32c(std::string_view bytes) noexcept { return hashes::crc32c(bytes); }
+// CRC-32C lives in the crc32c library; these names forward to it.
+using Checksum = ::kronuz::crc32c::Crc32c;
+inline std::uint32_t crc32c(std::string_view bytes) noexcept { return ::kronuz::crc32c::crc32c(bytes); }
 
 inline void put32(std::string& bytes, std::uint32_t value) {
 	for (unsigned i = 0; i < 4; ++i) { bytes.push_back(static_cast<char>(value >> (i * 8))); }
