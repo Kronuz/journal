@@ -240,11 +240,21 @@ void journal_fixture() {
 		auto name = entry.path().filename().string();
 		if (!name.starts_with("manifest") && !name.starts_with("generation-") && !name.starts_with("artifact-")) { continue; }
 		auto damaged = scratch("journal-damaged"); fs::copy(directory, damaged, fs::copy_options::recursive);
-		flip(damaged / name, name.starts_with("manifest") ? 20 : name.starts_with("generation-") ? file_header_v2_size + batch_header_size + 2 : 100);
-		check(throws([&] {
-			j::PosixIO io(damaged); j::Journal journal(io, 1 << 20);
-			journal.recover([](auto, auto) {}, [](const j::Frontier&, j::ArtifactReader& a, std::span<j::ArtifactReader> r) { read_artifact(a); for (auto& d : r) { read_artifact(d); } });
-		}), "a flipped byte is refused");
+		// The generation's first batch is empty, so its second batch's payload starts two headers in.
+		auto payload = file_header_v2_size + 2 * batch_header_size;
+		// Each check is pinned by flipping the byte it covers and, separately, the CRC it compares against.
+		auto last = fs::file_size(damaged / name) - 1;
+		std::vector<std::uint64_t> offsets{20u, last};
+		if (name.starts_with("generation-")) { offsets = {payload - 1, payload + 2, payload + 100, last}; }
+		if (name.starts_with("artifact-")) { offsets = {100u, j::detail::artifact_ownership_size - 1, last}; }
+		for (auto offset : offsets) {
+			fs::remove_all(damaged); fs::copy(directory, damaged, fs::copy_options::recursive);
+			flip(damaged / name, offset);
+			check(throws([&] {
+				j::PosixIO io(damaged); j::Journal journal(io, 1 << 20);
+				journal.recover([](auto, auto) {}, [](const j::Frontier&, j::ArtifactReader& a, std::span<j::ArtifactReader> r) { read_artifact(a); for (auto& d : r) { read_artifact(d); } });
+			}), "a flipped byte is refused");
+		}
 		fs::remove_all(damaged);
 	}
 	fs::remove_all(directory);
@@ -267,19 +277,21 @@ void turn_log_fixture() {
 	check(recovered.groups == expected && !expected.empty(), "every turn-log record reads back");
 	fs::remove_all(directory); fs::remove_all(scratch("turn-log-reference"));
 
-	// A flipped byte in a block header is a gap, not a silent success.
-	auto damaged = copy_fixture("turn-log");
-	std::vector<fs::path> segments;
-	for (const auto& entry : fs::directory_iterator(damaged)) { if (entry.path().filename().string().starts_with("turns-")) { segments.push_back(entry.path()); } }
-	std::sort(segments.begin(), segments.end());
-	check(!segments.empty(), "the fixture holds turn-log segments");
-	if (!segments.empty()) {
-		flip(segments.front(), 60);
-		j::PosixIO damaged_io(damaged); auto damaged_owner = damaged_io.acquire_owner(true);
-		j::TurnRecovery after; j::TurnLog log(damaged_io, turn_identity, after, turn_options);
-		check(after.damaged || after.groups != expected, "a damaged block does not read back as intact");
+	// A flipped byte anywhere in a segment, header or payload, is damage or a lost record, never a silent success.
+	for (std::uint64_t offset : {40, 60, 100, 200, 300, 450, 511, 700, 1500, 3000}) {
+		auto damaged = copy_fixture("turn-log");
+		std::vector<fs::path> segments;
+		for (const auto& entry : fs::directory_iterator(damaged)) { if (entry.path().filename().string().starts_with("turns-")) { segments.push_back(entry.path()); } }
+		std::sort(segments.begin(), segments.end());
+		check(!segments.empty(), "the fixture holds turn-log segments");
+		if (!segments.empty() && fs::file_size(segments.front()) > offset) {
+			flip(segments.front(), offset);
+			j::PosixIO damaged_io(damaged); auto damaged_owner = damaged_io.acquire_owner(true);
+			j::TurnRecovery after; j::TurnLog log(damaged_io, turn_identity, after, turn_options);
+			check(after.damaged || !after.lost.empty() || after.groups != expected, "a damaged turn-log byte does not read back as intact");
+		}
+		fs::remove_all(damaged);
 	}
-	fs::remove_all(damaged);
 }
 #endif
 }  // namespace
