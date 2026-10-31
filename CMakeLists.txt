@@ -6,7 +6,7 @@ project(journal LANGUAGES CXX)
 include(FetchContent)
 FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 21809c7ae35d19ee7707692e2d8bae6d8a7a92a8)
 # Fixed-vector reservation accounting shared with managed local storage.
-FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG b7daa52f1b6a316e04bba2817f0f527d64d704eb)
+FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG 2fc537f2fd616c4163c1d100c5e26b121b592890)
 # CRC-32C: one implementation, header-only, no dependencies.
 FetchContent_Declare(crc32c GIT_REPOSITORY https://github.com/Kronuz/crc32c.git GIT_TAG 04737c35c6b22f6edf4942757c7b2da084f7bd81)
 FetchContent_MakeAvailable(completion allocators crc32c)
