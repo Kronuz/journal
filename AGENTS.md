@@ -27,7 +27,7 @@ test/             journal, inventory, admission, turn_log, turn_log_power (T9),
 fuzz/             libFuzzer target for turn-log segments and checkpoint records, and its replay test.
 bench/            append, checkpoint, reclaim, turn, and completion benchmarks.
 examples/demo.cc  A small command-line tool.
-docs/             MEASUREMENTS.md; journal.d2, the README diagram's source.
+docs/             MEASUREMENTS.md.
 ```
 
 ## Verify a change
@@ -39,8 +39,7 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on
 The power-loss and shared-store tests allow up to 600 s; macOS makes a full flush per
 turn. The fuzzer needs Clang: configure with `-DJOURNAL_FUZZ=ON` and run
 `build/journal_fuzz`. CTest's fixtures create the build's own `.scratch/`, so a fresh
-build directory needs nothing set up by hand. To redraw the README diagram:
-`d2 --layout elk --sketch --theme 302 docs/journal.d2 docs/journal.svg`.
+build directory needs nothing set up by hand.
 
 ## Rules for storage code
 

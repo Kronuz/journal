@@ -122,6 +122,12 @@ settled taints the ledger. The journal's `bootstrap_plan()`, `append_plan()`, an
 `checkpoint_plan()` compute the footprints to reserve; `resources.h` holds the value
 types and checked arithmetic.
 
+The checked arithmetic and the committed and reserved counters come from
+`allocators::resources`; the storage permits, the Control and Replacement pools and the
+slot limits are the journal's own policy. A permit keeps its admission owner through
+completion, and cancelling a permit known not to have started refunds it explicitly.
+Abandoning a started or uncertain operation fences admission and keeps the reserved debt.
+
 ### Store
 
 `Store` (`store.h`) owns a journal, its census, its accounting session, and one
@@ -132,6 +138,13 @@ replacement cycle before capture, prepares Application then Bundle with
 `publish()`es. Ordinary appends interleave with preparation. Known cancellation charges
 the staged orphans until reclamation removes them; uncertain errors fence journal and
 accounting together.
+
+`grow_replacement(id, minimum_bundle_cap)` raises an existing protected checkpoint
+reservation without I/O and without a new replacement identity. It returns false, and
+keeps the reservation as it was, when the extra capacity or the backend's artifact bound is
+unavailable. Growth may follow settled Application preparation, but not pending original
+I/O or the start of Bundle preparation. `Admission::grow_replacement` keeps the same
+permit and ticket.
 
 ## Completion-driven operations
 
