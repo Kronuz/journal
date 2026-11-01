@@ -4,9 +4,9 @@ project(journal LANGUAGES CXX)
 # Durable record storage over completion I/O: the journal, artifacts, mutations,
 # reclamation, inventory, and storage admission. Header-only; no Asio or reactor.
 include(FetchContent)
-FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 21809c7ae35d19ee7707692e2d8bae6d8a7a92a8)
+FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 43d3fef84e88ca144a7e518bd57e9d635ef45624)
 # Fixed-vector reservation accounting shared with managed local storage.
-FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG 2fc537f2fd616c4163c1d100c5e26b121b592890)
+FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG c558fa76521857d8547ca9267bce8ed8aac70835)
 # CRC-32C: one implementation, header-only, no dependencies.
 FetchContent_Declare(crc32c GIT_REPOSITORY https://github.com/Kronuz/crc32c.git GIT_TAG 04737c35c6b22f6edf4942757c7b2da084f7bd81)
 FetchContent_MakeAvailable(completion allocators crc32c)
