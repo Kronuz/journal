@@ -144,11 +144,11 @@ void actual_backend(const std::filesystem::path &directory) {
 	}
 	check(journal.finish_append(operation).sequence == 1, "terminal barrier permits acknowledged frontier");
 	auto stats = queue.stats();
-	check(stats.native_submitted >= 5 && stats.native_completed == stats.native_submitted,
-		  "actual journal and manifest writes use reaped native IO");
-	check(stats.fallback_completed == stats.fallback_submitted && stats.fallback_submitted >= 1,
-		  "validated composite operations use the bounded fallback slot");
-	check(stats.file_write_bytes == 150000 + 24 + 52, "backend reports exact completed file write bytes");
+	// Three 64 KiB chunks of the record and its commit slot; no manifest, no namespace change.
+	check(stats.native_submitted >= 4 && stats.native_completed == stats.native_submitted,
+		  "actual record and commit slot writes use reaped native IO");
+	check(stats.fallback_completed == stats.fallback_submitted, "every fallback primitive is reaped");
+	check(stats.file_write_bytes == 150000 + 24 + 28, "backend reports exact completed file write bytes");
 	check(!queue.busy() && !queue.poll(), "drained queue has no retained result");
 	std::cout << "native=" << stats.native_completed << " fallback=" << stats.fallback_completed
 			  << " steps=" << steps << '\n';
