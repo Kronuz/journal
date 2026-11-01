@@ -93,6 +93,38 @@ Not for:
 - **Network filesystems or storage that ignores flushes.** The durability model assumes a
   local filesystem that honors `fsync` and atomic rename.
 
+## ⚡ Performance
+
+`journal_bench --compare` appends 64 batches of 1, 32 or 256 operations of 256 bytes each and
+times each `append_batch()` until it returns durable; the table gives the median append in
+milliseconds, the range over two runs. The comparator, the *plain loop*, is what a caller writes
+without the library: one `write` and one `F_FULLFSYNC` per batch to one file, with no batch
+header, checksum, manifest or recovery. Before timing, the bench checks that the journal's
+recovered batches, the plain file and the input are the same bytes. Counted over the journal's
+192 appends on both Macs, a journal append makes three `F_FULLFSYNC` calls, one `fsync` and
+three `pwrite` calls; the plain loop makes one `F_FULLFSYNC`, so it waits about a third as long.
+
+| Operations per batch | journal, Apple M4 Pro (ms) | plain loop, M4 Pro (ms) | journal, Intel Core i9-9980HK (ms) | plain loop, i9 (ms) |
+|---:|---:|---:|---:|---:|
+| 1 | 13.0 to 15.0 | 4.0 to 4.1 | 63.0 to 63.4 | 21.0 |
+| 32 | 13.1 to 13.2 | 4.1 to 4.6 | 63.1 to 63.3 | 21.0 |
+| 256 | 12.2 to 12.9 | 4.0 | 63.1 to 63.6 | 21.0 to 21.2 |
+
+The flush sets the pace, so throughput grows with the batch: at 256 operations per batch the
+journal makes 19,500 to 20,000 operations durable per second on the M4 Pro and 3,900 to 4,000
+on the i9. [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md) has the checkpoint and reclamation
+benchmarks.
+
+Apple M4 Pro (arm64), macOS 26.7.2, internal SSD, and Intel Core i9-9980HK (x86_64), macOS
+15.8.1, internal SSD, both with Apple clang 17.0.0 and `-O3 -DNDEBUG`, at `5a94035`; run it from
+the repository root:
+
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target journal_bench
+./build/journal_bench --compare
+```
+
 ## 📚 Documentation
 
 - [ARCHITECTURE.md](ARCHITECTURE.md): the contract, checkpoints, reclamation, admission,
@@ -113,7 +145,7 @@ ctest --test-dir build --output-on-failure
 
 The benchmarks (`journal_bench`, `journal_checkpoint_bench`, `journal_reclaim_bench`,
 `journal_turn_bench`) build with the tests, run from the repository root and write under
-`.scratch/`. Add `-DJOURNAL_FUZZ=ON` (Clang) for the libFuzzer target.
+`.scratch/`; `journal_bench --compare` adds the plain write-and-flush loop. Add `-DJOURNAL_FUZZ=ON` (Clang) for the libFuzzer target.
 
 ## 🤝 Contributing
 
