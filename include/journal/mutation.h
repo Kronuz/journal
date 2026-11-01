@@ -168,6 +168,21 @@ class AppendMutation : public IOOperation {
 				publication_.complete(std::move(completion));
 			} else if (phase_ == Phase::Sync) {
 				phase_ = Phase::Publication;
+			} else if (phase_ == Phase::Order) {
+				phase_ = Phase::Slot;
+			} else if (phase_ == Phase::Commit) {
+				phase_ = Phase::Committed;
+			} else if (phase_ == Phase::Record || phase_ == Phase::Slot) {
+				auto &bytes = phase_ == Phase::Record ? header_ : payload_;
+				if (!completion.count || completion.count > std::min<std::size_t>(detail::artifact_chunk_size,
+																				  bytes.size() - written_)) {
+					throw std::runtime_error("journal write made invalid progress");
+				}
+				written_ += completion.count;
+				if (written_ == bytes.size()) {
+					written_ = 0;
+					phase_ = phase_ == Phase::Record ? Phase::Order : Phase::Commit;
+				}
 			} else {
 				auto &bytes = phase_ == Phase::Header ? header_ : payload_;
 				if (!completion.count || completion.count > std::min<std::size_t>(detail::artifact_chunk_size,
@@ -190,7 +205,9 @@ class AppendMutation : public IOOperation {
 		}
 		return true;
 	}
-	bool done() const noexcept override { return error_ || turned_ || (phase_ == Phase::Publication && publication_.done()); }
+	bool done() const noexcept override {
+		return error_ || turned_ || phase_ == Phase::Committed || (phase_ == Phase::Publication && publication_.done());
+	}
 	bool in_flight() const noexcept override { return in_flight_; }
 	void result() const {
 		if (!done() || in_flight_) {
@@ -217,6 +234,19 @@ class AppendMutation : public IOOperation {
 		refresh_request();
 		owner_->mutation_active = true;
 	}
+	// A generation with commit slots: the record (header and batch) past the frontier, an
+	// ordering flush, the slot naming the new frontier, and the flush that acknowledges it.
+	// The first flush needs only to order the record before the slot.
+	struct Slots {};
+	AppendMutation(std::shared_ptr<IO> io, std::shared_ptr<detail::OwnerSession> owner, std::shared_ptr<File> data,
+				   std::uint64_t offset, std::string record, std::uint64_t slot_offset, std::string slot,
+				   MutationToken token, Slots)
+		: io_(std::move(io)), owner_(std::move(owner)), data_(std::move(data)), offset_(offset),
+		  slot_offset_(slot_offset), header_(std::move(record)), payload_(std::move(slot)), phase_(Phase::Record) {
+		request_.token = token;
+		refresh_request();
+		owner_->mutation_active = true;
+	}
 	// A turn record: the batch is one record of the core's turn log, durable at its turn's
 	// barrier; the turn driver submits and completes it.
 	struct Turn {};
@@ -232,6 +262,17 @@ class AppendMutation : public IOOperation {
 		}
 		if (phase_ == Phase::Publication) {
 			request_ = publication_.request();
+		} else if (phase_ == Phase::Record || phase_ == Phase::Slot) {
+			request_ = {};
+			request_.file = data_;
+			request_.kind = PrimitiveKind::Write;
+			const auto &bytes = phase_ == Phase::Record ? header_ : payload_;
+			request_.offset = (phase_ == Phase::Record ? offset_ : slot_offset_) + written_;
+			request_.bytes = std::string_view(bytes).substr(written_, detail::artifact_chunk_size);
+		} else if (phase_ == Phase::Order || phase_ == Phase::Commit) {
+			request_ = {};
+			request_.file = data_;
+			request_.kind = PrimitiveKind::Sync;
 		} else {
 			request_ = {};
 			request_.file = data_;
@@ -244,11 +285,13 @@ class AppendMutation : public IOOperation {
 		}
 		request_.token = token;
 	}
-	enum class Phase { Header, Payload, Sync, Publication, Turn };
+	// Header, Payload, Sync, Publication: a generation that publishes its manifest per append.
+	// Record, Order, Slot, Commit: one with commit slots (header_ holds the record, payload_ the slot).
+	enum class Phase { Header, Payload, Sync, Publication, Turn, Record, Order, Slot, Commit, Committed };
 	std::shared_ptr<IO> io_;
 	std::shared_ptr<detail::OwnerSession> owner_;
 	std::shared_ptr<File> data_;
-	std::uint64_t offset_;
+	std::uint64_t offset_, slot_offset_ = 0;
 	std::string header_, payload_;
 	detail::PublicationSteps publication_;
 	MutationRequest request_;

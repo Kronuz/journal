@@ -42,6 +42,10 @@ struct Frontier {
 	std::uint64_t offset = 28;
 	std::uint64_t sequence = 0;
 	std::uint32_t version = 1;
+	// The generation file holds the frontier in two commit slots, so an append publishes no
+	// manifest; the manifest then names the generation's base. False for a generation that
+	// publishes the manifest per append, which recovery and appends still read and write.
+	bool commit_slots = false;
 	Identity journal_identity{};
 	std::uint64_t base_sequence = 0;
 	std::optional<ArtifactDescriptor> checkpoint;
@@ -131,7 +135,8 @@ public:
 	// Plans live beside the format encoder. Peak includes simultaneous
 	// temporary names/bytes; successful settlement credits only removed names.
 	static MutationPlan bootstrap_plan() {
-		auto bytes = std::uint64_t(file_header_size) + encode_manifest(Frontier{}).size();
+		Frontier initial; initial.commit_slots = true; initial.offset = records_start;
+		auto bytes = std::uint64_t(records_start) + encode_manifest(initial).size();
 		return {{bytes, 4}, {bytes, 3}, {}};
 	}
 	static MutationPlan append_footprint(std::size_t payload_bound) {
@@ -166,14 +171,14 @@ public:
 		if (payload_bounds.empty() || payload_bounds.size() > maximum_dependencies + 1) {
 			throw std::invalid_argument("invalid checkpoint artifact count");
 		}
-		Frontier target = frontier_; target.version = 2; target.checkpoint = ArtifactDescriptor{};
+		Frontier target = frontier_; target.version = 2; target.commit_slots = !shared(); target.checkpoint = ArtifactDescriptor{};
 		target.dependencies.assign(payload_bounds.size() - 1, ArtifactDescriptor{});
 		if (shared()) {
 			StorageResources artifacts;
 			for (auto bound : payload_bounds) { artifacts = detail::resources_add(artifacts, artifact_footprint(bound)); }
 			return {artifacts, artifacts, {}};
 		}
-		StorageResources added{std::uint64_t(file_header_v2_size) + encode_manifest(target).size(), 2};
+		StorageResources added{std::uint64_t(records_start) + encode_manifest(target).size(), 2};
 		for (auto bound : payload_bounds) { added = detail::resources_add(added, artifact_footprint(bound)); }
 		return {added, added, {encode_manifest(frontier_).size(), 1}};
 	}
@@ -251,7 +256,7 @@ public:
 		}
 		try {
 			owner_->lock = io_.acquire_owner(false);
-			Frontier base = legacy; base.sequence = legacy.base_sequence;
+			Frontier base = legacy; base.sequence = legacy.base_sequence; base.commit_slots = false;  // a turn record names no generation file
 			record_sequence_ = turns_->sequence(group_);
 			turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(base)});
 			for (auto& batch : batches) { turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Batch, std::move(batch)}); }
@@ -278,9 +283,9 @@ public:
 			// Reserve the final metadata name exclusively. A damaged existing
 			// store with a missing lock must never be reinitialized over it.
 			auto reservation = io_.create_exclusive(manifest_name);
-			frontier_.identity = identity;
+			frontier_.identity = identity; frontier_.commit_slots = true; frontier_.offset = records_start;
 			data_ = io_.create_exclusive(data_name(frontier_));
-			auto header = file_header(frontier_);
+			auto header = generation_image(frontier_);
 			write_all(*data_, 0, header);
 			data_->sync();
 			// Establish the generation and stable lock before referencing them.
@@ -313,13 +318,15 @@ public:
 			frontier_ = decode_manifest(std::string_view(raw.data(), static_cast<std::size_t>(manifest_length)));
 			data_ = io_.open_existing(data_name(frontier_));
 			auto size = data_->size();
-			if (size < frontier_.offset) { throw Corruption("journal shorter than durable frontier"); }
+			if (size < (frontier_.commit_slots ? records_start : frontier_.offset)) { throw Corruption("journal shorter than durable frontier"); }
 			auto expected_header = file_header(frontier_);
-			std::array<char, file_header_v2_size> raw_header{};
-			read_all(*data_, 0, std::span<char>(raw_header.data(), expected_header.size()));
-			if (std::string_view(raw_header.data(), expected_header.size()) != expected_header) {
+			std::string image(frontier_.commit_slots ? records_start : expected_header.size(), '\0');
+			read_all(*data_, 0, std::span<char>(image.data(), image.size()));
+			if (std::string_view(image).substr(0, expected_header.size()) != expected_header) {
 				throw Corruption("journal identity or header mismatch");
 			}
+			std::optional<Commits> commits;
+			if (frontier_.commit_slots) { commits = read_commits(image, expected_header); }
 			if (frontier_.checkpoint) {
 				validate_artifact_bound(*frontier_.checkpoint);
 				ArtifactReader checkpoint(io_, owner_, frontier_.identity, *frontier_.checkpoint);
@@ -330,39 +337,8 @@ public:
 				}
 				restore(frontier_, checkpoint, std::span<ArtifactReader>(dependencies));
 			}
-			std::uint64_t offset = expected_header.size(), sequence = frontier_.base_sequence;
-			while (offset < frontier_.offset) {
-				if (frontier_.offset - offset < batch_header_size) { throw Corruption("truncated durable batch header"); }
-				std::array<char, batch_header_size> raw_batch{};
-				read_all(*data_, offset, raw_batch);
-				std::string_view header(raw_batch.data(), raw_batch.size());
-				if (crc32c(header.substr(0, batch_header_size - 4)) != checksum_at_end(header)) {
-					throw Corruption("batch header checksum mismatch");
-				}
-				if (get32(header) != batch_magic) { throw Corruption("invalid batch magic"); }
-				auto length = get32(header);
-				auto next_sequence = get64(header);
-				auto checksum = get32(header);
-				if (sequence == std::numeric_limits<std::uint64_t>::max() || next_sequence != sequence + 1) {
-					throw Corruption("batch sequence mismatch");
-				}
-				if (length > maximum_batch_ || length > frontier_.offset - offset - batch_header_size) {
-					throw Corruption("invalid durable batch length");
-				}
-				std::string batch(length, '\0');
-				read_all(*data_, offset + batch_header_size, std::span<char>(batch.data(), batch.size()));
-				if (crc32c(batch) != checksum) { throw Corruption("batch payload checksum mismatch"); }
-				// This view expires when the callback returns.
-				replay(next_sequence, std::string_view(batch));
-				offset += std::uint64_t(batch_header_size) + length;
-				sequence = next_sequence;
-			}
-			if (sequence != frontier_.sequence) { throw Corruption("manifest sequence mismatch"); }
-			if (size > frontier_.offset) {
-				// Only bytes outside a fully verified frontier are disposable.
-				data_->truncate(frontier_.offset);
-				data_->sync();
-			}
+			if (commits) { recover_committed(*commits, size, replay); }
+			else { recover_published(expected_header.size(), size, replay); }
 			// A process restart can observe a replaced manifest whose directory
 			// barrier never ran. Seal that selected namespace before using it.
 			io_.sync_directory();
@@ -425,9 +401,19 @@ private:
 		put32(header, crc32c(batch));
 		put32(header, crc32c(header));
 		auto backend = io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {});
-		auto operation = std::shared_ptr<AppendMutation>(new AppendMutation(std::move(backend), owner_, data_,
-			frontier_.offset, std::move(header), std::string(batch), encode_manifest(next),
-			{owner_->mutation_identity, owner_->mutation_sequence + 1, 1}));
+		const MutationToken token{owner_->mutation_identity, owner_->mutation_sequence + 1, 1};
+		std::shared_ptr<AppendMutation> operation;
+		if (frontier_.commit_slots) {
+			// One write of the whole batch, then its slot: no manifest, no namespace change.
+			std::string record; record.reserve(header.size() + batch.size());
+			record.append(header).append(batch);
+			auto slot = encode_slot(file_header(next), next.sequence, next.offset);
+			operation = std::shared_ptr<AppendMutation>(new AppendMutation(std::move(backend), owner_, data_,
+				frontier_.offset, std::move(record), slot_offset(next.sequence), std::move(slot), token, AppendMutation::Slots{}));
+		} else {
+			operation = std::shared_ptr<AppendMutation>(new AppendMutation(std::move(backend), owner_, data_,
+				frontier_.offset, std::move(header), std::string(batch), encode_manifest(next), token));
+		}
 		append_target_ = std::move(next); append_operation_ = operation; ++owner_->mutation_sequence;
 		return operation;
 	}
@@ -459,7 +445,8 @@ private:
 		}
 		Frontier next = frontier_; next.version = 2; ++next.generation;
 		next.journal_identity = detail::random_identity(); next.base_sequence = covered_sequence;
-		next.offset = file_header_v2_size; next.checkpoint = checkpoint.descriptor(); next.dependencies.clear();
+		next.commit_slots = !shared(); next.offset = next.commit_slots ? records_start : file_header_v2_size;
+		next.checkpoint = checkpoint.descriptor(); next.dependencies.clear();
 		for (const auto& dependency : dependencies) {
 			if (!dependency.lease_ || dependency.lease_->owner != owner_ || dependency.descriptor().identity == checkpoint.descriptor().identity ||
 				std::find_if(next.dependencies.begin(), next.dependencies.end(), [&](const auto& previous) {
@@ -485,7 +472,7 @@ private:
 			checkpoint_target_.emplace(std::move(target)); checkpoint_operation_ = operation; ++owner_->mutation_sequence; return operation;
 		}
 		auto backend = io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {});
-		auto operation = std::shared_ptr<CheckpointMutation>(new CheckpointMutation(std::move(backend), owner_, data_name(next), file_header(next), encode_manifest(next), std::move(retained), {owner_->mutation_identity, owner_->mutation_sequence + 1, 1}));
+		auto operation = std::shared_ptr<CheckpointMutation>(new CheckpointMutation(std::move(backend), owner_, data_name(next), generation_image(next), encode_manifest(next), std::move(retained), {owner_->mutation_identity, owner_->mutation_sequence + 1, 1}));
 		checkpoint_target_.emplace(std::move(target)); checkpoint_operation_ = operation; ++owner_->mutation_sequence; return operation;
 	}
 
@@ -502,6 +489,15 @@ private:
 	static constexpr std::uint64_t file_magic = 0x314154444a5a4e4bull;     // KNZJDTA1
 	static constexpr std::uint64_t manifest_v2_magic = 0x32464d4a5a4e524bull;
 	static constexpr std::uint64_t file_v2_magic = 0x324154444a5a4e4bull;
+	// Generations with commit slots: the same layouts under their own magics.
+	static constexpr std::uint64_t manifest_slots_magic = 0x31534d4a5a4e524bull;     // KRNZJMS1
+	static constexpr std::uint64_t manifest_v2_slots_magic = 0x32534d4a5a4e524bull;  // KRNZJMS2
+	static constexpr std::uint64_t file_slots_magic = 0x315354444a5a4e4bull;         // KNZJDTS1
+	static constexpr std::uint64_t file_v2_slots_magic = 0x325354444a5a4e4bull;      // KNZJDTS2
+	static constexpr std::uint64_t slot_magic = 0x31544d434a5a4e4bull;               // KNZJCMT1
+	// Each slot has a page of its own, apart from the header and the batches, so writing one
+	// cannot tear the other or a batch; batches start after the second slot's page.
+	static constexpr std::size_t slot_page = 4096, slot_size = 28, records_start = 3 * slot_page;
 	static constexpr std::uint32_t batch_magic = 0x3142544bu;             // KTB1
 	static constexpr std::size_t manifest_size = 52, file_header_size = 28, batch_header_size = 24;
 	static constexpr std::size_t manifest_v2_size = 108, file_header_v2_size = 60, maximum_dependencies = 8;
@@ -591,9 +587,9 @@ private:
 			}
 			if (name.starts_with("generation-")) {
 				Identity id{}; std::copy_n(bytes.begin(), id.size(), id.begin()); bytes.remove_prefix(id.size());
-				return magic == file_v2_magic && name == "generation-" + detail::hexadecimal(id) && get64(bytes) >= 2;
+				return (magic == file_v2_magic || magic == file_v2_slots_magic) && name == "generation-" + detail::hexadecimal(id) && get64(bytes) >= 2;
 			}
-			return magic == file_magic && name == "journal-0000000000000001";
+			return (magic == file_magic || magic == file_slots_magic) && name == "journal-0000000000000001";
 		} catch (const Corruption&) { return false; }
 	}
 	std::shared_ptr<IO> owned_backend() const { return io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {}); }
@@ -620,6 +616,7 @@ private:
 			if (records.empty() || records.front().kind != TurnRecordKind::Checkpoint) { throw Corruption("the group has no checkpoint record"); }
 			owner_->lock = io_.acquire_owner(false);
 			frontier_ = decode_manifest(records.front().payload);
+			if (frontier_.commit_slots) { throw Corruption("checkpoint record names a generation file"); }
 			if (frontier_.sequence != frontier_.base_sequence) { throw Corruption("checkpoint record covers an unaligned sequence"); }
 			if (frontier_.checkpoint) {
 				validate_artifact_bound(*frontier_.checkpoint);
@@ -678,9 +675,181 @@ private:
 		bytes.remove_prefix(bytes.size() - 4);
 		return get32(bytes);
 	}
+	// A generation that publishes its manifest per append: the manifest names the frontier.
+	template <class Replay>
+	void recover_published(std::uint64_t offset, std::uint64_t size, Replay& replay) {
+		std::uint64_t sequence = frontier_.base_sequence;
+		while (offset < frontier_.offset) {
+			if (frontier_.offset - offset < batch_header_size) { throw Corruption("truncated durable batch header"); }
+			std::array<char, batch_header_size> raw_batch{};
+			read_all(*data_, offset, raw_batch);
+			std::string_view header(raw_batch.data(), raw_batch.size());
+			if (crc32c(header.substr(0, batch_header_size - 4)) != checksum_at_end(header)) {
+				throw Corruption("batch header checksum mismatch");
+			}
+			if (get32(header) != batch_magic) { throw Corruption("invalid batch magic"); }
+			auto length = get32(header);
+			auto next_sequence = get64(header);
+			auto checksum = get32(header);
+			if (sequence == std::numeric_limits<std::uint64_t>::max() || next_sequence != sequence + 1) {
+				throw Corruption("batch sequence mismatch");
+			}
+			if (length > maximum_batch_ || length > frontier_.offset - offset - batch_header_size) {
+				throw Corruption("invalid durable batch length");
+			}
+			std::string batch(length, '\0');
+			read_all(*data_, offset + batch_header_size, std::span<char>(batch.data(), batch.size()));
+			if (crc32c(batch) != checksum) { throw Corruption("batch payload checksum mismatch"); }
+			// This view expires when the callback returns.
+			replay(next_sequence, std::string_view(batch));
+			offset += std::uint64_t(batch_header_size) + length;
+			sequence = next_sequence;
+		}
+		if (sequence != frontier_.sequence) { throw Corruption("manifest sequence mismatch"); }
+		if (size > frontier_.offset) {
+			// Only bytes outside a fully verified frontier are disposable.
+			data_->truncate(frontier_.offset);
+			data_->sync();
+		}
+	}
+
+	// Commit slots. Slot `sequence % 2` holds the frontier an append made durable; the other
+	// holds the one before (both hold the base until the first append). An append writes its
+	// batch past the frontier, flushes, writes its slot, and flushes: a slot never reaches the
+	// media before the batch it names, and only one slot is ever being written.
+	struct Commit {
+		std::uint64_t sequence = 0, offset = 0;
+		bool operator==(const Commit&) const = default;
+	};
+	struct Commits {
+		Commit high;
+		std::optional<Commit> low;
+		bool damaged = false;  // the other slot is not valid: it was being written, or is corrupt
+	};
+	static std::uint64_t slot_offset(std::uint64_t sequence) { return slot_page * (1 + sequence % 2); }
+	// A slot is bound to its generation file: the checksum covers the file's header too.
+	static std::string encode_slot(std::string_view header, std::uint64_t sequence, std::uint64_t offset) {
+		std::string slot;
+		put64(slot, slot_magic); put64(slot, sequence); put64(slot, offset);
+		Checksum checksum; checksum.update(header); checksum.update(slot); put32(slot, checksum.value());
+		return slot;
+	}
+	static std::optional<Commit> decode_slot(std::string_view header, std::string_view raw) {
+		Checksum checksum; checksum.update(header); checksum.update(raw.substr(0, slot_size - 4));
+		if (checksum.value() != checksum_at_end(raw) || get64(raw) != slot_magic) { return std::nullopt; }
+		Commit commit; commit.sequence = get64(raw); commit.offset = get64(raw);
+		return commit;
+	}
+	// The header, the two slots holding the base frontier, and zeros: what a generation with
+	// commit slots starts as. Batches begin at records_start.
+	static std::string generation_image(const Frontier& frontier) {
+		auto header = file_header(frontier);
+		if (!frontier.commit_slots) { return header; }
+		std::string image(records_start, '\0');
+		image.replace(0, header.size(), header);
+		auto slot = encode_slot(header, frontier.sequence, frontier.offset);
+		image.replace(slot_offset(0), slot.size(), slot);
+		image.replace(slot_offset(1), slot.size(), slot);
+		return image;
+	}
+	// Which slot names the frontier. Two valid slots hold consecutive frontiers, each in its
+	// own slot (or the base in both). One valid slot is the newest only if the other is the
+	// one the next append writes; the batch that append made durable must then follow.
+	Commits read_commits(std::string_view image, std::string_view header) const {
+		auto zero = [](std::string_view bytes) { return std::all_of(bytes.begin(), bytes.end(), [](char byte) { return byte == '\0'; }); };
+		if (!zero(image.substr(header.size(), slot_page - header.size())) ||
+			!zero(image.substr(slot_offset(0) + slot_size, slot_page - slot_size)) ||
+			!zero(image.substr(slot_offset(1) + slot_size, slot_page - slot_size))) {
+			throw Corruption("nonzero generation padding");
+		}
+		const std::uint64_t base = frontier_.base_sequence;
+		std::array<std::optional<Commit>, 2> slots;
+		for (std::uint64_t index : {0u, 1u}) {
+			auto slot = decode_slot(header, image.substr(slot_offset(index), slot_size));
+			if (slot && slot->sequence >= base && slot->offset >= records_start && slot->offset <= maximum_offset &&
+				(slot->sequence == base) == (slot->offset == records_start)) { slots[index] = slot; }
+		}
+		if (slots[0] && slots[1]) {
+			if (*slots[0] == *slots[1]) {
+				if (slots[0]->sequence != base) { throw Corruption("inconsistent commit slots"); }
+				return {*slots[0], std::nullopt, false};
+			}
+			const std::size_t high = slots[0]->sequence > slots[1]->sequence ? 0 : 1;
+			const auto& newest = *slots[high]; const auto& older = *slots[1 - high];
+			if (newest.sequence % 2 != high || older.sequence + 1 != newest.sequence || older.offset >= newest.offset) {
+				throw Corruption("inconsistent commit slots");
+			}
+			return {newest, older, false};
+		}
+		for (std::size_t index : {0u, 1u}) {
+			if (!slots[index]) { continue; }
+			if (slots[index]->sequence % 2 != index) { throw Corruption("commit slot damaged out of turn"); }
+			return {*slots[index], std::nullopt, true};
+		}
+		throw Corruption("no valid commit slot");
+	}
+	// The batch after `sequence` at `offset`, whole and valid inside `limit`, or nullopt with
+	// the reason.
+	std::optional<std::string> read_batch(std::uint64_t offset, std::uint64_t sequence, std::uint64_t limit, const char*& reason) {
+		reason = "truncated durable batch header";
+		if (limit < offset || limit - offset < batch_header_size) { return std::nullopt; }
+		std::array<char, batch_header_size> raw{};
+		read_all(*data_, offset, raw);
+		std::string_view header(raw.data(), raw.size());
+		reason = "batch header checksum mismatch";
+		if (crc32c(header.substr(0, batch_header_size - 4)) != checksum_at_end(header)) { return std::nullopt; }
+		reason = "invalid batch magic";
+		if (get32(header) != batch_magic) { return std::nullopt; }
+		auto length = get32(header); auto next_sequence = get64(header); auto checksum = get32(header);
+		reason = "batch sequence mismatch";
+		if (sequence == std::numeric_limits<std::uint64_t>::max() || next_sequence != sequence + 1) { return std::nullopt; }
+		reason = "invalid durable batch length";
+		if (length > maximum_batch_ || length > limit - offset - batch_header_size) { return std::nullopt; }
+		std::string batch(length, '\0');
+		read_all(*data_, offset + batch_header_size, std::span<char>(batch.data(), batch.size()));
+		reason = "batch payload checksum mismatch";
+		if (crc32c(batch) != checksum) { return std::nullopt; }
+		return batch;
+	}
+	// Every batch up to the newest slot must validate. Past it lies at most the batch whose
+	// slot did not reach the media: kept whole, then committed; anything else is discarded.
+	template <class Replay>
+	void recover_committed(const Commits& commits, std::uint64_t size, Replay& replay) {
+		std::uint64_t offset = records_start, sequence = frontier_.base_sequence;
+		const char* reason = nullptr;
+		while (offset < commits.high.offset) {
+			auto batch = read_batch(offset, sequence, commits.high.offset, reason);
+			if (!batch) { throw Corruption(reason); }
+			replay(sequence + 1, std::string_view(*batch));  // the view expires when the callback returns
+			offset += std::uint64_t(batch_header_size) + batch->size(); ++sequence;
+			if (commits.low && sequence == commits.low->sequence && offset != commits.low->offset) {
+				throw Corruption("commit slots disagree with the batches");
+			}
+		}
+		if (offset != commits.high.offset || sequence != commits.high.sequence) { throw Corruption("commit slot sequence mismatch"); }
+		std::vector<std::uint64_t> ends;
+		while (auto batch = read_batch(offset, sequence, size, reason)) {
+			replay(sequence + 1, std::string_view(*batch));
+			offset += std::uint64_t(batch_header_size) + batch->size(); ++sequence;
+			ends.push_back(offset);
+		}
+		if (commits.damaged && ends.empty()) { throw Corruption("a commit slot is damaged and no batch follows the other"); }
+		frontier_.offset = offset; frontier_.sequence = sequence;
+		if (size > offset) { data_->truncate(offset); }
+		// A restart can read a slot or batch that never reached the media: flush what was
+		// selected, then commit any batch kept past the newest slot.
+		data_->sync();
+		auto header = file_header(frontier_);
+		for (std::size_t i = 0; i < ends.size(); ++i) {
+			auto committed = commits.high.sequence + 1 + i;
+			write_all(*data_, slot_offset(committed), encode_slot(header, committed, ends[i]));
+			data_->sync();
+		}
+	}
 	static std::string file_header(const Frontier& frontier) {
 		std::string result;
-		put64(result, frontier.version == 1 ? file_magic : file_v2_magic);
+		put64(result, frontier.version == 1 ? (frontier.commit_slots ? file_slots_magic : file_magic)
+			: (frontier.commit_slots ? file_v2_slots_magic : file_v2_magic));
 		result.append(frontier.identity.data(), frontier.identity.size());
 		if (frontier.version == 2) {
 			result.append(frontier.journal_identity.data(), frontier.journal_identity.size());
@@ -691,7 +860,8 @@ private:
 	}
 	static std::string encode_manifest(const Frontier& frontier) {
 		std::string result;
-		put64(result, frontier.version == 1 ? manifest_magic : manifest_v2_magic);
+		put64(result, frontier.version == 1 ? (frontier.commit_slots ? manifest_slots_magic : manifest_magic)
+			: (frontier.commit_slots ? manifest_v2_slots_magic : manifest_v2_magic));
 		result.append(frontier.identity.data(), frontier.identity.size());
 		put64(result, frontier.generation);
 		put64(result, frontier.offset);
@@ -711,16 +881,18 @@ private:
 		if (bytes.size() != manifest_size && (bytes.size() < manifest_v2_size || bytes.size() > maximum_manifest_size)) { throw Corruption("invalid manifest size"); }
 		if (crc32c(bytes.substr(0, bytes.size() - 4)) != checksum_at_end(bytes)) { throw Corruption("manifest checksum mismatch"); }
 		auto length = bytes.size(); auto magic = get64(bytes);
-		if ((magic != manifest_magic && magic != manifest_v2_magic) ||
-			(magic == manifest_magic && length != manifest_size) || (magic == manifest_v2_magic && length < manifest_v2_size)) {
+		const bool first = magic == manifest_magic || magic == manifest_slots_magic;
+		const bool second = magic == manifest_v2_magic || magic == manifest_v2_slots_magic;
+		if ((!first && !second) || (first && length != manifest_size) || (second && length < manifest_v2_size)) {
 			throw Corruption("unsupported journal manifest");
 		}
 		Frontier result;
+		result.commit_slots = magic == manifest_slots_magic || magic == manifest_v2_slots_magic;
 		for (char& byte : result.identity) { byte = bytes.front(); bytes.remove_prefix(1); }
 		result.generation = get64(bytes);
 		result.offset = get64(bytes);
 		result.sequence = get64(bytes);
-		if (magic == manifest_v2_magic) {
+		if (second) {
 			result.version = 2; result.base_sequence = get64(bytes);
 			for (char& byte : result.journal_identity) { byte = bytes.front(); bytes.remove_prefix(1); }
 			result.checkpoint = decode_artifact(bytes); auto count = get32(bytes);
@@ -735,7 +907,8 @@ private:
 		}
 		if ((result.version == 1 && result.generation != 1) || (result.version == 2 && result.generation < 2) ||
 			result.offset < (result.version == 1 ? file_header_size : file_header_v2_size) || result.offset > maximum_offset ||
-			result.sequence < result.base_sequence) {
+			result.sequence < result.base_sequence ||
+			(result.commit_slots && (result.offset != records_start || result.sequence != result.base_sequence))) {
 			throw Corruption("unsupported generation or invalid durable offset");
 		}
 		return result;
