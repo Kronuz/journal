@@ -10,6 +10,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Changed
 
+- Pins completion at `bf69026`, the head of its `phase/task-driver` branch, where
+  `AsioCompletionDriver` returns `task::task<void>`. journal's headers and tests do not use the
+  driver, and `completion::completion` is unchanged: no API of journal changes. Re-pin to
+  completion's `main` when the branch lands.
 - Pins completion at `e2c6474`, its head, which moves completion's own metrics and allocators
   pins to their heads (docs-only changes past the previous pins).
 
