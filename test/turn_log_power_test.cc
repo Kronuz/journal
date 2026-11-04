@@ -113,7 +113,7 @@ void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned t
 
 // The blocks each record's fragments occupy, on a clean disk: what a damaged block may cost.
 std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> groups_by_block(MemoryIO& io) {
-	namespace d = j::turn_log_detail;
+	namespace d = j::turn_log_detail; namespace f = j::framing;
 	std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> result;
 	auto cursor = io.scan_directory();
 	while (auto name = cursor->next()) {
@@ -122,15 +122,15 @@ std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> group
 		std::vector<d::Item> items; d::Manifests manifests; d::scan_segment(*file, identity, options, *number, items, manifests);
 		for (const auto& item : items) {
 			if (item.gap || !item.group) { continue; }
-			std::string header(d::fragment_header, '\0');
+			std::string header(f::fragment_header, '\0');
 			for (std::uint64_t position = item.offset;;) {
-				if (position % options.block_bytes == 0) { std::string c(2, '\0'); file->read_at(position + 56, c); position += d::header_bytes(d::get16(c)); }
+				if (position % options.block_bytes == 0) { std::string c(2, '\0'); file->read_at(position + 56, c); position += f::header_bytes(f::get16(c)); }
 				auto room = options.block_bytes - position % options.block_bytes;
-				if (room < d::fragment_header + 1) { position += room; continue; }
+				if (room < f::fragment_header + 1) { position += room; continue; }
 				file->read_at(position, header);
 				result[{*number, position / options.block_bytes}].insert(item.group);
-				auto type = static_cast<std::uint8_t>(header[6]); position += d::fragment_header + d::get16(std::string_view(header).substr(4));
-				if (type == d::Full || type == d::Last) { break; }
+				auto type = static_cast<std::uint8_t>(header[6]); position += f::fragment_header + f::get16(std::string_view(header).substr(4));
+				if (type == f::Full || type == f::Last) { break; }
 			}
 		}
 	}

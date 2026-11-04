@@ -271,6 +271,18 @@ void turn_log_fixture() {
 		j::TurnRecovery ignored; j::TurnLog log(reference_io, turn_identity, ignored, turn_options);
 		expected = write_turns(log);
 	}
+	// The writer still emits the fixture byte for byte.
+	{
+		auto regenerated = scratch("turn-log-regenerated"); generate_turn_log(regenerated);
+		std::size_t compared = 0;
+		for (const auto& entry : fs::directory_iterator(fs::path(JOURNAL_FIXTURE_DIR) / "turn-log")) {
+			auto name = entry.path().filename();
+			check(fs::exists(regenerated / name) && slurp(regenerated / name) == slurp(entry.path()), "turn-log segment regenerates byte for byte");
+			++compared;
+		}
+		check(compared > 1, "the turn-log fixture holds segments");
+		fs::remove_all(regenerated);
+	}
 	j::TurnRecovery recovered;
 	{ j::TurnLog log(io, turn_identity, recovered, turn_options); }
 	check(!recovered.damaged && recovered.lost.empty() && recovered.epoch == 2, "turn log segments verify");
