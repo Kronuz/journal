@@ -129,6 +129,13 @@ public:
 		if (found == disk_.names.end()) { throw std::runtime_error("no such file"); }
 		return std::make_unique<MemoryFile>(disk_, found->second);
 	}
+	std::unique_ptr<j::File> open_existing_read_only(std::string_view name) override { return open_existing(name); }
+	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view name) override {
+		auto found = disk_.names.find(path(name));
+		return found == disk_.names.end() ? nullptr : std::make_unique<MemoryFile>(disk_, found->second);
+	}
+	void open_existing_read_only_into(std::string_view, j::File&) override { throw std::logic_error("reusable file open unsupported"); }
+	bool open_reclaim_candidate_read_only_into(std::string_view, j::File&) override { throw std::logic_error("reusable candidate open unsupported"); }
 	std::unique_ptr<j::File> create_exclusive(std::string_view name) override {
 		disk_.tick();
 		if (disk_.names.contains(path(name))) { throw std::runtime_error("file exists"); }
