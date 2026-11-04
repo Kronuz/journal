@@ -29,6 +29,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -275,7 +276,7 @@ void rule_rows() {
 	kronuz::journal::testing::Disk disk; kronuz::journal::testing::MemoryIO io(disk, "framing/");
 	auto file = io.create_exclusive("log"); file->write_at(0, log);
 	check(f::read_file(*file) == log, "read_file reads the whole file");
-	check(f::read_record(*file, stream.block_bytes, clean.records[2].offset) == std::string(700, 'x'), "read_record reads a record across blocks");
+	check(f::read_record(*file, stream, clean.records[2].offset) == std::string(700, 'x'), "read_record reads a record across blocks");
 
 	// A header without a manifest leaves the manifest's segment and block zero: other bytes there
 	// under a valid CRC are bytes no emitter writes (the fuzz target's first finding).
@@ -285,6 +286,56 @@ void rule_rows() {
 	forged.replace(512 + 58, 4, forged.substr(forged.size() - 4));
 	forged.resize(log.size());
 	check(at(forged).tail == f::Tail::damage, "a no-manifest header with a manifest block is damage");
+
+	// Forged bytes a hostile copy could hold, CRCs valid (the security review's SR1 and SR2).
+	auto header = [](const f::Stream& s, std::uint32_t index, std::uint16_t count) {
+		std::string b(s.magic); b.append(s.identity.data(), 16); j::put64(b, s.segment); j::put32(b, index); j::put64(b, s.epoch);
+		j::put64(b, 0); j::put32(b, 0); f::put16(b, count);
+		if (count != f::no_manifest) { b.append(16 * std::size_t{count}, '\0'); }
+		j::put32(b, j::crc32c(b)); return b;
+	};
+	auto fragment = [](const f::Stream& s, f::Fragment type, std::string_view payload) {
+		std::string h; f::put16(h, static_cast<std::uint16_t>(payload.size())); h.push_back(static_cast<char>(type)); h.push_back('\0');
+		j::put64(h, s.segment); j::put64(h, s.epoch);
+		j::Checksum c; c.update(h); c.update(payload); std::string out; j::put32(out, c.value()); return out + h + std::string(payload);
+	};
+	// A header that fills its block (270 = 62 + 16 * 13, 14 mod 16) leaves no room for a fragment,
+	// so the next block's bytes cannot read as one without a header of their own.
+	const f::Stream wide{"RFTW0001", identity, 270, 7, 1, true};
+	check(f::header_bytes(13) == wide.block_bytes, "a 13-entry manifest header is 270 bytes");
+	const auto filled_block = f::scan(header(wide, 0, 13) + fragment(wide, f::Full, "where block 1's header belongs"), wide);
+	check(filled_block.records.empty() && filled_block.tail == f::Tail::damage, "damage: a header that fills its block");
+	check(f::scan(header(wide, 0, 11) + fragment(wide, f::Full, "x"), wide).records.size() == 1, "a header that leaves a fragment's room reads");  // 238 + 24 + 1 <= 270
+	f::Emitter honest(wide, 0);
+	for (int i = 0; i < 40; ++i) { honest.record(std::string(37 + i * 11, char('a' + i % 26)), 1 + i % 20, i); }
+	check(f::scan(honest.bytes(), wide).tail == f::Tail::clean, "the emitter's 270-byte blocks read clean");
+
+	// read_record checks what scan checks: a record of another segment, or of another epoch,
+	// does not read as this stream's; nor does a header count it never verified.
+	auto stored = [&io](const std::string& name, const std::string& bytes) { auto file = io.create_exclusive(name); file->write_at(0, bytes); return file; };
+	auto refuses = [](const std::function<void()>& read) {
+		try { read(); } catch (const j::Corruption&) { return true; }
+		return false;
+	};
+	for (const auto& [segment, epoch] : {std::pair<std::uint64_t, std::uint64_t>{99, 1}, {7, 42}}) {
+		f::Stream foreign_stream = stream; foreign_stream.segment = segment; foreign_stream.epoch = epoch;
+		f::Emitter theirs(foreign_stream, 0);  // one record within a block, one across blocks
+		const auto within = theirs.record(std::string(100, 'g')), across = theirs.record(std::string(700, 'f'));
+		auto file2 = stored("foreign-" + std::to_string(segment), theirs.bytes());
+		check(f::read_record(*file2, foreign_stream, within) == std::string(100, 'g') && f::read_record(*file2, foreign_stream, across) == std::string(700, 'f'), "read_record reads its own stream's records");
+		check(refuses([&] { f::read_record(*file2, stream, within); }), "read_record refuses another segment's or epoch's fragment");
+		check(refuses([&] { f::read_record(*file2, stream, across); }), "read_record refuses another segment's or epoch's record across blocks");
+	}
+	std::string skipped = header(stream, 0, f::no_manifest) + fragment(stream, f::First, std::string(426, 'a'));
+	skipped.resize(512, '\0');
+	std::string far = header(stream, 1, f::no_manifest); far[56] = '\xfe'; far[57] = '\xff';
+	skipped += far; skipped.resize(512 + f::header_bytes(0xfffe), '\0'); skipped += fragment(stream, f::Last, "past a 1 MiB header");
+	auto file3 = stored("skipped", skipped);
+	check(refuses([&] { f::read_record(*file3, stream, f::header_bytes(f::no_manifest)); }), "read_record refuses a header count it cannot verify");
+	std::string bad_header = log;  // the segment field of the block the record crosses into, under its old CRC
+	bad_header[(clean.records[2].offset / 512 + 1) * 512 + 30] ^= 1;
+	auto file4 = stored("bad-header", bad_header);
+	check(refuses([&] { f::read_record(*file4, stream, clean.records[2].offset); }), "read_record refuses a block header that fails its check");
 }
 // record_end against the emitter: every record start in a block and the next block's first, sizes to four blocks.
 void record_ends() {

@@ -35,9 +35,16 @@ that grows by appends).
 - `parse_header` and `parse_fragment` check one header or fragment and answer ok, bad (bytes there
   that fail a check) or cut (the end of file comes first). A fragment's structure (length within
   its block, type, zero byte, segment, epoch) is checked before its extent against the end of file,
-  so a length that leaves its block is bad, not cut.
+  so a length that leaves its block is bad, not cut. A header must leave its block room for a
+  fragment (its size plus 24 below the block size), so the next block's start is always a header's;
+  the emitter keeps a manifest within half a block, so honest headers always do.
 - The turn log's `scan_segment` reads whole preallocated blocks with them and keeps its own gap and
-  epoch logic. `read_record` reads one record back by offset (the turn log's forwarding).
+  epoch logic. `read_record(file, stream, offset)` reads one record back by
+  offset (the turn log's forwarding) and checks what `scan` checks on the way: each block header it
+  enters (its count bounded by the block before it is read, then `parse_header`, epoch the
+  stream's) and each fragment against the stream's segment and epoch. A record of another segment
+  or epoch, or bytes changed since the scan, are `Corruption`. The turn log keeps each live
+  record's epoch to rebuild its stream.
 - `read_file` reads a growing file whole, its partial last block included. `scan` reads it from the
   start and returns the whole records, each with its first fragment's offset and its end, and how
   the log ends.

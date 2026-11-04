@@ -88,7 +88,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 		j::testing::Disk disk; j::testing::MemoryIO io(disk, "fuzz/");
 		auto file = io.create_exclusive("log"); file->write_at(0, bytes);
 		require(f::read_file(*file) == bytes);
-		for (const auto& record : scan.records) { require(f::read_record(*file, stream.block_bytes, record.offset) == record.bytes); }
+		for (const auto& record : scan.records) { require(f::read_record(*file, stream, record.offset) == record.bytes); }
 	}
 	return 0;
 }

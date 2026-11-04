@@ -258,14 +258,14 @@ public:
 	const std::set<std::uint64_t>& data_segments() const noexcept { return data_segments_; }
 
 private:
-	struct Live { std::uint64_t segment, offset; TurnRecordKind kind; };
+	struct Live { std::uint64_t segment, epoch, offset; TurnRecordKind kind; };
 	// A checkpoint supersedes the group's earlier records; a copy only replaces its original.
 	void note(std::uint64_t group, std::uint64_t sequence, TurnRecordKind kind, std::uint64_t offset, bool copy = false) {
 		auto& records = index_[group];
 		auto drop = [&](const Live& live) { if (!--live_counts_[live.segment]) { live_counts_.erase(live.segment); } };
 		if (kind == TurnRecordKind::Checkpoint && !copy) { for (const auto& [_, live] : records) { drop(live); } records.clear(); }
 		if (auto found = records.find(sequence); found != records.end()) { drop(found->second); records.erase(found); }
-		records.emplace(sequence, Live{segment_, offset, kind}); ++live_counts_[segment_];
+		records.emplace(sequence, Live{segment_, epoch_, offset, kind}); ++live_counts_[segment_];
 	}
 	bool fits(const std::function<void(framing::Emitter&)>& emit) const {
 		framing::Emitter fresh(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, filling_);
@@ -283,7 +283,7 @@ private:
 			for (const auto& [sequence, live] : records) {
 				if (live.segment != oldest) { continue; }
 				std::string_view logical;
-				auto record = framing::read_record(reader(oldest), options_.block_bytes, live.offset);
+				auto record = framing::read_record(reader(oldest), turn_log_detail::stream(identity_, options_.block_bytes, oldest, live.epoch), live.offset);
 				logical = record; logical.remove_prefix(turn_log_detail::record_header);
 				copies.push_back({group, sequence, live.kind, std::string(logical)});
 				if ((bytes += logical.size()) >= std::min<std::uint64_t>(options_.forward_bytes, options_.segment_bytes / 4)) { return copies; }
@@ -522,7 +522,7 @@ inline TurnRecovery TurnLog::recover() {
 			if (it->first != expected) { result.lost.insert(group); break; }
 			const auto& item = items[it->second];
 			kept.push_back({group, item.sequence, static_cast<TurnRecordKind>(item.kind), item.payload});
-			index_[group].emplace(item.sequence, Live{item.segment, item.offset, static_cast<TurnRecordKind>(item.kind)});
+			index_[group].emplace(item.sequence, Live{item.segment, item.epoch, item.offset, static_cast<TurnRecordKind>(item.kind)});
 		}
 		if (!result.lost.contains(group)) { result.groups.emplace(group, std::move(kept)); }
 		else { index_.erase(group); }

@@ -151,7 +151,7 @@ inline Header parse_header(std::string_view block, const Stream& stream, std::ui
 	header.count = get16(block.substr(56)); header.size = header_bytes(header.count);
 	if (!stream.manifests && header.count != no_manifest) { return header; }
 	if (header.count == no_manifest && (peek64(block.substr(44)) || peek32(block.substr(52)))) { return header; }  // the emitter writes zeros
-	if (header.size > stream.block_bytes) { return header; }
+	if (header.size + fragment_header >= stream.block_bytes) { return header; }  // a block holds a fragment byte after its header
 	if (header.size > block.size()) { header.check = Check::cut; return header; }
 	if (block.substr(0, 8) != stream.magic || block.substr(8, 16) != std::string_view(stream.identity.data(), 16) || peek64(block.substr(24)) != stream.segment ||
 		peek32(block.substr(32)) != index || peek32(block.substr(header.size - 4)) != crc32c(block.substr(0, header.size - 4))) { return header; }
@@ -175,24 +175,35 @@ inline FragmentView parse_fragment(std::string_view at, std::size_t room, std::u
 	return view;
 }
 
-// Reads back the record whose first fragment starts at offset in a written stream.
-inline std::string read_record(File& file, std::uint32_t block_bytes, std::uint64_t offset) {
-	std::string logical, header(fragment_header, '\0');
+// Reads back the record whose first fragment starts at `offset`, checking each block header and
+// fragment on the way as scan does, so a record of another segment or epoch is corruption.
+inline std::string read_record(File& file, const Stream& stream, std::uint64_t offset) {
+	const std::uint64_t block = stream.block_bytes;
+	auto read = [&file](std::string& to, std::uint64_t at, std::size_t size) {
+		const auto start = to.size(); to.resize(start + size);
+		if (file.read_at(at, std::span<char>(to.data() + start, size)) != size) { throw Corruption("short log read"); }
+	};
+	std::string logical, bytes;
 	for (std::uint64_t position = offset;;) {
-		if (position % block_bytes == 0) {
-			std::string count(2, '\0');
-			if (file.read_at(position + 56, count) != 2) { throw Corruption("short log read"); }
-			position += header_bytes(get16(count));
+		if (position % block == 0) {
+			bytes.clear(); read(bytes, position, header_fixed);
+			const auto size = header_bytes(get16(std::string_view(bytes).substr(56)));
+			if (size + fragment_header >= block) { throw Corruption("invalid log block header"); }
+			read(bytes, position + header_fixed, size - header_fixed);
+			const auto header = parse_header(bytes, stream, position / block);
+			if (header.check != Check::ok || header.epoch != stream.epoch) { throw Corruption("invalid log block header"); }
+			position += size;
 		}
-		auto room = block_bytes - position % block_bytes;
+		const auto room = block - position % block;
 		if (room < fragment_header + 1) { position += room; continue; }
-		if (file.read_at(position, header) != header.size()) { throw Corruption("short log read"); }
-		auto length = get16(std::string_view(header).substr(4)); auto type = static_cast<std::uint8_t>(header[6]);
-		std::string payload(length, '\0');
-		if (!length || length > room - fragment_header || file.read_at(position + fragment_header, payload) != length) { throw Corruption("invalid log fragment"); }
-		Checksum checksum; checksum.update(std::string_view(header).substr(4)); checksum.update(payload);
-		if (checksum.value() != peek32(header) || (logical.empty() ? type != Full && type != First : type != Middle && type != Last)) { throw Corruption("log record changed since it was written"); }
-		logical.append(payload); position += fragment_header + length;
+		bytes.clear(); read(bytes, position, fragment_header);
+		const std::size_t length = get16(std::string_view(bytes).substr(4));
+		if (!length || fragment_header + length > room) { throw Corruption("invalid log fragment"); }
+		read(bytes, position + fragment_header, length);
+		const auto fragment = parse_fragment(bytes, room, stream.segment, stream.epoch);
+		const auto type = fragment.type;
+		if (fragment.check != Check::ok || (logical.empty() ? type != Full && type != First : type != Middle && type != Last)) { throw Corruption("log record changed since it was written"); }
+		logical.append(fragment.payload); position += fragment_header + length;
 		if (type == Full || type == Last) { return logical; }
 	}
 }
