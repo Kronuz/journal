@@ -157,6 +157,10 @@ public:
 		auto file = found == model_.visible.end() ? nullptr : std::make_unique<MemoryFile>(model_, found->second);
 		model_.after(); return file;
 	}
+	std::unique_ptr<File> open_existing_read_only(std::string_view name) override { return open_existing(name); }
+	std::unique_ptr<File> open_reclaim_candidate_read_only(std::string_view name) override { return open_reclaim_candidate(name); }
+	void open_existing_read_only_into(std::string_view, File&) override { throw std::logic_error("reusable file open unsupported"); }
+	bool open_reclaim_candidate_read_only_into(std::string_view, File&) override { throw std::logic_error("reusable candidate open unsupported"); }
 	std::optional<EntryFootprint> entry_footprint(std::string_view name) override {
 		model_.before(); auto found = model_.visible.find(std::string(name)); std::optional<EntryFootprint> result;
 		if (found != model_.visible.end()) { result = EntryFootprint{EntryKind::Regular, found->second->visible.size(), std::nullopt}; }

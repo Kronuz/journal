@@ -40,6 +40,10 @@ public:
 	bool missing = false, fail = false;
 	std::unique_ptr<OwnerLock> acquire_owner(bool) override { throw std::logic_error("unexpected lock"); }
 	std::unique_ptr<File> open_existing(std::string_view) override { throw std::logic_error("unexpected open"); }
+	std::unique_ptr<File> open_existing_read_only(std::string_view) override { throw std::logic_error("unexpected open"); }
+	std::unique_ptr<File> open_reclaim_candidate_read_only(std::string_view) override { throw std::logic_error("unexpected open"); }
+	void open_existing_read_only_into(std::string_view, File&) override { throw std::logic_error("unexpected open"); }
+	bool open_reclaim_candidate_read_only_into(std::string_view, File&) override { throw std::logic_error("unexpected open"); }
 	std::unique_ptr<File> create_exclusive(std::string_view) override { throw std::logic_error("unexpected mutation"); }
 	void replace(std::string_view, std::string_view) override { throw std::logic_error("unexpected mutation"); }
 	void remove(std::string_view) override { throw std::logic_error("unexpected mutation"); }
