@@ -126,3 +126,50 @@ Neither blocks strata's step 3: strata's stream is unaffected by SR1, and strata
 **Not run:** TSan (nothing is concurrent); Linux, FreeBSD and arm64 (left to PR #2's CI, green on
 nine jobs per the ledger); the turn log's own `scan_segment` (out of scope); a fuzz run longer
 than 3 minutes; a structure-aware mutator.
+
+## Re-check
+
+> Re-checker, 2026-11-04, at `journal:df7db00` (the fix for SR1 and SR2), worktree
+> `manifest-log-steps12`, ASan+UBSan (Homebrew LLVM) build. Probes rerun from `.scratch/secprobe/`.
+
+| Finding | Verdict | Evidence |
+|---|---|---|
+| SR1 | CLOSED | `framing.h:154` now refuses `size + fragment_header >= block_bytes`. Probe `j1_header_fills_block`: scan of the 270-byte-block bytes gives 0 records, tail `damage` (was 1 record, `clean`). `framing_test` (58 checks, 0 failures; `turn_log_test` 53, 0). Mutant restoring `size > block_bytes`: `framing_test` fails "damage: a header that fills its block" (1 failure). |
+| SR2 | CLOSED | `read_record(file, stream, offset)` (`framing.h:180-208`) bounds the count (`:192`), runs `parse_header` and compares the epoch (`:193-194`), and runs `parse_fragment` with the stream's segment and epoch (`:203-205`). Probe `j3_read_record` (adapted to the new signature): the segment-99 record is refused ("log record changed since it was written"), the `0xfffe` header is refused ("invalid log block header"), and `scan` still says `damage`. Mutants: each fragment taking its own segment and epoch, 2 failures; the fragment check out, 2 failures. |
+| SR3 (info) | unchanged | `j4_torn` gives the same four verdicts as before. `j2_record_end` still shows 0 differences and the same wrap near 2^64. |
+
+Fuzz: `journal_fuzz_framing`, 2 minutes under ASan+UBSan from the reviewer's 685-input corpus and
+dictionary: 195,303 runs, peak RSS 520 MB, no finding (`.scratch/secprobe/fuzz-recheck.log`).
+
+**The surviving mutant (the count's size bound in `read_record`, `:192`).** The developer's claim
+holds for the outcome and fails for the cost.
+
+- Outcome: removing the line changes nothing a caller sees. `parse_header` refuses the same
+  header (`size + fragment_header >= block_bytes`, `:154`) after `read_record` has read it, and
+  both paths throw `Corruption`; on a short file the message is "short log read" instead of
+  "invalid log block header". No test can tell them apart by outcome, so the mutant is equivalent
+  in that sense.
+- Cost: with a block header whose count is `0xfffe`, `read_record` asks `read_at` for 508 bytes
+  with the bound and 1,049,056 without it (probe `j5_bound_and_epoch`, a counting `File`): a
+  1 MiB allocation and read per call, from one crafted count. The commit message names this
+  purpose ("bounds each block header's count by the block before reading it"). So the line is a
+  resource bound, not dead code. Keep it. If the owner wants the mutant killed, `framing_test`
+  can wrap the file in a counting `File` and require that `read_record` on the `0xfffe` case reads
+  no more than one block.
+- The same reasoning covers the fragment's `fragment_header + length > room` check in
+  `read_record` (`:200`): `parse_fragment` repeats it, so removing it survives, and it bounds the
+  payload read to the block.
+
+**R1 (info, test gap): the block header's epoch comparison is not pinned.** Dropping
+`|| header.epoch != stream.epoch` (`:194`) alone survives `framing_test`: the foreign-epoch case
+fails at the fragment first. With the line in place `read_record` refuses a block header of
+another epoch whose CRC is valid and whose fragment carries the stream's epoch (probe
+`j5_bound_and_epoch`, "invalid log block header"; `scan` says `damage`), so the code is right.
+The converse term (`header.check != ok`) is redundant with it, since `parse_header` leaves the
+epoch 0 on a failed check, so a stream with epoch 0 is the only place it matters. Add a
+`framing_test` row with a valid header of another epoch before a same-epoch fragment.
+
+Conditions 1 and 2 are met. Neither blocks strata's step 3.
+
+**Not run:** TSan; Linux, FreeBSD and arm64 (CI); a fuzz run longer than 2 minutes; the turn log's
+`scan_segment`.
