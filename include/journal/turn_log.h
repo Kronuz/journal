@@ -28,7 +28,7 @@
 
 #pragma once
 
-#include "primitives.h"
+#include "framing.h"
 #include <algorithm>
 #include <cstdio>
 #include <deque>
@@ -76,15 +76,18 @@ struct TurnLogStats {
 
 namespace turn_log_detail {
 inline constexpr std::string_view magic{"RFTW0001", 8};
-// A block header: magic, identity, segment, block, epoch, then the manifest of the block
-// written before it (its segment, block, and each group with a fragment there and its
-// highest sequence), all under one CRC-32C. A count of 0xffff names no block.
-inline constexpr std::size_t header_fixed = 58, fragment_header = 24, record_header = 25;
-inline constexpr std::uint16_t no_manifest = 0xffff;
-inline std::size_t header_bytes(std::uint16_t count) { return header_fixed + (count == no_manifest ? 0 : 16 * std::size_t{count}) + 4; }
-struct Manifest { bool known = false; std::uint64_t segment = 0; std::uint32_t block = 0; std::map<std::uint64_t, std::uint64_t> groups; };
-enum Fragment : std::uint8_t { Full = 1, First, Middle, Last };
+// A logical record: kind, turn, group and sequence, then the payload.
+inline constexpr std::size_t record_header = 25;
 inline constexpr std::uint8_t end_of_turn = 0x10, open_record = 0x11;
+
+inline framing::Stream stream(const Identity& identity, std::uint32_t block_bytes, std::uint64_t segment, std::uint64_t epoch) {
+	return {magic, identity, block_bytes, segment, epoch, true};
+}
+inline std::string logical(std::uint8_t kind, std::uint64_t turn, std::uint64_t group, std::uint64_t sequence, std::string_view payload) {
+	std::string bytes; bytes.reserve(record_header + payload.size());
+	bytes.push_back(static_cast<char>(kind)); put64(bytes, turn); put64(bytes, group); put64(bytes, sequence); bytes.append(payload);
+	return bytes;
+}
 
 inline std::string segment_name(std::uint64_t number) {
 	char name[32]; std::snprintf(name, sizeof name, "turns-%016llx", static_cast<unsigned long long>(number)); return name;
@@ -99,65 +102,6 @@ inline std::optional<std::uint64_t> segment_number(std::string_view name) {
 	}
 	return value;
 }
-inline void put16(std::string& bytes, std::uint16_t value) { bytes.push_back(static_cast<char>(value)); bytes.push_back(static_cast<char>(value >> 8)); }
-inline std::uint16_t get16(std::string_view bytes) { return static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[0]) | static_cast<unsigned char>(bytes[1]) << 8); }
-inline std::uint64_t peek64(std::string_view bytes) { return get64(bytes); }
-inline std::uint32_t peek32(std::string_view bytes) { return get32(bytes); }
-
-// Writes records as fragments into blocks from a segment offset, starting a block's header
-// as the stream enters it and padding a block's tail too short for a fragment.
-class Emitter {
-public:
-	// `filling` holds the groups with fragments in the block being filled, which the next
-	// block's header names.
-	Emitter(const Identity& identity, std::uint32_t block_bytes, std::uint64_t segment, std::uint64_t epoch, std::uint64_t position, Manifest filling)
-		: identity_(identity), block_(block_bytes), segment_(segment), epoch_(epoch), position_(position), filling_(std::move(filling)) {}
-	// Returns the offset of the record's first fragment.
-	std::uint64_t record(std::uint8_t kind, std::uint64_t turn, std::uint64_t group, std::uint64_t sequence, std::string_view payload) {
-		std::string logical; logical.reserve(record_header + payload.size());
-		logical.push_back(static_cast<char>(kind)); put64(logical, turn); put64(logical, group); put64(logical, sequence); logical.append(payload);
-		std::string_view rest(logical); bool first = true; std::uint64_t start = 0;
-		while (!rest.empty()) {
-			enter_block();
-			auto room = block_ - position_ % block_;
-			if (room < fragment_header + 1) { pad(room); continue; }
-			auto count = std::min<std::size_t>(rest.size(), room - fragment_header);
-			bool last = count == rest.size();
-			if (first) { start = position_; }
-			if (group) { auto& highest = filling_.groups[group]; highest = std::max(highest, sequence); }
-			fragment(first ? (last ? Full : First) : (last ? Last : Middle), rest.substr(0, count));
-			rest.remove_prefix(count); first = false;
-		}
-		return start;
-	}
-	const std::string& bytes() const noexcept { return bytes_; }
-	std::uint64_t position() const noexcept { return position_; }
-	const Manifest& filling() const noexcept { return filling_; }
-private:
-	void enter_block() {
-		if (position_ % block_) { return; }
-		auto start = bytes_.size();
-		bytes_.append(magic); bytes_.append(identity_.data(), identity_.size());
-		put64(bytes_, segment_); put32(bytes_, static_cast<std::uint32_t>(position_ / block_)); put64(bytes_, epoch_);
-		// A manifest larger than half a block is not kept: damage there costs conservatively.
-		auto count = filling_.known && header_bytes(static_cast<std::uint16_t>(std::min<std::size_t>(filling_.groups.size(), 4096))) <= block_ / 2 ?
-			static_cast<std::uint16_t>(filling_.groups.size()) : no_manifest;
-		put64(bytes_, count == no_manifest ? 0 : filling_.segment); put32(bytes_, count == no_manifest ? 0 : filling_.block); put16(bytes_, count);
-		if (count != no_manifest) { for (const auto& [group, sequence] : filling_.groups) { put64(bytes_, group); put64(bytes_, sequence); } }
-		put32(bytes_, crc32c(std::string_view(bytes_).substr(start)));
-		position_ += header_bytes(count);
-		filling_ = Manifest{true, segment_, static_cast<std::uint32_t>(position_ / block_), {}};
-	}
-	void pad(std::uint64_t count) { bytes_.append(count, '\0'); position_ += count; }
-	void fragment(Fragment type, std::string_view payload) {
-		std::string header; put16(header, static_cast<std::uint16_t>(payload.size())); header.push_back(static_cast<char>(type)); header.push_back('\0');
-		put64(header, segment_); put64(header, epoch_);
-		Checksum checksum; checksum.update(header); checksum.update(payload);
-		put32(bytes_, checksum.value()); bytes_.append(header); bytes_.append(payload);
-		position_ += fragment_header + payload.size();
-	}
-	Identity identity_; std::uint64_t block_, segment_, epoch_, position_; std::string bytes_; Manifest filling_;
-};
 
 // One parsed item of the stream: a whole logical record, or a gap where bytes did not
 // read back as current (unwritten, stale, or damaged).
@@ -181,33 +125,29 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		here = offset;
 		if (file.read_at(offset, block) != block.size()) { gap(); assembling = false; continue; }
 		std::string_view view(block);
-		const auto count = get16(view.substr(56)); const auto size = header_bytes(count);
-		if (view.substr(0, 8) != magic || view.substr(8, 16) != std::string_view(identity.data(), 16) || peek64(view.substr(24)) != segment ||
-			peek32(view.substr(32)) != index || size > options.block_bytes || peek32(view.substr(size - 4)) != crc32c(view.substr(0, size - 4))) { gap(); assembling = false; continue; }
-		const auto epoch = peek64(view.substr(36));
-		if (count != no_manifest) {
-			auto& manifest = manifests[{peek64(view.substr(44)), peek32(view.substr(52))}];
+		const auto header = framing::parse_header(view, stream(identity, options.block_bytes, segment, 0), index);
+		if (header.check != framing::Check::ok) { gap(); assembling = false; continue; }
+		const auto epoch = header.epoch; const auto count = header.count;
+		if (count != framing::no_manifest) {
+			auto& manifest = manifests[{framing::peek64(view.substr(44)), framing::peek32(view.substr(52))}];
 			manifest.segment = segment; manifest.block = static_cast<std::uint32_t>(index); manifest.epoch = epoch;
-			for (std::size_t i = 0; i < count; ++i) { manifest.groups[peek64(view.substr(header_fixed + 16 * i))] = peek64(view.substr(header_fixed + 16 * i + 8)); }
+			const auto entry = framing::header_fixed;
+			for (std::size_t i = 0; i < count; ++i) { manifest.groups[framing::peek64(view.substr(entry + 16 * i))] = framing::peek64(view.substr(entry + 16 * i + 8)); }
 		}
-		std::size_t position = size;
-		while (options.block_bytes - position >= fragment_header + 1) {
-			auto fragment = view.substr(position);
-			auto length = get16(fragment.substr(4)); auto type = static_cast<std::uint8_t>(fragment[6]);
-			bool valid = length > 0 && fragment_header + length <= fragment.size() && type >= Full && type <= Last && fragment[7] == '\0' &&
-				peek64(fragment.substr(8)) == segment && peek64(fragment.substr(16)) == epoch;
-			if (valid) { Checksum checksum; checksum.update(fragment.substr(4, fragment_header - 4)); checksum.update(fragment.substr(fragment_header, length)); valid = checksum.value() == peek32(fragment); }
-			if (!valid) { gap(); assembling = false; break; }
-			auto payload = fragment.substr(fragment_header, length);
-			position += fragment_header + length;
-			if (type == Full || type == First) {
+		std::size_t position = header.size;
+		while (options.block_bytes - position >= framing::fragment_header + 1) {
+			const auto fragment = framing::parse_fragment(view.substr(position), options.block_bytes - position, segment, epoch);
+			if (fragment.check != framing::Check::ok) { gap(); assembling = false; break; }
+			const auto type = fragment.type; const auto payload = fragment.payload; const auto length = payload.size();
+			position += framing::fragment_header + length;
+			if (type == framing::Full || type == framing::First) {
 				if (assembling) { gap(); }
-				partial.assign(payload); partial_epoch = epoch; partial_offset = offset + position - fragment_header - length; assembling = type == First;
+				partial.assign(payload); partial_epoch = epoch; partial_offset = offset + position - framing::fragment_header - length; assembling = type == framing::First;
 				if (assembling) { continue; }
 			} else {
 				if (!assembling || partial_epoch != epoch) { gap(); assembling = false; continue; }
 				partial.append(payload);
-				if (type == Middle) { continue; }
+				if (type == framing::Middle) { continue; }
 				assembling = false;
 			}
 			if (partial.size() < record_header) { gap(); continue; }
@@ -219,27 +159,6 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 	}
 	if (assembling) { gap(); }
 }
-// Reads back the logical record whose first fragment starts at offset.
-inline std::string read_record(File& file, const TurnLogOptions& options, std::uint64_t offset) {
-	std::string logical, header(fragment_header, '\0');
-	for (std::uint64_t position = offset;;) {
-		if (position % options.block_bytes == 0) {
-			std::string count(2, '\0');
-			if (file.read_at(position + 56, count) != 2) { throw Corruption("short turn log read"); }
-			position += header_bytes(get16(count));
-		}
-		auto room = options.block_bytes - position % options.block_bytes;
-		if (room < fragment_header + 1) { position += room; continue; }
-		if (file.read_at(position, header) != header.size()) { throw Corruption("short turn log read"); }
-		auto length = get16(std::string_view(header).substr(4)); auto type = static_cast<std::uint8_t>(header[6]);
-		std::string payload(length, '\0');
-		if (!length || length > room - fragment_header || file.read_at(position + fragment_header, payload) != length) { throw Corruption("invalid turn log fragment"); }
-		Checksum checksum; checksum.update(std::string_view(header).substr(4)); checksum.update(payload);
-		if (checksum.value() != peek32(header) || (logical.empty() ? type != Full && type != First : type != Middle && type != Last)) { throw Corruption("turn log record changed since it was written"); }
-		logical.append(payload); position += fragment_header + length;
-		if (type == Full || type == Last) { return logical; }
-	}
-}
 }  // namespace turn_log_detail
 
 class TurnLog {
@@ -247,7 +166,7 @@ public:
 	// Recovers the journal in the IO's directory (empty for a new one), then starts a new
 	// epoch whose open record is durable before any turn is admitted (condition 8).
 	TurnLog(IO& io, Identity identity, TurnRecovery& recovered, TurnLogOptions options = {}) : io_(io), identity_(identity), options_(options) {
-		if (!options_.block_bytes || options_.block_bytes > 65535 + turn_log_detail::fragment_header || options_.block_bytes < 256 ||
+		if (!options_.block_bytes || !framing::valid_block_bytes(options_.block_bytes) ||
 			options_.segment_bytes < options_.block_bytes || options_.segment_bytes % options_.block_bytes) {
 			throw std::invalid_argument("invalid turn log geometry");
 		}
@@ -258,7 +177,7 @@ public:
 		next_segment_ = highest_segment_ + 1;
 		begin_segment();
 		data_segments_.insert(segment_);
-		write({[&](turn_log_detail::Emitter& emitter) { emitter.record(turn_log_detail::open_record, turn_, 0, 0, {}); }});
+		write({[&](framing::Emitter& emitter) { emitter.record(turn_log_detail::logical(turn_log_detail::open_record, turn_, 0, 0, {})); }});
 	}
 	// Preallocates spare segments; the host calls it off the turn.
 	void prepare() { while (spares_.size() < options_.spare_segments) { spares_.push_back(preallocate()); } }
@@ -296,12 +215,12 @@ public:
 		for (const auto& record : records) { turn.notes.push_back({record.group, record.sequence, record.kind, record.payload.size(), false}); }
 		auto copies = forward_slice();
 		std::vector<std::uint64_t> offsets;
-		auto emit = [&](turn_log_detail::Emitter& emitter) {
+		auto emit = [&](framing::Emitter& emitter) {
 			offsets.clear();
-			for (const auto& record : records) { offsets.push_back(emitter.record(static_cast<std::uint8_t>(record.kind), turn.turn, record.group, record.sequence, record.payload)); }
-			for (const auto& copy : copies) { offsets.push_back(emitter.record(static_cast<std::uint8_t>(copy.kind), turn.turn, copy.group, copy.sequence, copy.payload)); }
+			for (const auto& record : records) { offsets.push_back(emitter.record(turn_log_detail::logical(static_cast<std::uint8_t>(record.kind), turn.turn, record.group, record.sequence, record.payload), record.group, record.sequence)); }
+			for (const auto& copy : copies) { offsets.push_back(emitter.record(turn_log_detail::logical(static_cast<std::uint8_t>(copy.kind), turn.turn, copy.group, copy.sequence, copy.payload), copy.group, copy.sequence)); }
 			std::string count; put32(count, static_cast<std::uint32_t>(records.size() + copies.size()));
-			emitter.record(turn_log_detail::end_of_turn, turn.turn, 0, 0, count);
+			emitter.record(turn_log_detail::logical(turn_log_detail::end_of_turn, turn.turn, 0, 0, count));
 		};
 		// Copies ride along only where the turn still fits in a segment.
 		if (!copies.empty() && !fits(emit)) { copies.clear(); }
@@ -348,8 +267,8 @@ private:
 		if (auto found = records.find(sequence); found != records.end()) { drop(found->second); records.erase(found); }
 		records.emplace(sequence, Live{segment_, offset, kind}); ++live_counts_[segment_];
 	}
-	bool fits(const std::function<void(turn_log_detail::Emitter&)>& emit) const {
-		turn_log_detail::Emitter fresh(identity_, options_.block_bytes, segment_, epoch_, 0, filling_);
+	bool fits(const std::function<void(framing::Emitter&)>& emit) const {
+		framing::Emitter fresh(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, filling_);
 		emit(fresh); return fresh.position() <= options_.segment_bytes;
 	}
 	// Past retain_segments, the oldest segment's live records move forward, a bounded slice
@@ -364,7 +283,7 @@ private:
 			for (const auto& [sequence, live] : records) {
 				if (live.segment != oldest) { continue; }
 				std::string_view logical;
-				auto record = turn_log_detail::read_record(reader(oldest), options_, live.offset);
+				auto record = framing::read_record(reader(oldest), options_.block_bytes, live.offset);
 				logical = record; logical.remove_prefix(turn_log_detail::record_header);
 				copies.push_back({group, sequence, live.kind, std::string(logical)});
 				if ((bytes += logical.size()) >= std::min<std::uint64_t>(options_.forward_bytes, options_.segment_bytes / 4)) { return copies; }
@@ -394,7 +313,7 @@ private:
 		if (!file) { file = io_.open_existing(turn_log_detail::segment_name(segment)); }
 		return *file;
 	}
-	struct Body { std::function<void(turn_log_detail::Emitter&)> emit; };
+	struct Body { std::function<void(framing::Emitter&)> emit; };
 	std::unique_ptr<File> preallocate() {
 		auto file = io_.create_exclusive(turn_log_detail::segment_name(next_segment_++));
 		const std::string zeros(std::min<std::uint64_t>(options_.segment_bytes, 1 << 20), '\0');
@@ -412,15 +331,15 @@ private:
 		data_segments_.insert(segment_);
 	}
 	// A turn never crosses a segment: one that does not fit starts the next one.
-	turn_log_detail::Emitter encode(const std::function<void(turn_log_detail::Emitter&)>& emit) {
-		turn_log_detail::Emitter emitter(identity_, options_.block_bytes, segment_, epoch_, offset_, filling_);
+	framing::Emitter encode(const std::function<void(framing::Emitter&)>& emit) {
+		framing::Emitter emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), offset_, filling_);
 		emit(emitter);
 		if (emitter.position() > options_.segment_bytes) {
-			turn_log_detail::Emitter fresh(identity_, options_.block_bytes, segment_, epoch_, 0, filling_);
+			framing::Emitter fresh(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, filling_);
 			emit(fresh);
 			if (fresh.position() > options_.segment_bytes) { throw std::length_error("turn exceeds a segment"); }
 			begin_segment();
-			emitter = turn_log_detail::Emitter(identity_, options_.block_bytes, segment_, epoch_, 0, filling_);
+			emitter = framing::Emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, filling_);
 			emit(emitter);
 		}
 		return emitter;
@@ -441,9 +360,9 @@ private:
 	std::map<std::uint64_t, std::uint64_t> sequences_; std::set<std::uint64_t> lost_;
 	std::map<std::uint64_t, std::map<std::uint64_t, Live>> index_; std::map<std::uint64_t, std::size_t> live_counts_;
 	std::set<std::uint64_t> data_segments_; std::map<std::uint64_t, std::unique_ptr<File>> readers_;
-	turn_log_detail::Manifest filling_;  // unknown until the first block this open enters
+	framing::Manifest filling_;  // unknown until the first block this open enters
 	struct Note { std::uint64_t group, sequence; TurnRecordKind kind; std::size_t bytes; bool copy; std::uint64_t offset = 0; };
-	struct Staged { std::uint64_t turn = 0, offset = 0, end = 0; std::map<std::uint64_t, std::uint64_t> next; std::vector<Note> notes; turn_log_detail::Manifest filling; std::string bytes; };
+	struct Staged { std::uint64_t turn = 0, offset = 0, end = 0; std::map<std::uint64_t, std::uint64_t> next; std::vector<Note> notes; framing::Manifest filling; std::string bytes; };
 	std::optional<Staged> staged_;
 	TurnLogStats stats_; bool failed_ = false;
 };
