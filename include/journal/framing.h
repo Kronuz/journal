@@ -123,6 +123,22 @@ private:
 	Stream stream_; std::uint64_t position_; std::string bytes_; Manifest filling_;
 };
 
+// Where Emitter::record leaves a stream without manifests after a `size`-byte record written
+// from `position`: block headers, padding and fragment headers included, in constant time.
+inline std::uint64_t record_end(const Stream& stream, std::uint64_t position, std::uint64_t size) {
+	if (stream.manifests) { throw std::invalid_argument("framing: record_end needs a stream without manifests"); }
+	if (!size) { return position; }
+	const std::uint64_t block = stream.block_bytes, header = header_bytes(no_manifest), carried = block - header - fragment_header;
+	if (position % block == 0) { position += header; }
+	if (auto room = block - position % block; room < fragment_header + 1) { position += room + header; }  // padded
+	const std::uint64_t first = block - position % block - fragment_header;
+	if (size <= first) { return position + fragment_header + size; }
+	size -= first;
+	position += first + fragment_header;  // a block start: whole blocks of `carried` bytes, then the last
+	const std::uint64_t whole = (size - 1) / carried;
+	return position + whole * block + header + fragment_header + (size - whole * carried);
+}
+
 // A check's outcome: the bytes verify, or they fail, or the end of file cuts them.
 enum class Check : std::uint8_t { ok, bad, cut };
 

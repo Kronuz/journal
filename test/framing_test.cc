@@ -277,12 +277,32 @@ void rule_rows() {
 	check(f::read_file(*file) == log, "read_file reads the whole file");
 	check(f::read_record(*file, stream.block_bytes, clean.records[2].offset) == std::string(700, 'x'), "read_record reads a record across blocks");
 }
+// record_end against the emitter: every record start in a block and the next block's first, sizes to four blocks.
+void record_ends() {
+	for (std::uint32_t block : {256u, 512u}) {
+		f::Stream s = stream; s.block_bytes = block;
+		const auto header = f::header_bytes(f::no_manifest);
+		std::uint64_t wrong = 0, cases = 0;
+		for (std::uint64_t at = 0; at <= block + header; ++at) {
+			if (at % block && at % block < header) { continue; }  // inside a header: no record starts there
+			for (std::uint64_t size = 0; size <= 4 * block; size += (size < block + 64 ? 1 : 11)) {
+				f::Emitter emitter(s, at); emitter.record(std::string(size, 'x'));
+				++cases; wrong += f::record_end(s, at, size) != emitter.position();
+			}
+		}
+		check(wrong == 0 && cases > 50000, "record_end matches the emitter at " + std::to_string(block) + "-byte blocks: " + std::to_string(wrong) + " of " + std::to_string(cases) + " differ");
+	}
+	bool refused = false;
+	try { f::record_end(f::Stream{"STRLOG01", identity, 512, 7, 1, true}, 0, 1); } catch (const std::invalid_argument&) { refused = true; }
+	check(refused, "record_end refuses a stream with manifests");
+}
 }  // namespace
 
 int main() {
 	try {
 		model_logs();
 		rule_rows();
+		record_ends();
 	} catch (const std::exception& error) {
 		std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
 		return 1;

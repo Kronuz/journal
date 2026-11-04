@@ -23,6 +23,11 @@ that grows by appends).
   it notes each nonzero group's highest sequence for the next block's header (the turn log's use).
   The turn log wraps its own 25-byte record header (kind, turn, group, sequence) inside the record
   (`turn_log_detail::logical`); the framing never looks inside a record.
+- `record_end(stream, position, size)` says where the emitter would end a record, in constant time,
+  for a stream without manifests (a manifest's size depends on the groups written): the header and
+  padding of the block it starts in, then whole blocks of `block - 62 - 24` payload bytes, then the
+  last fragment. strata's writer sizes a snapshot with it (D7's S); `framing_test` checks it against
+  the emitter at every record start in a block.
 
 ## Reading
 
