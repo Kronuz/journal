@@ -150,6 +150,7 @@ inline Header parse_header(std::string_view block, const Stream& stream, std::ui
 	if (block.size() < (stream.manifests ? header_fixed : header_bytes(no_manifest))) { header.check = Check::cut; return header; }
 	header.count = get16(block.substr(56)); header.size = header_bytes(header.count);
 	if (!stream.manifests && header.count != no_manifest) { return header; }
+	if (header.count == no_manifest && (peek64(block.substr(44)) || peek32(block.substr(52)))) { return header; }  // the emitter writes zeros
 	if (header.size > stream.block_bytes) { return header; }
 	if (header.size > block.size()) { header.check = Check::cut; return header; }
 	if (block.substr(0, 8) != stream.magic || block.substr(8, 16) != std::string_view(stream.identity.data(), 16) || peek64(block.substr(24)) != stream.segment ||

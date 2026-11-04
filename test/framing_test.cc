@@ -276,6 +276,15 @@ void rule_rows() {
 	auto file = io.create_exclusive("log"); file->write_at(0, log);
 	check(f::read_file(*file) == log, "read_file reads the whole file");
 	check(f::read_record(*file, stream.block_bytes, clean.records[2].offset) == std::string(700, 'x'), "read_record reads a record across blocks");
+
+	// A header without a manifest leaves the manifest's segment and block zero: other bytes there
+	// under a valid CRC are bytes no emitter writes (the fuzz target's first finding).
+	std::string forged = log;
+	forged[512 + 54] = '\xf7';
+	j::put32(forged, j::crc32c(std::string_view(forged).substr(512, 58)));
+	forged.replace(512 + 58, 4, forged.substr(forged.size() - 4));
+	forged.resize(log.size());
+	check(at(forged).tail == f::Tail::damage, "a no-manifest header with a manifest block is damage");
 }
 // record_end against the emitter: every record start in a block and the next block's first, sizes to four blocks.
 void record_ends() {

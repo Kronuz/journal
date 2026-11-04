@@ -14,7 +14,8 @@ that grows by appends).
   identity, the block size, the segment number, the epoch, and whether headers carry manifests.
 - A **block** opens with a header: magic, identity, segment (8), block number (4), epoch (8), the
   manifest's segment (8), block (4) and count (2), 16 bytes per manifest entry, CRC-32C (4). Without a
-  manifest the count is `0xffff` and the header is 62 bytes.
+  manifest the count is `0xffff`, the manifest's segment and block are zero (a reader refuses
+  other bytes there), and the header is 62 bytes.
 - A **record** is opaque bytes split into fragments: CRC-32C (4), length (2), type (1: full, 2:
   first, 3: middle, 4: last), a zero byte, segment (8), epoch (8), then the payload; 24 bytes of
   header. The CRC covers everything after itself. A fragment never crosses a block; a block's tail
