@@ -1,0 +1,85 @@
+-- The CXX compiler identification is Clang 23.1.2
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/local/opt/llvm/bin/clang++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Performing Test HAS_THREAD_LOCAL
+-- Performing Test HAS_THREAD_LOCAL - Success
+-- Configuring done (5.2s)
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/kronuz/code/Kronuz/journal-wt/manifest-log-steps12/build-asan
+[1/38] Building CXX object CMakeFiles/journal_admission_test.dir/test/admission_test.cc.o
+[2/38] Building CXX object CMakeFiles/journal_inventory_test.dir/test/inventory_test.cc.o
+[3/38] Building CXX object CMakeFiles/journal_framing_test.dir/test/framing_test.cc.o
+[4/38] Building CXX object CMakeFiles/journal_turn_log_test.dir/test/turn_log_test.cc.o
+[5/38] Building CXX object CMakeFiles/journal_turn_log_power_test.dir/test/turn_log_power_test.cc.o
+[6/38] Building CXX object CMakeFiles/journal_shared_store_test.dir/test/shared_store_test.cc.o
+[7/38] Building CXX object CMakeFiles/journal_journal_test.dir/test/journal_test.cc.o
+[8/38] Building CXX object CMakeFiles/journal_fuzz_replay.dir/fuzz/fuzz_turn_log.cc.o
+[9/38] Building CXX object CMakeFiles/journal_fuzz_framing_replay.dir/fuzz/fuzz_framing.cc.o
+[10/38] Building CXX object CMakeFiles/journal_crc_fixture_test.dir/test/crc_fixture_test.cc.o
+[11/38] Building CXX object CMakeFiles/journal_fuzz_framing_replay.dir/fuzz/replay_framing.cc.o
+[12/38] Building CXX object CMakeFiles/journal_fuzz_framing.dir/fuzz/fuzz_framing.cc.o
+[13/38] Building CXX object CMakeFiles/journal_fuzz_replay.dir/fuzz/replay.cc.o
+[14/38] Building CXX object CMakeFiles/journal_fuzz.dir/fuzz/fuzz_turn_log.cc.o
+[15/38] Building CXX object CMakeFiles/journal_completion_test.dir/test/completion_test.cc.o
+[16/38] Building CXX object CMakeFiles/journal_bench.dir/bench/bench.cc.o
+[17/38] Building CXX object CMakeFiles/journal_checkpoint_bench.dir/bench/checkpoint_bench.cc.o
+[18/38] Linking CXX executable journal_journal_test
+[19/38] Linking CXX executable journal_inventory_test
+[20/38] Linking CXX executable journal_admission_test
+[21/38] Linking CXX executable journal_framing_test
+[22/38] Linking CXX executable journal_turn_log_test
+[23/38] Linking CXX executable journal_turn_log_power_test
+[24/38] Linking CXX executable journal_shared_store_test
+[25/38] Linking CXX executable journal_crc_fixture_test
+[26/38] Building CXX object CMakeFiles/journal_reclaim_bench.dir/bench/reclaim_bench.cc.o
+[27/38] Linking CXX executable journal_fuzz_replay
+[28/38] Linking CXX executable journal_fuzz_framing_replay
+[29/38] Linking CXX executable journal_fuzz
+[30/38] Linking CXX executable journal_fuzz_framing
+[31/38] Linking CXX executable journal_completion_test
+[32/38] Linking CXX executable journal_bench
+[33/38] Building CXX object CMakeFiles/journal_demo.dir/examples/demo.cc.o
+[34/38] Building CXX object CMakeFiles/journal_turn_bench.dir/bench/turn_bench.cc.o
+[35/38] Linking CXX executable journal_checkpoint_bench
+[36/38] Linking CXX executable journal_reclaim_bench
+[37/38] Linking CXX executable journal_demo
+[38/38] Linking CXX executable journal_turn_bench
+Test project /Users/kronuz/code/Kronuz/journal-wt/manifest-log-steps12/build-asan
+      Start  1: journal_journal
+      Start  2: journal_inventory
+      Start  3: journal_admission
+      Start  4: journal_framing
+ 1/11 Test  #2: journal_inventory ................   Passed    0.80 sec
+      Start  5: journal_turn_log
+ 2/11 Test  #3: journal_admission ................   Passed    0.89 sec
+      Start  6: journal_turn_log_power
+ 3/11 Test  #1: journal_journal ..................   Passed    8.25 sec
+      Start  7: journal_shared_store
+ 4/11 Test  #4: journal_framing ..................   Passed   20.43 sec
+      Start  8: journal_crc_fixture
+ 5/11 Test  #6: journal_turn_log_power ...........   Passed   25.28 sec
+      Start  9: journal_fuzz_replay
+ 6/11 Test  #9: journal_fuzz_replay ..............   Passed    2.28 sec
+      Start 10: journal_fuzz_framing_replay
+ 7/11 Test #10: journal_fuzz_framing_replay ......   Passed    6.83 sec
+      Start 11: journal_completion
+ 8/11 Test #11: journal_completion ...............   Passed    8.78 sec
+ 9/11 Test  #8: journal_crc_fixture ..............***Timeout  30.05 sec
+
+10/11 Test  #5: journal_turn_log .................   Passed   63.97 sec
+11/11 Test  #7: journal_shared_store .............   Passed   57.51 sec
+
+91% tests passed, 1 tests failed out of 11
+
+Total Test time (real) =  65.82 sec
+
+The following tests FAILED:
+	  8 - journal_crc_fixture (Timeout)
+Errors while running CTest
+EXIT 8
