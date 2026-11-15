@@ -127,6 +127,8 @@ cmake --build build --target journal_bench
 
 ## 📚 Documentation
 
+- [Acknowledged Means Durable](https://kronuz.github.io/blog/consensus/):
+  the Familiars post on why it exists and how it works.
 - [ARCHITECTURE.md](ARCHITECTURE.md): the contract, checkpoints, reclamation, admission,
   `Store`, completion-driven operations, the turn log and the durability model.
 - [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md): append, checkpoint and reclamation
