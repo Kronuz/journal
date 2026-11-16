@@ -24,8 +24,9 @@
 // floor or ceil(4,096 / L) slots; `remap` cuts power after every durable step of four
 // re-partitions of groups over a damaged old generation, where every group's records come back
 // exactly once on its new loop and every lost group stays lost through two more restarts;
-// `repartition_lost`, `repartition_damaged` and `retention` show the table's mark alone keeps a lost id refused once
-// the damage is gone, after a 1->2 re-partition and after retention. `placement_test [case]`.
+// `repartition_lost`, `repartition_damaged` and `retention` show the table's mark alone keeps a
+// lost id refused once the damage is gone: after a 1->2 re-partition, after a re-partition that
+// first sees the damage, and after retention. `placement_test [case]`.
 #include "journal/memory_io.h"
 #include "journal/host.h"
 #include <iostream>
@@ -198,7 +199,7 @@ void repartition_damaged() {
 	const auto written = populate(disk, 120, victims);
 	std::set<std::uint64_t> lost;
 	{
-		const jt::Disk copy = disk; jt::Disk probe = copy;
+		jt::Disk probe = disk;  // what the stored generation lost, read on a copy
 		auto host = open(probe, 1); lost = host->driver(0).recovered().lost;
 	}
 	check(lost.contains(50) && lost.contains(100), "the damage loses its victims");
