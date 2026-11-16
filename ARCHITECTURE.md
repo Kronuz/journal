@@ -8,7 +8,8 @@ I/O backends. Two backends sit behind one `Store` facade:
 - **The per-group journal** (`journal.h`): one directory per store, a manifest that names
   the durable frontier, and immutable checkpoint artifacts.
 - **The shared turn log** (`turn_log.h`, `turn_driver.h`): one log per core, carrying
-  every group on that core, one durability barrier per turn for all of them.
+  every group on that core, one durability barrier per turn for all of them. Its groups
+  and logs live in one directory per host (`host.h`).
 
 Measurements and qualification records are in [docs/MEASUREMENTS.md](docs/MEASUREMENTS.md).
 
@@ -200,6 +201,33 @@ count.
 shared backend, stages its batches and checkpoint records there; each staged operation
 completes at its turn's barrier, or fails with the turn. One turn is in flight at a time.
 
+## One directory per host
+
+`Host` (`host.h`) holds every group of a host and every loop's turn log in one flat directory
+under the directory's own owner lock, the lock strata's cold tier takes, whatever the loop count
+L. A group holds a table entry and no descriptor (`bench/idle_cost.cc`).
+[docs/design/host-layout.md](docs/design/host-layout.md) has the names and the protocols.
+
+- **Names.** `layout` (RJHL0001: L and the log generation), the group table's shards
+  `groups-<slot>` (RJGT0001), each loop's segments `l<generation>-<loop>-turns-<n>`, and each
+  group's artifacts `g<group>-artifact-<incarnation><serial>`. Loops and groups reach the
+  directory through prefixed views (`PrefixIO`), so `TurnLog` and the per-group code are
+  unchanged inside them.
+- **Group table.** Per group: incarnation, state (open, closed, lost), the serial range its
+  artifacts may use, and a closed group's last checkpoint record. Shards are replaced whole.
+  Reclamation and the admission census probe the serial range by name and never list the
+  directory; reclaiming one group names only its own files.
+- **Close and reopen.** A group whose last record is a durable checkpoint covering every batch
+  closes into the table, and its loop's log forgets it. Reopening restores it from the table
+  without reading a turn log and stages that record again as its first.
+- **Lost ids.** Every open marks the ids recovery calls lost in the table before it serves, and
+  each loop's `TurnLog` opens with them and refuses each, after a re-partition and after
+  retention reclaims the damage alike.
+- **Placement.** A group's loop is `(slot × L) >> 12` over 4,096 slots. Opened with another L,
+  the host reads the stored generation, marks its lost ids, writes each group's live records
+  into the next generation's logs, and commits by replacing `layout`; a crash before the commit
+  leaves the old generation authoritative (`test/placement_test.cc` cuts power at every step).
+
 ## Coroutine drivers
 
 The same operations run as `task::task`s over completion's seam (`completion_ref`, with
@@ -232,10 +260,8 @@ journal's headers.
 `HeldCompletion`, which must write the synchronous run's history; `test/mutants.py` names the
 mutants the tests kill.
 
-**Migration (R20).** `Store::migrate` moves a per-group journal into the turn log; once
-the migrated records are durable, `finish_migration` writes the `journal.shared` marker
-and removes the old files. The marker is an empty file whose presence selects the shared
-layout. Every step is checked at every crash point (`test/shared_store_test.cc`).
+A shared group's whole life (create, appends, checkpoints, reclamation, close and reopen) is
+checked at every crash point through both drivers (`test/shared_store_test.cc`).
 
 ## POSIX backend and the durability model
 

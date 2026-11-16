@@ -41,12 +41,16 @@ void check(bool value, const std::string& what) {
 	if (!value) { ++failures; if (failures < 30) { std::cerr << "FAIL: " << what << '\n'; } }
 }
 const j::Identity host_identity{'P', 'L', 'A', 'C', 'E'};
-const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
+// Segments large enough that populating keeps every record where it was written; retention uses
+// small ones.
+const j::TurnLogOptions turn_options{256 * 1024, 1024, 1, 4, 4096}, small_segments{16 * 1024, 1024, 1, 4, 4096};
 using Records = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
 
-std::unique_ptr<j::Host> open(jt::Disk& disk, std::uint32_t loops) {
-	return std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{loops, turn_options});
+std::unique_ptr<j::Host> open(jt::Disk& disk, std::uint32_t loops, const j::TurnLogOptions& options = turn_options) {
+	return std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{loops, options});
 }
+// Every fiftieth group, unless a later checkpoint supersedes its damaged batch.
+bool victim(std::uint64_t group) { return group % 50 == 0 && group % 3 != 0; }
 void commit(j::Host& host) { for (std::uint32_t l = 0; l < host.loops(); ++l) { while (!host.driver(l).idle()) { host.driver(l).commit(); } } }
 // Flips a byte of a durable record's payload, at `marker`, in whichever segment holds it.
 bool damage(jt::Disk& disk, const std::string& marker) {
@@ -70,10 +74,10 @@ bool refused(j::Host& host, std::uint64_t group) {
 // Groups 1..count, each a checkpoint record then batches over four turns, every third with a
 // later checkpoint; the first batch of every fiftieth is damaged. Returns what each group wrote
 // from its latest checkpoint.
-Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& victims) {
+Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& victims, const j::TurnLogOptions& options = turn_options) {
 	Records written;
 	{
-		auto host = open(disk, 1);
+		auto host = open(disk, 1, options);
 		for (std::uint64_t g = 1; g <= count; ++g) {
 			host->create_group(g);
 			j::TurnRecord record{g, 1, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)};
@@ -86,7 +90,7 @@ Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& v
 				auto& records = written[g];
 				const auto kind = round == 2 && g % 3 == 0 ? j::TurnRecordKind::Checkpoint : j::TurnRecordKind::Batch;
 				auto payload = "group-" + std::to_string(g) + "-round-" + std::to_string(round) + std::string(g % 40, '.');
-				if (round == 0 && g % 50 == 0) { payload += std::string(2400, marker(g)[0]); }
+				if (round == 0 && victim(g)) { payload += std::string(2400, marker(g)[0]); }
 				j::TurnRecord record{g, records.back().sequence + 1, kind, payload};
 				host->driver_of(g).stage(record);
 				if (kind == j::TurnRecordKind::Checkpoint) { records.clear(); }
@@ -97,6 +101,7 @@ Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& v
 		}
 	}
 	for (std::uint64_t g = 50; g <= count; g += 50) {
+		if (!victim(g)) { continue; }
 		check(damage(disk, marker(g)), "the victim's first batch is in the log");
 		victims.insert(g);
 	}
@@ -189,16 +194,16 @@ void repartition_lost() {
 void retention() {
 	jt::Disk disk;
 	std::set<std::uint64_t> victims;
-	const auto written = populate(disk, 60, victims);
+	const auto written = populate(disk, 60, victims, small_segments);
 	std::set<std::uint64_t> lost;
 	{
-		auto host = open(disk, 1);
+		auto host = open(disk, 1, small_segments);
 		lost = host->driver(0).recovered().lost;
 		check(lost.contains(50) && host->driver(0).recovered().damaged, "the damaged group is lost");
 		std::uint64_t sequence = written.at(1).back().sequence;
 		for (int turn = 0; turn < 200; ++turn) { host->driver(0).stage({1, ++sequence, j::TurnRecordKind::Batch, std::string(900, 'r')}); commit(*host); }
 	}
-	auto host = open(disk, 1);
+	auto host = open(disk, 1, small_segments);
 	check(!host->driver(0).recovered().damaged, "retention recycled the damaged segment");
 	check(host->status(50) == j::GroupStatus::lost, "the table still holds the group lost");
 	check(refused(*host, 50), "its id stays refused");
