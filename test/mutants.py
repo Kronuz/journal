@@ -37,6 +37,38 @@ MUTANTS = {
     "cancel-without-hop": ("include/journal/turn_driver.h",
         "if (!waiter->home.post_call(&hop, waiter)) { hop(waiter); }", "hop(waiter);",
         "journal_driver_test", ["entry_threads_busy"]),
+    # The table's lost ids never reach the logs: a lost id appends again once the damage is gone.
+    "remap-forget": ("include/journal/host.h",
+        "if (entry.state == GroupState::lost) { loop.lost.insert(id); }", "if (false) { loop.lost.insert(id); }",
+        "journal_placement_test", ["repartition_lost"]),
+    # A re-partition that does not mark recovery's lost ids before it writes the new generation.
+    "repartition-skips-mark": ("include/journal/host.h",
+        "\t\tmark_lost(lost);\n\t\tconst auto next = generation_ + 1;", "\t\tconst auto next = generation_ + 1;",
+        "journal_placement_test", ["remap"]),
+    # An open that does not mark the lost ids: retention then forgets them.
+    "open-skips-mark": ("include/journal/host.h",
+        "\t\tfor (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }\n\t\tmark_lost(lost);",
+        "\t\tfor (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }",
+        "journal_placement_test", ["retention"]),
+    # Artifact names that drop the group's id: two groups collide.
+    "group-blind-names": ("include/journal/host.h",
+        'inline std::string group_prefix(std::uint64_t group) { return "g" + hex(group, 16) + "-"; }',
+        'inline std::string group_prefix(std::uint64_t) { return "g-"; }',
+        "journal_host_test", ["reclaim_isolation"]),
+    # A group's census and reclamation list the directory instead of probing its names.
+    "group-scans": ("include/journal/host.h",
+        "\t\t\tconst auto* found = entry(group);\n\t\t\tif (!found) {",
+        "\t\t\tif (group) { return io_->scan_directory(); }\n\t\t\tconst auto* found = entry(group);\n\t\t\tif (!found) {",
+        "journal_host_test", ["census"]),
+    # A closed group recovered from its loop's log, not the table.
+    "reopen-from-log": ("include/journal/journal.h",
+        "\t\t\tif (!turns_->has_group(group_)) {\n\t\t\t\tif (status == GroupStatus::closed)",
+        "\t\t\tif (false) {\n\t\t\t\tif (status == GroupStatus::closed)",
+        "journal_host_test", ["closed_reopen"]),
+    # A group created again keeps its first incarnation's name space.
+    "same-incarnation": ("include/journal/host.h",
+        "entry = GroupEntry{entry.incarnation + 1, GroupState::open,", "entry = GroupEntry{1, GroupState::open,",
+        "journal_host_test", ["recreate"]),
 }
 
 def main():

@@ -41,7 +41,7 @@ namespace jt = kronuz::journal::testing;
 
 namespace {
 int checks = 0, failures = 0;
-std::uint64_t published = 0, acknowledged_batches = 0, reclaimed = 0, recovered_checkpoints = 0;
+std::uint64_t published = 0, acknowledged_batches = 0, reclaimed = 0, recovered_checkpoints = 0, reopened = 0;
 void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
@@ -121,6 +121,24 @@ struct Node {
 		}
 	}
 
+	// A group whose checkpoint covers every batch closes into the host's table and reopens from
+	// it, staging that record again as its first.
+	void cycle(std::uint64_t g) {
+		auto& group = groups[g];
+		group.store->close();
+		group.store = std::make_unique<j::Store>(*host, g, limits);
+		std::vector<std::string> recovered;
+		group.store->recover([&](std::uint64_t, std::string_view) { check(false, "a closed group replays no batch"); },
+			[&](const j::Frontier&, j::ArtifactReader& bundle, std::span<j::ArtifactReader>) {
+				std::string bytes(static_cast<std::size_t>(bundle.descriptor().length), '\0');
+				for (std::size_t at = 0; at < bytes.size();) { at += bundle.read_at(at, std::span<char>(bytes.data() + at, bytes.size() - at)); }
+				recovered = decode(bytes);
+			});
+		check(recovered == group.acknowledged, "a reopened group has every acknowledged batch");
+		while (!driver->idle()) { driver->commit(); }
+		while (!group.store->inventory_step(64).complete) {}
+		++reopened;
+	}
 	// Every append that reported success is acknowledged, whenever power is lost after.
 	void collect() {
 		for (auto& call : calls) {
@@ -170,6 +188,7 @@ struct Node {
 			check(publication->done(), "a publication completes at its turn's barrier");
 			publication->result(); ++published;
 		}
+		for (auto& [g, publication] : publications) { if (random() % 2 == 0) { cycle(g); } }
 		for (auto& [g, group] : groups) { if (random() % 4 == 0) { reclaimed += group.store->reclaim_step(16).removed; } }
 	}
 
@@ -223,6 +242,7 @@ struct Node {
 			++published;
 		}
 		collect();
+		for (auto& call : publications) { if (random() % 2 == 0) { cycle(call.group); } }
 		for (auto& [g, group] : groups) {
 			if (random() % 4 != 0) { continue; }
 			Call reclaim; std::uint64_t removed = 0;
@@ -305,6 +325,6 @@ int main(int argc, char** argv) {
 		std::cout << (mode ? "tasks: " : "sync: ") << points << " crash points so far, " << failures << " failures\n";
 	}
 	std::cout << points << " crash points, " << checks << " shared store checks, " << failures << " failures (" << acknowledged_batches << " batches and "
-		<< published << " checkpoints acknowledged, " << recovered_checkpoints << " checkpoints recovered, " << reclaimed << " artifacts reclaimed)\n";
+		<< published << " checkpoints acknowledged, " << recovered_checkpoints << " checkpoints recovered, " << reclaimed << " artifacts reclaimed, " << reopened << " groups closed and reopened)\n";
 	return failures ? 1 : 0;
 }

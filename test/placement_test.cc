@@ -77,6 +77,7 @@ Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& v
 			host->create_group(g);
 			j::TurnRecord record{g, 1, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)};
 			host->driver_of(g).stage(record); written[g] = {record};
+			if (g % 25 == 0) { commit(*host); }  // a turn fits in a segment
 		}
 		commit(*host);
 		for (int round = 0; round < 4; ++round) {
@@ -89,6 +90,7 @@ Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& v
 				host->driver_of(g).stage(record);
 				if (kind == j::TurnRecordKind::Checkpoint) { records.clear(); }
 				records.push_back(record);
+				if (g % 25 == 0) { commit(*host); }
 			}
 			commit(*host);
 		}
