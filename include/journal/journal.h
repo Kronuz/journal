@@ -392,11 +392,13 @@ public:
 	}
 	// A shared journal's append or checkpoint: hands its record, with the operation that
 	// owns it, to the turn driver.
-	void enqueue_turn(std::shared_ptr<IOOperation> operation, MutationToken token) {
+	// Returns the record's sequence in the group.
+	std::uint64_t enqueue_turn(std::shared_ptr<IOOperation> operation, MutationToken token) {
 		if (!shared() || !turn_record_) { throw std::logic_error("no turn record staged"); }
 		auto record = std::move(*turn_record_); turn_record_.reset();
-		turns_->stage(std::move(record), std::move(operation), token);
+		return turns_->stage(std::move(record), std::move(operation), token);
 	}
+	TurnDriver* turns() const noexcept { return turns_; }
 private:
 	friend class Store;
 	std::shared_ptr<AppendMutation> start_append(std::string_view batch, bool asynchronous) {

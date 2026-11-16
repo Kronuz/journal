@@ -557,7 +557,68 @@ public:
 	}
 	std::shared_ptr<StoreReclaim> begin_reclaim(std::size_t budget = 1) { return start_reclaim(budget, true); }
 
+	// The same operations as tasks over completion's seam (async-drivers D2), on the loop that
+	// owns the Store and its turn driver. `token` is the caller's: requested before the operation
+	// starts, nothing starts and the call throws task::cancelled. A started operation's IO runs
+	// to its end with no token, so cancellation never tears one. A shared append or publication
+	// completes at its turn's barrier; cancelled while it waits, the caller is released and the
+	// record is still written with its turn.
+	task::task<Frontier> append(AppendReservation reservation, std::string_view bytes, completion_ref io, task::cancel_token token = {}) {
+		if (token.requested()) { throw task::cancelled{}; }
+		auto operation = start_append(std::move(reservation), bytes, true);
+		co_await settle(operation, staged_, io, std::move(token));
+		try { co_return operation->result(); } catch (...) { fence(); throw; }
+	}
+	task::task<Frontier> publish(ReplacementId id, std::uint64_t expected_sequence, completion_ref io, task::cancel_token token = {}) {
+		if (token.requested()) { throw task::cancelled{}; }
+		auto operation = start_publication(id, expected_sequence, true);
+		co_await settle(operation, staged_, io, std::move(token));
+		try { auto result = operation->result(); replacement_.reset(); co_return result; } catch (...) { fence(); throw; }
+	}
+	task::task<void> prepare_artifact(ReplacementId id, ArtifactPart part, completion_ref io, task::cancel_token token = {}) {
+		if (token.requested()) { throw task::cancelled{}; }
+		co_await run_artifact(begin_artifact_operation(id, part), io);
+	}
+	task::task<void> write_chunk(ReplacementId id, std::string_view bytes, completion_ref io, task::cancel_token token = {}) {
+		if (token.requested()) { throw task::cancelled{}; }
+		co_await run_artifact(begin_write_chunk(id, bytes), io);
+	}
+	task::task<ArtifactDescriptor> finish_artifact(ReplacementId id, completion_ref io, task::cancel_token token = {}) {
+		if (token.requested()) { throw task::cancelled{}; }
+		auto operation = begin_finish_artifact(id);
+		co_await run_artifact(operation, io);
+		co_return operation->descriptor();
+	}
+	task::task<ReclaimStats> reclaim_step(std::size_t budget, completion_ref io, task::cancel_token token = {}) {
+		if (token.requested()) { throw task::cancelled{}; }
+		if (!budget || budget > 4096) { throw std::invalid_argument("invalid reclamation scan budget"); }
+		auto operation = start_reclaim(budget, true);
+		std::exception_ptr error;
+		try { co_await io.run(operation); } catch (...) { error = std::current_exception(); }
+		if (error) { fence(); std::rethrow_exception(error); }
+		try { co_return operation->result(); } catch (...) { fence(); throw; }
+	}
+
 private:
+	// A shared operation waits for its turn's barrier, under the caller's token; a per-group
+	// one runs its primitives through `io`.
+	template <class Operation> task::task<void> settle(std::shared_ptr<Operation> operation, std::uint64_t sequence, completion_ref io, task::cancel_token token) {
+		std::exception_ptr error;
+		try {
+			if (shared()) { co_await journal_->turns()->durable(journal_->group(), sequence, std::move(token)); }
+			else { co_await io.run(operation); }
+		} catch (const task::cancelled&) { throw; }
+		catch (...) { error = std::current_exception(); }
+		if (error) { fence(); std::rethrow_exception(error); }
+	}
+	task::task<void> run_artifact(std::shared_ptr<StoreArtifactOperation> operation, completion_ref io) {
+		std::exception_ptr error;
+		if (!operation->done()) {
+			try { co_await io.run(operation); } catch (...) { error = std::current_exception(); }
+		}
+		if (error) { fence(); std::rethrow_exception(error); }
+		try { operation->result(); } catch (...) { fence(); throw; }
+	}
 	static IO& owned_io(const std::shared_ptr<IO>& io) {
 		if (!io) { throw std::invalid_argument("null owned store IO"); } return *io;
 	}
@@ -568,7 +629,7 @@ private:
 		auto append = journal_->start_append(bytes, asynchronous);
 		auto token = append->token();
 		auto operation = std::shared_ptr<StoreAppend>(new StoreAppend(journal_, std::move(append), std::move(reservation), plan));
-		if (shared()) { journal_->enqueue_turn(operation, token); }
+		if (shared()) { staged_ = journal_->enqueue_turn(operation, token); }
 		return operation;
 	}
 	std::shared_ptr<StorePublication> start_publication(const ReplacementId& id, std::uint64_t expected_sequence, bool asynchronous) {
@@ -578,7 +639,7 @@ private:
 		auto publication = journal_->start_checkpoint(*cycle.prepared[1], std::span<const PreparedArtifact>(&*cycle.prepared[0], 1), expected_sequence, asynchronous);
 		auto token = publication->token();
 		auto operation = std::shared_ptr<StorePublication>(new StorePublication(journal_, replacement_, std::move(publication), plan));
-		if (shared()) { journal_->enqueue_turn(operation, token); }
+		if (shared()) { staged_ = journal_->enqueue_turn(operation, token); }
 		return operation;
 	}
 	std::shared_ptr<StoreReclaim> start_reclaim(std::size_t budget, bool asynchronous) {
@@ -609,7 +670,7 @@ private:
 	std::optional<Inventory> inventory_;
 	std::shared_ptr<Admission> admission_;
 	std::shared_ptr<Replacement> replacement_;
-	std::uint64_t next_replacement_ = 0;
+	std::uint64_t next_replacement_ = 0, staged_ = 0;  // staged_: the last record staged in the turn
 	bool opened_ = false, failed_ = false;
 };
 } // namespace kronuz::journal
