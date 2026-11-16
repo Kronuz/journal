@@ -36,7 +36,7 @@ MUTANTS = {
     # The cancel callback unlinks on the requesting thread instead of hopping to the loop (TSan).
     "cancel-without-hop": ("include/journal/turn_driver.h",
         "if (!waiter->home.post_call(&hop, waiter)) { hop(waiter); }", "hop(waiter);",
-        "journal_driver_test", ["entry_threads"]),
+        "journal_driver_test", ["entry_threads_busy"]),
 }
 
 def main():

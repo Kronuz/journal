@@ -26,6 +26,7 @@
 #include "journal/blocking.h"
 #include "journal/memory_io.h"
 #include "journal/store.h"
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <iostream>
@@ -321,13 +322,47 @@ void entry_threads() {
 	check(slowest < std::chrono::seconds(5), "no round waits for its deadline");
 	std::cout << "entry_threads: slowest round " << std::chrono::duration_cast<std::chrono::microseconds>(slowest).count() << " us\n";
 }
+// A cancel from another thread while the loop links and unlinks other waiters: the callback
+// only claims and hops, so the loop alone touches the driver's waiters (run under TSan).
+void entry_threads_busy() {
+	constexpr int rounds = 20;
+	Core core;
+	core.store(12); core.store(13);
+	int cancelled = 0;
+	for (int round = 0; round < rounds; ++round) {
+		task::blocking_scheduler scheduler;
+		task::cancel_source outer;
+		std::atomic<bool> busy{false};
+		bool done = false;
+		auto wait = [&]() -> task::task<void> {
+			task::deadline<task::blocking_scheduler> limit(scheduler, std::chrono::steady_clock::now() + std::chrono::seconds(30), outer.token());
+			try { co_await core.turns->durable(13, 2, limit.token()); } catch (const task::cancelled&) { ++cancelled; }
+			done = true;
+		};
+		auto appends = [&]() -> task::task<void> {
+			auto& store = core.store(12);
+			for (int n = 0; !done && n < 100000; ++n) {
+				busy.store(true, std::memory_order_release);
+				co_await store.append(core.reserve(12, 1), "b", {});
+			}
+		};
+		auto root = [&]() -> task::task<void> {
+			task::spawn(task::current(), wait());
+			co_await appends();
+		};
+		std::thread other([&] { while (!busy.load(std::memory_order_acquire)) { std::this_thread::yield(); } outer.request(); });
+		try { j::run(*core.turns, scheduler, root()); } catch (const std::exception& error) { check(false, std::string("busy round threw: ") + error.what()); }
+		other.join();
+	}
+	check(cancelled == rounds, "every cancel lands while the loop is busy (" + std::to_string(cancelled) + " of " + std::to_string(rounds) + ")");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"runner", runner}, {"cancel_waiting", cancel_waiting}, {"cancel_races_barrier", cancel_races_barrier}, {"failed_turn", failed_turn},
 		{"entry_append", entry_append}, {"entry_lost_wake", entry_lost_wake}, {"entry_live_token", entry_live_token},
-		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads},
+		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {
