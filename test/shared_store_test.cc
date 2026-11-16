@@ -25,9 +25,13 @@
 // Power is cut after every I/O operation of a randomized run: every acknowledged batch
 // and checkpoint survives, nothing unstaged appears, and the groups carry on. Checkpoints
 // cross every publication step (artifacts durable, record staged, barrier, reclamation),
-// which is Condition 25's ordering under T9.
+// which is Condition 25's ordering under T9. Each run goes twice: once through the synchronous
+// calls and TurnDriver::commit, once through Store's tasks and TurnDriver::run over a
+// HeldCompletion on an inline_scheduler, whose primitives complete in the order issued. The two
+// must write the same history (the same count of disk operations) and keep the same batches.
 #include "journal/memory_io.h"
 #include "journal/store.h"
+#include <deque>
 #include <iostream>
 #include <map>
 #include <random>
@@ -66,13 +70,22 @@ struct Group {
 	std::vector<std::string> attempted, acknowledged;  // every batch staged; those completed
 };
 
+bool tasks = false;  // drive the rounds through the coroutine drivers
+
+// An append or publication run as a task: its outcome once done.
+struct Call { std::uint64_t group = 0; std::string batch; bool done = false; std::exception_ptr error; };
+
 struct Node {
 	jt::Disk& disk;
 	jt::MemoryIO log_io;
 	std::unique_ptr<j::TurnDriver> driver;
 	std::map<std::uint64_t, Group> groups;
 	std::vector<std::pair<std::uint64_t, std::shared_ptr<j::StoreAppend>>> appends;
+	task::inline_scheduler loop;
+	j::HeldCompletion held;
+	std::deque<Call> calls;  // the task round's appends, in order
 	explicit Node(jt::Disk& d) : disk(d), log_io(d, "log/") {}
+	~Node() { if (driver) { settle_tasks(); } }
 
 	// Opens the driver and every group: recovers it, or creates it when it has no records.
 	void open() {
@@ -119,6 +132,12 @@ struct Node {
 
 	// Every append that reported success is acknowledged, whenever power is lost after.
 	void collect() {
+		for (auto& call : calls) {
+			if (!call.done || call.error) { continue; }
+			auto& group = groups[call.group];
+			group.acknowledged.push_back(group.attempted[group.acknowledged.size()]); ++acknowledged_batches;
+		}
+		calls.clear();
 		for (auto& [g, append] : appends) {
 			if (!append->done()) { continue; }
 			try { append->result(); } catch (...) { continue; }
@@ -128,6 +147,7 @@ struct Node {
 		appends.clear();
 	}
 	void round(std::mt19937_64& random) {
+		if (tasks) { return task_round(random); }
 		std::vector<std::pair<std::uint64_t, std::shared_ptr<j::StorePublication>>> publications;
 		for (auto& [g, group] : groups) {
 			auto& store = *group.store;
@@ -160,6 +180,86 @@ struct Node {
 			publication->result(); ++published;
 		}
 		for (auto& [g, group] : groups) { if (random() % 4 == 0) { reclaimed += group.store->reclaim_step(16).removed; } }
+	}
+
+	// The same round as tasks: the groups' work in order (artifact IO awaited, appends and
+	// publications staged by tasks of their own), then one runner drains the staged turn, then
+	// reclamation. Each held primitive completes in the order issued, so the disk sees the
+	// synchronous round's operations; the first failure ends the round as the exception does there.
+	void task_round(std::mt19937_64& random) {
+		const auto ref = task::scheduler_ref::of(loop);
+		const auto io = j::completion_ref::of(held);
+		std::deque<Call> publications;
+		Call body;
+		auto staging = [&]() -> task::task<void> {
+			for (auto& [g, group] : groups) {
+				auto& store = *group.store;
+				if (random() % 8 == 0) {
+					auto id = store.reserve_replacement(1024, 1u << 20);
+					if (id) {
+						co_await store.prepare_artifact(*id, j::ArtifactPart::Application, io); co_await store.write_chunk(*id, "application", io); co_await store.finish_artifact(*id, io);
+						co_await store.prepare_artifact(*id, j::ArtifactPart::Bundle, io);
+						const auto bytes = encode(group.acknowledged);
+						for (std::size_t at = 0; at < bytes.size(); at += 65536) { co_await store.write_chunk(*id, std::string_view(bytes).substr(at, 65536), io); }
+						co_await store.finish_artifact(*id, io);
+						auto& call = publications.emplace_back(); call.group = g;
+						task::spawn(ref, track(call, [&store, id = *id, io] { return store.publish(id, store.frontier().sequence, io); }));
+						continue;
+					}
+				}
+				if (random() % 4 != 0) {
+					std::string batch = "g" + std::to_string(g) + "-" + std::to_string(group.attempted.size() + 1) + std::string(random() % 300, 'x');
+					auto permit = store.reserve_append(j::AdmissionClass::Normal, batch.size());
+					if (!permit) { continue; }
+					group.attempted.push_back(batch);
+					auto& call = calls.emplace_back(); call.group = g; call.batch = std::move(batch);
+					task::spawn(ref, track(call, [&store, &call, permit = std::make_shared<j::AppendReservation>(std::move(*permit)), io] { return store.append(std::move(*permit), call.batch, io); }));
+				}
+			}
+		};
+		task::spawn(ref, track(body, staging));
+		drive([&] { return body.done; });
+		if (body.error) { fail(body.error); }
+		task::cancel_source stop; stop.request();  // drain what is staged, then end
+		Call runner;
+		task::spawn(ref, track(runner, [&] { return driver->run(io, stop.token()); }));
+		drive([&] { return runner.done; });
+		if (runner.error) { fail(runner.error); }
+		for (auto& call : calls) { check(call.done, "an append completes at its turn's barrier"); if (call.error) { fail(call.error); } }
+		for (auto& call : publications) {
+			check(call.done, "a publication completes at its turn's barrier");
+			if (call.error) { fail(call.error); }
+			++published;
+		}
+		collect();
+		for (auto& [g, group] : groups) {
+			if (random() % 4 != 0) { continue; }
+			Call reclaim; std::uint64_t removed = 0;
+			auto& store = *group.store;
+			task::spawn(ref, track(reclaim, [&]() -> task::task<void> { removed = (co_await store.reclaim_step(16, io)).removed; }));
+			drive([&] { return reclaim.done; });
+			if (reclaim.error) { fail(reclaim.error); }
+			reclaimed += removed;
+		}
+	}
+	template <class F> static task::task<void> track(Call& call, F make) {
+		try { co_await make(); } catch (...) { call.error = std::current_exception(); }
+		call.done = true;
+	}
+	// Runs the loop, completing held primitives in order, until `done` or nothing moves.
+	template <class Done> void drive(Done done) {
+		for (loop.run(); !done() && held.held(); loop.run()) { held.complete(held.tickets().front()); }
+		if (!done()) { throw std::logic_error("a task round stalled"); }
+	}
+	// A failure ends the round: what is staged fails with it, so no task stays suspended.
+	[[noreturn]] void fail(std::exception_ptr error) {
+		settle_tasks(error);
+		std::rethrow_exception(error);
+	}
+	void settle_tasks(std::exception_ptr error = {}) noexcept {
+		if (!driver->idle() || driver->in_flight()) { driver->failed(error ? error : std::make_exception_ptr(std::runtime_error("node closed"))); }
+		for (auto ticket : held.tickets()) { held.drop(ticket); }
+		loop.run();
 	}
 };
 
@@ -251,14 +351,29 @@ std::uint64_t run(std::uint64_t seed, std::uint64_t cut, unsigned rounds) {
 
 int main(int argc, char** argv) {
 	const std::uint64_t seeds = argc > 1 ? std::stoull(argv[1]) : 3;
+	// `shared_store_test N sync` or `N tasks` runs one driver; both by default.
+	const std::string only = argc > 2 ? argv[2] : "";
 	std::uint64_t points = 0;
-	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-		const auto total = run(seed, std::numeric_limits<std::uint64_t>::max(), 40);
-		for (std::uint64_t cut = 1; cut <= total; ++cut, ++points) { run(seed, cut, 40); }
-	}
-	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-		const auto total = run_migration(seed, std::numeric_limits<std::uint64_t>::max());
-		for (std::uint64_t cut = 1; cut <= total; ++cut, ++points) { run_migration(seed, cut); }
+	for (bool mode : {false, true}) {
+		if ((only == "sync" && mode) || (only == "tasks" && !mode)) { continue; }
+		tasks = mode;
+		for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
+			const auto total = run(seed, std::numeric_limits<std::uint64_t>::max(), 40);
+			if (tasks) {
+				tasks = false; const auto sync = run(seed, std::numeric_limits<std::uint64_t>::max(), 40); tasks = true;
+				check(total == sync, "seed " + std::to_string(seed) + ": the tasks write the synchronous history (" + std::to_string(total) + " operations, " + std::to_string(sync) + " synchronously)");
+			}
+			for (std::uint64_t cut = 1; cut <= total; ++cut, ++points) { run(seed, cut, 40); }
+		}
+		for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
+			const auto total = run_migration(seed, std::numeric_limits<std::uint64_t>::max());
+			if (tasks) {
+				tasks = false; const auto sync = run_migration(seed, std::numeric_limits<std::uint64_t>::max()); tasks = true;
+				check(total == sync, "migration seed " + std::to_string(seed) + ": the tasks write the synchronous history (" + std::to_string(total) + " operations, " + std::to_string(sync) + " synchronously)");
+			}
+			for (std::uint64_t cut = 1; cut <= total; ++cut, ++points) { run_migration(seed, cut); }
+		}
+		std::cout << (mode ? "tasks: " : "sync: ") << points << " crash points so far, " << failures << " failures\n";
 	}
 	std::cout << points << " crash points, " << checks << " shared store checks, " << failures << " failures (" << acknowledged_batches << " batches and "
 		<< published << " checkpoints acknowledged, " << recovered_checkpoints << " checkpoints recovered, " << reclaimed << " artifacts reclaimed, " << migrated << " groups migrated)\n";

@@ -89,6 +89,7 @@ template <class E> bool throws(const std::exception_ptr& error) {
 void runner() {
 	Core core;
 	auto& store = core.store(1);
+	auto& other = core.store(10);  // a group appends one batch at a time
 	task::inline_scheduler loop;
 	auto ref = task::scheduler_ref::of(loop);
 	j::HeldCompletion held;
@@ -103,16 +104,16 @@ void runner() {
 	check(held.request(ticket).kind == j::PrimitiveKind::Write, "a turn starts with its write");
 	check(!first.done, "an append waits for its turn's barrier");
 	// A record staged while the turn is in flight waits for the next turn.
-	task::spawn(ref, capture(second, [&] { return store.append(core.reserve(1, 3), "two", j::completion_ref::of(held)); }));
+	task::spawn(ref, capture(second, [&] { return other.append(core.reserve(10, 3), "two", j::completion_ref::of(held)); }));
 	loop.run();
 	held.complete(ticket); loop.run();
 	check(held.held() == 1 && held.request(held.tickets().front()).kind == j::PrimitiveKind::SyncData, "the write is followed by its data barrier");
 	check(!first.done, "a written record is not acknowledged before its barrier");
 	held.complete(held.tickets().front()); loop.run();
 	check(first.done && first.value && first.value->sequence == 1, "the append completes at its barrier with its frontier");
-	check(core.turns->sequence(1) == 2 && !second.done, "the next turn holds the record staged in flight");
+	check(core.turns->sequence(1) == 2 && core.turns->sequence(10) == 1 && !second.done, "the next turn holds the record staged in flight");
 	for (int i = 0; i < 2 && held.held(); ++i) { held.complete(held.tickets().front()); loop.run(); }
-	check(second.done && second.value && second.value->sequence == 2, "the second append completes in the next turn");
+	check(second.done && second.value && second.value->sequence == 1 && core.turns->sequence(10) == 2, "the second append completes in the next turn");
 	check(!ran.done, "the runner waits for work");
 	stop.request(); loop.run();
 	check(ran.done && !ran.error, "stop ends the runner once nothing is staged");
