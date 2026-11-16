@@ -41,12 +41,15 @@ int main() {
 	j::Frontier genesis; genesis.identity = {'G'};
 	std::string manifest;  // built through a shared Store's create
 	{
-		jt::Disk disk; jt::MemoryIO log_io(disk, "log/"); j::TurnDriver driver(log_io, {'F', 'U', 'Z', 'Z'}, {8 * 512, 512, 1, 4, 1024});
-		auto io = std::make_shared<jt::MemoryIO>(disk, "g1/");
-		j::Store store(io, driver, 1, {{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3});
-		store.create(genesis.identity); driver.commit();
-		j::TurnDriver reopened(log_io, {'F', 'U', 'Z', 'Z'}, {8 * 512, 512, 1, 4, 1024});
-		manifest = reopened.records(1).front().payload;
+		jt::Disk disk; auto io = std::make_shared<jt::MemoryIO>(disk, "host/");
+		const j::HostOptions options{1, {8 * 512, 512, 1, 4, 1024}};
+		{
+			j::Host host(io, {'F', 'U', 'Z', 'Z'}, options);
+			j::Store store(host, 1, {{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3});
+			store.create(genesis.identity); host.driver(0).commit();
+		}
+		j::Host reopened(io, {'F', 'U', 'Z', 'Z'}, options);
+		manifest = reopened.driver(0).records(1).front().payload;
 	}
 	run(1, manifest); ++inputs;
 	for (std::size_t n = 0; n < 8; ++n) { run(1, manifest.substr(0, n)); ++inputs; }  // shorter than a checksum

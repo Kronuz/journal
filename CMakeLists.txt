@@ -27,7 +27,7 @@ add_library(journal::journal ALIAS journal)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	enable_testing()
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
-	foreach(t journal inventory admission framing turn_log turn_log_power shared_store crc_fixture driver)
+	foreach(t journal inventory admission framing turn_log turn_log_power shared_store crc_fixture driver host placement)
 		add_executable(journal_${t}_test test/${t}_test.cc)
 		target_link_libraries(journal_${t}_test PRIVATE journal::journal)
 		add_test(NAME journal_${t} COMMAND journal_${t}_test)
@@ -39,6 +39,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set_tests_properties(journal_framing PROPERTIES TIMEOUT 120)  # about 27 s under ASan and UBSan at -O0
 	set_tests_properties(journal_turn_log_power PROPERTIES TIMEOUT 600)
 	set_tests_properties(journal_shared_store PROPERTIES TIMEOUT 600)
+	set_tests_properties(journal_placement PROPERTIES TIMEOUT 600)  # every durable step of four re-partitions
 	# T8: the shared journal's decoders, replayed over seeded inputs; libFuzzer with JOURNAL_FUZZ.
 	add_executable(journal_fuzz_replay fuzz/fuzz_turn_log.cc fuzz/replay.cc)
 	target_link_libraries(journal_fuzz_replay PRIVATE journal::journal)
