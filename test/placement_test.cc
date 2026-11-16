@@ -26,8 +26,8 @@
 // exactly once on its new loop and every lost group stays lost through two more restarts;
 // `repartition_lost`, `repartition_damaged` and `retention` show the table's mark alone keeps a
 // lost id refused once the damage is gone: after a 1->2 re-partition, after a re-partition that
-// first sees the damage, and after retention; `absent`, a group whose only records the damage
-// took, is lost rather than offered for create. `placement_test [case]`.
+// first sees the damage, and after retention; `damaged_absent`, a group whose only records the
+// damage took, is lost rather than offered for create. `placement_test [case]`.
 #include "journal/memory_io.h"
 #include "journal/host.h"
 #include <iostream>
@@ -211,7 +211,7 @@ void repartition_damaged() {
 // A group whose only records a damaged log no longer holds, and that no surviving manifest
 // names, is lost, never offered for create: its checkpoint record's bytes flipped, its segment
 // zeroed past the first block, or the segment gone. It stays lost through another restart.
-void absent() {
+void damaged_absent() {
 	const j::TurnLogOptions options{64 * 1024, 1024, 1, 4, 4096};
 	const std::uint64_t group = 7;
 	for (int mode = 0; mode < 3; ++mode) {
@@ -270,7 +270,7 @@ void retention() {
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
-	const std::vector<std::pair<std::string, void (*)()>> cases{{"map", map}, {"remap", remap}, {"repartition_lost", repartition_lost}, {"repartition_damaged", repartition_damaged}, {"retention", retention}, {"absent", absent}};
+	const std::vector<std::pair<std::string, void (*)()>> cases{{"map", map}, {"remap", remap}, {"repartition_lost", repartition_lost}, {"repartition_damaged", repartition_damaged}, {"retention", retention}, {"damaged_absent", damaged_absent}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

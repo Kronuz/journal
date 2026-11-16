@@ -278,7 +278,7 @@ void recreate() {
 
 // A close whose table write fails (a full disk) leaves the group open and its records live in
 // the log: retention keeps them, and after a restart the group recovers, never offered for create.
-void close_failure() {
+void failed_close() {
 	jt::Disk disk;
 	{
 		Node node(disk);
@@ -301,7 +301,7 @@ void close_failure() {
 // A group closed, reopened from the table, then recovered by a second Store of the same host:
 // its state is in the log, not the table, so the recovery is refused; its loop keeps running,
 // and the reopened host recovers the group's latest state.
-void recover_twice() {
+void second_recovery() {
 	jt::Disk disk;
 	{
 		Node node(disk);
@@ -350,7 +350,7 @@ int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
-		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"close_failure", close_failure}, {"recover_twice", recover_twice}, {"lock", lock}};
+		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"second_recovery", second_recovery}, {"lock", lock}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

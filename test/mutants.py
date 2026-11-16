@@ -72,20 +72,20 @@ MUTANTS = {
     # A damaged log keeps quiet about an open group it holds nothing of: create takes its id (F1).
     "damaged-keeps-absent": ("include/journal/turn_log.h",
         "if (damaged) { for (auto group : known.open)", "if (false) { for (auto group : known.open)",
-        "journal_placement_test", ["absent"]),
+        "journal_placement_test", ["damaged_absent"]),
     # The log forgets a closing group before its table write is durable (F2).
     "close-forgets-first": ("include/journal/host.h",
         "\t\tupdate(group, [&](GroupEntry& entry) {\n\t\t\tsettle_mark",
         "\t\tdriver_of(group).forget(group);\n\t\tupdate(group, [&](GroupEntry& entry) {\n\t\t\tsettle_mark",
-        "journal_host_test", ["close_failure"]),
+        "journal_host_test", ["failed_close"]),
     # A failed table write keeps its change in memory (F4).
     "update-keeps-change": ("include/journal/host.h",
         "catch (...) { if (before) { entry = std::move(*before); } else { shard.erase(group); } throw; }", "catch (...) { throw; }",
-        "journal_host_test", ["close_failure"]),
+        "journal_host_test", ["failed_close"]),
     # A second recovery on one host takes the table's stale checkpoint (F3).
     "recover-twice-from-table": ("include/journal/journal.h",
         "if (turns_->holds(group_)) { throw", "if (false) { throw",
-        "journal_host_test", ["recover_twice"]),
+        "journal_host_test", ["second_recovery"]),
 }
 
 def main():
