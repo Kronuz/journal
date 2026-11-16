@@ -323,6 +323,23 @@ void entry_threads() {
 	check(slowest < std::chrono::seconds(5), "no round waits for its deadline");
 	std::cout << "entry_threads: slowest round " << std::chrono::duration_cast<std::chrono::microseconds>(slowest).count() << " us\n";
 }
+// A cancel from another thread between drives only claims the waiter and queues its hop: once
+// that thread is joined, the waiter is still linked, and only the loop's next drive unlinks it.
+void cancel_hops() {
+	Core core;
+	core.store(14);
+	task::inline_scheduler loop;
+	task::cancel_source caller;
+	Outcome<int> wait;
+	task::spawn(task::scheduler_ref::of(loop), capture(wait, [&]() -> task::task<int> { co_await core.turns->durable(14, 2, caller.token()); co_return 0; }));
+	loop.run();
+	check(!wait.done && core.turns->waiting_groups() == std::vector<std::uint64_t>{14}, "the waiter is linked");
+	std::thread other([&] { caller.request(); });
+	other.join();
+	check(!wait.done && core.turns->waiting_groups() == std::vector<std::uint64_t>{14}, "the cancelling thread leaves the waiter linked for the loop");
+	loop.run();
+	check(wait.done && throws<task::cancelled>(wait.error) && core.turns->waiting_groups().empty(), "the loop's hop unlinks it and resumes it cancelled");
+}
 // A cancel from another thread while the loop links and unlinks other waiters: the callback
 // only claims and hops, so the loop alone touches the driver's waiters (run under TSan).
 void entry_threads_busy() {
@@ -363,7 +380,7 @@ int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"runner", runner}, {"cancel_waiting", cancel_waiting}, {"cancel_races_barrier", cancel_races_barrier}, {"failed_turn", failed_turn},
 		{"entry_append", entry_append}, {"entry_lost_wake", entry_lost_wake}, {"entry_live_token", entry_live_token},
-		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy},
+		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy}, {"cancel_hops", cancel_hops},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {

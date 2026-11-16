@@ -36,7 +36,7 @@ MUTANTS = {
     # The cancel callback unlinks on the requesting thread instead of hopping to the loop (TSan).
     "cancel-without-hop": ("include/journal/turn_driver.h",
         "if (!waiter->home.post_call(&hop, waiter)) { hop(waiter); }", "hop(waiter);",
-        "journal_driver_test", ["entry_threads_busy"]),
+        "journal_driver_test", ["cancel_hops"]),
     # The table's lost ids never reach the logs: a lost id appends again once the damage is gone.
     "remap-forget": ("include/journal/host.h",
         "if (entry.state == GroupState::lost) { loop.lost.insert(id); continue; }", "if (false) { loop.lost.insert(id); continue; }",
