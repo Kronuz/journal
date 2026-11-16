@@ -27,7 +27,7 @@
 // `repartition_lost`, `repartition_damaged` and `retention` show the table's mark alone keeps a
 // lost id refused once the damage is gone: after a 1->2 re-partition, after a re-partition that
 // first sees the damage, and after retention; `damaged_absent`, a group whose only records the
-// damage took, is lost rather than offered for create. `placement_test [case]`.
+// damage took, is lost rather than offered for create. `placement_test [case [shard shards]]`.
 #include "journal/memory_io.h"
 #include "journal/host.h"
 #include <iostream>
@@ -144,6 +144,9 @@ void map() {
 	check(*std::min_element(hits.begin(), hits.end()) > 50 && *std::max_element(hits.begin(), hits.end()) < 150, "sequential ids spread over the slots");
 }
 
+// `remap` alone may run one shard of its crash points: those whose index modulo `shards` is
+// `shard`; every shard repeats the uncut re-partitions, so the shards together cut every point.
+std::uint64_t shard = 0, shards = 1;
 void remap() {
 	jt::Disk disk;
 	std::set<std::uint64_t> victims;
@@ -162,7 +165,9 @@ void remap() {
 		const auto start = disk.operations;
 		{ auto host = open(disk, loops); verify(*host, written, lost, loops, "re-partition to " + std::to_string(loops)); }
 		const auto total = disk.operations - start;
-		for (std::uint64_t cut = 1; cut <= total; ++cut, ++points) {
+		for (std::uint64_t cut = 1; cut <= total; ++cut) {
+			if ((cut - 1) % shards != shard) { continue; }
+			++points;
 			jt::Disk crashed = before;
 			crashed.cut = crashed.operations + cut;
 			try { open(crashed, loops); } catch (const jt::PowerLoss&) {}
@@ -174,7 +179,7 @@ void remap() {
 			}
 		}
 	}
-	std::cout << "remap: " << written.size() << " groups, " << lost.size() << " lost, " << points << " crash points\n";
+	std::cout << "remap: " << written.size() << " groups, " << lost.size() << " lost, " << points << " crash points (shard " << shard << " of " << shards << ")\n";
 }
 
 // Journal's own damage scenario: a group lost to a damaged block of the only loop's log, then a
@@ -270,6 +275,8 @@ void retention() {
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
+	if (argc > 3) { shard = std::stoull(argv[2]); shards = std::stoull(argv[3]); }  // `remap SHARD SHARDS`
+	if (!shards || shard >= shards) { std::cerr << "invalid remap shard\n"; return 2; }
 	const std::vector<std::pair<std::string, void (*)()>> cases{{"map", map}, {"remap", remap}, {"repartition_lost", repartition_lost}, {"repartition_damaged", repartition_damaged}, {"retention", retention}, {"damaged_absent", damaged_absent}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
