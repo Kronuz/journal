@@ -12,7 +12,8 @@ include/journal/
   journal.h       The per-group journal: append, checkpoint generations, recovery, migration.
   store.h         Store: the facade over both backends, with admission and inventory.
   turn_log.h      RFTW0001, the shared turn log (D11).
-  turn_driver.h   One core's turns: groups stage records, one barrier per turn.
+  turn_driver.h   One core's turns: groups stage records, one barrier per turn; run() and durable() as tasks.
+  blocking.h      journal::run, the blocking entry, and journal::stalled.
   artifact.h      Artifact builders, verifiers, readers, and their owned operations.
   mutation.h      Resumable append and manifest-publication state machines.
   reclamation.h   Bounded reclamation.
@@ -22,7 +23,7 @@ include/journal/
   codec.h         On-disk encodings.
   primitives.h    Shared helpers.
   memory_io.h     The injected power-loss filesystem the tests use.
-test/             journal, inventory, admission, turn_log, turn_log_power (T9),
+test/             journal, inventory, admission, turn_log, turn_log_power (T9), driver,
                   shared_store (R20), completion, linux_completion.
 fuzz/             libFuzzer target for turn-log segments and checkpoint records, and its replay test.
 bench/            append, checkpoint, reclaim, turn, and completion benchmarks.

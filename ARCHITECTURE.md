@@ -200,6 +200,38 @@ count.
 shared backend, stages its batches and checkpoint records there; each staged operation
 completes at its turn's barrier, or fails with the turn. One turn is in flight at a time.
 
+## Coroutine drivers
+
+The same operations run as `task::task`s over completion's seam (`completion_ref`, with
+`InlineCompletion`, `HeldCompletion` and the Asio driver behind it), with no event loop in
+journal's headers.
+
+- **`TurnDriver::run(io, stop)`** is the loop's task: it waits for staged records, writes each
+  turn as one `TurnBarrier` operation (the write, then `SyncData`, on the Turn lane) through
+  `io`, and completes the turn's operations at the barrier. Turn IO takes no caller's token, so
+  a staged record is always written; `stop` ends the task once nothing is staged or in flight.
+- **`TurnDriver::durable(group, sequence, token)`** resumes once the group's records through
+  `sequence` are durable. The waiter lives in the caller's frame; the loop links and completes
+  it, and a token's callback, on any thread, claims it and hops to the loop (`post_call`), which
+  unlinks it before resuming the caller. Only the claim's winner resumes it.
+- **`Store`'s tasks** (`append`, `publish`, `prepare_artifact`, `write_chunk`,
+  `finish_artifact`, `reclaim_step`) check the caller's token before starting; once started,
+  an operation's IO runs to its end. A shared append or publication waits for its barrier
+  under the token: cancelled, the caller is released and the record is still written.
+- **The blocking entry**, `journal::run(turns, task)` (`blocking.h`), drives a task on the
+  calling thread over `task::blocking_scheduler`, holding the turn driver: it runs the
+  scheduler until its queue is empty, commits what is staged inline, returns once the task has
+  finished and nothing is staged, sleeps only toward an armed operation deadline (a cross-thread
+  cancel's hop wakes it), and otherwise throws `journal::stalled`, a `std::logic_error` naming
+  the groups that held a waiter: a lost wake never passes silently.
+- **One holder.** `run()` and the blocking entry each refuse a turn driver the other holds, and
+  a manual `begin()`/`commit()` is refused while `run()` holds it.
+
+`test/driver_test.cc` covers each rule, cross-thread cancels under TSan included;
+`test/shared_store_test.cc` runs every crash point a second time through the tasks over
+`HeldCompletion`, which must write the synchronous run's history; `test/mutants.py` names the
+mutants the tests kill.
+
 **Migration (R20).** `Store::migrate` moves a per-group journal into the turn log; once
 the migrated records are durable, `finish_migration` writes the `journal.shared` marker
 and removes the old files. The marker is an empty file whose presence selects the shared
