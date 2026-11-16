@@ -57,8 +57,8 @@ MUTANTS = {
         "journal_host_test", ["reclaim_isolation"]),
     # A group's census and reclamation list the directory instead of probing its names.
     "group-scans": ("include/journal/host.h",
-        "\t\t\tconst auto* found = entry(group);\n\t\t\tif (!found) {",
-        "\t\t\tif (group) { return io_->scan_directory(); }\n\t\t\tconst auto* found = entry(group);\n\t\t\tif (!found) {",
+        "\t\t\tstd::uint64_t incarnation, serial, high;\n",
+        "\t\t\tif (group) { return io->scan_directory(); }\n\t\t\tstd::uint64_t incarnation, serial, high;\n",
         "journal_host_test", ["census"]),
     # A closed group recovered from its loop's log, not the table.
     "reopen-from-log": ("include/journal/journal.h",
