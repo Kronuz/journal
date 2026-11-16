@@ -452,7 +452,8 @@ private:
 		}
 		mark_lost(lost);
 		const auto next = generation_ + 1;
-		const auto budget = std::max<std::uint64_t>(1, options_.turns.segment_bytes / 4);
+		// A turn never crosses a segment: a quarter of one, counting each record's framing.
+		const auto budget = options_.turns.segment_bytes / 4;
 		for (std::uint32_t loop = 0; loop < options_.loops; ++loop) {
 			auto view = std::make_shared<PrefixIO>(io_, host_detail::log_prefix(next, loop), [] {
 				return std::make_unique<host_detail::NameCursor>([] { return std::optional<std::string>(); });
@@ -462,8 +463,9 @@ private:
 			for (const auto& [id, kept] : records) {
 				if (host_detail::loop(host_detail::slot(id), options_.loops) != loop) { continue; }
 				for (const auto& record : kept) {
-					if (!turn.empty() && bytes + record.payload.size() > budget) { log.append(turn); turn.clear(); bytes = 0; }
-					turn.push_back(record); bytes += record.payload.size();
+					const auto size = record.payload.size() + 64;
+					if (!turn.empty() && bytes + size > budget) { log.append(turn); turn.clear(); bytes = 0; }
+					turn.push_back(record); bytes += size;
 				}
 			}
 			if (!turn.empty()) { log.append(turn); }

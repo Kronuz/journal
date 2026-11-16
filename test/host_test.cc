@@ -197,9 +197,9 @@ void census() {
 	store->recover([](std::uint64_t, std::string_view) {}, [](const j::Frontier&, j::ArtifactReader&, std::span<j::ArtifactReader>) {});
 	j::InventoryStats census;
 	do { census = store->inventory_step(64); } while (!census.complete);
+	check(node.io->scans == 0, "the census never lists the directory");
 	std::uint64_t bytes = 0; std::size_t count = 0;
 	for (const auto& name : node.artifacts(3)) { bytes += node.io->entry_footprint(name)->logical_bytes; ++count; }
-	check(node.io->scans == 0, "the census never lists the directory");
 	check(census.entries == count && census.logical_bytes == bytes && count == 4, "the census counts the group's four artifacts and their bytes");
 }
 
@@ -226,11 +226,16 @@ void closed_reopen() {
 	{
 		Node node(disk);
 		node.io->names.clear();
-		node.store(7);
+		auto store = std::make_unique<j::Store>(*node.host, 7, limits);
+		std::string bundle;
+		store->recover([](std::uint64_t, std::string_view) { check(false, "a closed group replays no batch"); },
+			[&](const j::Frontier&, j::ArtifactReader& reader, std::span<j::ArtifactReader>) { bundle = read(reader); });
 		bool logs = false;
 		for (const auto& name : node.io->names) { logs |= hd::log_name(name).has_value(); }
-		check(!logs, "reopening reads no turn log");
-		check(node.recovered[7].bundle == "state" && node.recovered[7].batches.empty(), "the reopened group has its checkpoint");
+		check(!logs && !node.io->names.empty(), "reopening reads the group's artifacts and no turn log");
+		check(bundle == "state" && node.host->status(7) == j::GroupStatus::stored, "the reopened group has its checkpoint");
+		node.stores[7] = std::move(store); node.commit(7);
+		while (!node.stores[7]->inventory_step(64).complete) {}
 		node.append(7, "after");
 	}
 	Node node(disk);
