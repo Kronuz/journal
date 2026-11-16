@@ -62,6 +62,7 @@ struct Core {
 			store = std::make_unique<j::Store>(std::make_shared<jt::MemoryIO>(disk, "g" + std::to_string(group) + "/"), *turns, group, limits);
 			if (turns->has_group(group)) { store->recover([](std::uint64_t, std::string_view) {}); }
 			else { store->create(identity(group)); }
+			while (!turns->idle()) { turns->commit(); }  // the group's first checkpoint record: sequence 1
 			while (!store->inventory_step(64).complete) {}
 		}
 		return *store;
@@ -109,7 +110,7 @@ void runner() {
 	check(!first.done, "a written record is not acknowledged before its barrier");
 	held.complete(held.tickets().front()); loop.run();
 	check(first.done && first.value && first.value->sequence == 1, "the append completes at its barrier with its frontier");
-	check(core.turns->sequence(1) == 1 && !second.done, "the next turn holds the record staged in flight");
+	check(core.turns->sequence(1) == 2 && !second.done, "the next turn holds the record staged in flight");
 	for (int i = 0; i < 2 && held.held(); ++i) { held.complete(held.tickets().front()); loop.run(); }
 	check(second.done && second.value && second.value->sequence == 2, "the second append completes in the next turn");
 	check(!ran.done, "the runner waits for work");
@@ -133,14 +134,14 @@ void cancel_waiting() {
 	loop.run();
 	caller.request(); loop.run();
 	check(append.done && throws<task::cancelled>(append.error), "the cancelled caller completes with task::cancelled");
-	check(core.turns->sequence(2) == 0, "its record is not yet durable");
+	check(core.turns->sequence(2) == 1, "its record is not yet durable");
 	while (held.held()) { held.complete(held.tickets().front()); loop.run(); }
-	check(core.turns->sequence(2) == 1 && store.frontier().sequence == 1, "the cancelled append's record is written with its turn");
+	check(core.turns->sequence(2) == 2 && store.frontier().sequence == 1, "the cancelled append's record is written with its turn");
 	stop.request(); loop.run();
 	check(ran.done && !ran.error, "the runner ends");
 	// Reopened, the record is there.
 	core.open();
-	check(core.turns->sequence(2) == 1 && core.turns->records(2).size() == 1 && core.turns->records(2).front().payload == "kept", "recovery keeps the cancelled append's record");
+	check(core.turns->sequence(2) == 2 && core.turns->records(2).size() == 2 && core.turns->records(2).back().payload == "kept", "recovery keeps the cancelled append's record");
 	// A token requested before the call starts nothing.
 	Outcome<j::Frontier> refused;
 	task::cancel_source early; early.request();
@@ -173,7 +174,7 @@ void entry_append() {
 	Core core;
 	auto& store = core.store(4);
 	auto frontier = j::run(*core.turns, store.append(core.reserve(4, 6), "inline", {}));
-	check(frontier.sequence == 1 && core.turns->sequence(4) == 1, "the entry returns the append durable");
+	check(frontier.sequence == 1 && core.turns->sequence(4) == 2, "the entry returns the append durable");
 	check(core.turns->idle() && core.turns->holder() == j::TurnDriver::Holder::none, "nothing is left staged and the entry releases the driver");
 }
 
@@ -199,7 +200,7 @@ void entry_live_token() {
 	core.store(8);
 	task::cancel_source live;
 	try {
-		j::run(*core.turns, core.turns->durable(8, 1, live.token()));
+		j::run(*core.turns, core.turns->durable(8, 2, live.token()));
 		check(false, "a lost wake under a live token throws");
 	} catch (const j::stalled& error) {
 		check(error.groups == std::vector<std::uint64_t>{8}, "stalled names the group under a live token");
@@ -224,7 +225,7 @@ void entry_staged_cancelled() {
 		check(!core.turns->idle(), "the record is staged before the cancel");
 		source.request();
 		while (!finished) { co_await task::yield(); }
-		check(core.turns->sequence(5) == 0, "the caller is released before its record is written");
+		check(core.turns->sequence(5) == 1, "the caller is released before its record is written");
 		if (cancelled) { throw task::cancelled{}; }
 	};
 	try {
@@ -232,7 +233,7 @@ void entry_staged_cancelled() {
 		check(false, "the cancelled append returns task::cancelled");
 	} catch (const task::cancelled&) {}
 	check(cancelled, "the append saw the cancel");
-	check(core.turns->idle() && core.turns->sequence(5) == 1 && store.frontier().sequence == 1, "its record is written before the entry returns");
+	check(core.turns->idle() && core.turns->sequence(5) == 2 && store.frontier().sequence == 1, "its record is written before the entry returns");
 }
 
 // The holder tag: the entry refuses a driver run() holds, and run() one the entry holds.
@@ -247,7 +248,7 @@ void entry_holder() {
 	loop.run();
 	check(core.turns->holder() == j::TurnDriver::Holder::driver, "run() holds the driver");
 	bool refused = false;
-	try { j::run(*core.turns, core.turns->durable(6, 1)); } catch (const std::logic_error& error) { refused = !dynamic_cast<const j::stalled*>(&error); }
+	try { j::run(*core.turns, core.turns->durable(6, 2)); } catch (const std::logic_error& error) { refused = !dynamic_cast<const j::stalled*>(&error); }
 	check(refused, "the entry refuses a driver run() holds");
 	refused = false;
 	try { core.turns->commit(); } catch (const std::logic_error&) { refused = true; }
@@ -278,7 +279,7 @@ void entry_threads() {
 		task::cancel_source outer;
 		auto work = [&]() -> task::task<void> {
 			task::deadline<task::blocking_scheduler> limit(scheduler, std::chrono::steady_clock::now() + std::chrono::seconds(30), outer.token());
-			co_await core.turns->durable(9, 1, limit.token());
+			co_await core.turns->durable(9, 2, limit.token());
 		};
 		const auto started = std::chrono::steady_clock::now();
 		std::thread other([&] { std::this_thread::sleep_for(std::chrono::milliseconds(2)); outer.request(); });
