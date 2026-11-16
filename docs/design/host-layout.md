@@ -25,7 +25,11 @@ per host", summarizes it.
   per-group code inside the views are unchanged: a log still names its segments `turns-<n>`.
 - **Artifacts are named by group, incarnation and serial.** An artifact's 16-byte identity is
   its incarnation and serial, big-endian, so its name follows from its descriptor. Serials count
-  up per incarnation and are reserved 64 at a time with one table update.
+  up per incarnation and are reserved 64 at a time with one table update, made synchronously on
+  the loop when a preparation starts a new block.
+- **Views on other threads.** A completion backend may run a reclamation's scan primitive on a
+  worker; a group's view reads its serial range from a small locked copy the host updates
+  whenever the entry changes, never the table itself.
 
 ## The group table
 

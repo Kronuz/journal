@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -194,6 +195,12 @@ inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, 
 	return entries;
 }
 
+// A group's serial range as its view's scan reads it, on whichever thread runs the scan
+// primitive; the host updates it on the loop's thread whenever the table entry changes.
+struct Range {
+	std::mutex mutex;
+	std::uint64_t incarnation = 0, mark = 0, high = 0;
+};
 // The names `scan` yields, in order.
 class NameCursor final : public DirectoryCursor {
 public:
@@ -274,12 +281,16 @@ public:
 	// The group's view of the directory: its own names, and a scan that probes its serials.
 	std::shared_ptr<IO> group_io(std::uint64_t group) {
 		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
-		return std::make_shared<PrefixIO>(io_, host_detail::group_prefix(group), [this, group]() -> std::unique_ptr<DirectoryCursor> {
-			const auto* found = entry(group);
-			if (!found) { return std::make_unique<host_detail::NameCursor>([] { return std::optional<std::string>(); }); }
-			return std::make_unique<host_detail::NameCursor>([this, group, incarnation = found->incarnation, serial = found->mark, high = found->high]() mutable -> std::optional<std::string> {
+		std::erase_if(ranges_, [](const auto& item) { return item.second.expired(); });
+		auto range = std::make_shared<host_detail::Range>();
+		ranges_.emplace(group, range);
+		if (const auto* found = entry(group)) { publish(group, *found); }
+		return std::make_shared<PrefixIO>(io_, host_detail::group_prefix(group), [io = io_, group, range]() -> std::unique_ptr<DirectoryCursor> {
+			std::uint64_t incarnation, serial, high;
+			{ std::lock_guard hold(range->mutex); incarnation = range->incarnation; serial = range->mark; high = range->high; }
+			return std::make_unique<host_detail::NameCursor>([io, group, incarnation, serial, high]() mutable -> std::optional<std::string> {
 				for (; serial < high; ++serial) {
-					if (io_->entry_footprint(host_detail::artifact_name(group, incarnation, serial))) {
+					if (io->entry_footprint(host_detail::artifact_name(group, incarnation, serial))) {
 						return "artifact-" + host_detail::hex(incarnation, 16) + host_detail::hex(serial++, 16);
 					}
 				}
@@ -344,10 +355,17 @@ private:
 		entry.mark = entry.high;
 		return removed;
 	}
-	// Replaces the shards, then syncs the directory once.
+	// Replaces the shards, then syncs the directory once; the groups' views see their ranges.
 	void commit(const std::set<std::uint32_t>& slots) {
 		for (auto slot : slots) { host_detail::replace_file(*io_, host_detail::shard_name(slot), host_detail::encode_shard(identity_, shards_[slot])); }
 		io_->sync_directory();
+		for (auto slot : slots) { for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); } }
+	}
+	void publish(std::uint64_t group, const GroupEntry& entry) {
+		auto [first, last] = ranges_.equal_range(group);
+		for (; first != last; ++first) {
+			if (auto range = first->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
+		}
 	}
 	std::shared_ptr<IO> loop_io(std::uint64_t generation, std::uint32_t loop) {
 		auto names = logs_[{generation, loop}];
@@ -493,6 +511,7 @@ private:
 	std::map<std::pair<std::uint64_t, std::uint32_t>, std::vector<std::string>> logs_;
 	std::vector<std::shared_ptr<IO>> loop_views_;
 	std::set<std::uint64_t> opened_;  // groups a Store created or recovered this open
+	std::multimap<std::uint64_t, std::weak_ptr<host_detail::Range>> ranges_;  // the groups' views
 	std::vector<std::unique_ptr<TurnDriver>> drivers_;
 };
 

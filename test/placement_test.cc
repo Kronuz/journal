@@ -24,7 +24,7 @@
 // floor or ceil(4,096 / L) slots; `remap` cuts power after every durable step of four
 // re-partitions of groups over a damaged old generation, where every group's records come back
 // exactly once on its new loop and every lost group stays lost through two more restarts;
-// `repartition_lost` and `retention` show the table's mark alone keeps a lost id refused once
+// `repartition_lost`, `repartition_damaged` and `retention` show the table's mark alone keeps a lost id refused once
 // the damage is gone, after a 1->2 re-partition and after retention. `placement_test [case]`.
 #include "journal/memory_io.h"
 #include "journal/host.h"
@@ -190,6 +190,22 @@ void repartition_lost() {
 	verify(*host, written, lost, 2, "after 1->2");
 }
 
+// Damage first seen by a re-partition: step 1 marks the lost ids before the new generation,
+// which holds no damage, is written.
+void repartition_damaged() {
+	jt::Disk disk;
+	std::set<std::uint64_t> victims;
+	const auto written = populate(disk, 120, victims);
+	std::set<std::uint64_t> lost;
+	{
+		const jt::Disk copy = disk; jt::Disk probe = copy;
+		auto host = open(probe, 1); lost = host->driver(0).recovered().lost;
+	}
+	check(lost.contains(50) && lost.contains(100), "the damage loses its victims");
+	auto host = open(disk, 3);
+	verify(*host, written, lost, 3, "a re-partition over fresh damage");
+}
+
 // A lost id stays lost once retention recycled the damaged segment.
 void retention() {
 	jt::Disk disk;
@@ -212,7 +228,7 @@ void retention() {
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
-	const std::vector<std::pair<std::string, void (*)()>> cases{{"map", map}, {"remap", remap}, {"repartition_lost", repartition_lost}, {"retention", retention}};
+	const std::vector<std::pair<std::string, void (*)()>> cases{{"map", map}, {"remap", remap}, {"repartition_lost", repartition_lost}, {"repartition_damaged", repartition_damaged}, {"retention", retention}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

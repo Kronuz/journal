@@ -44,7 +44,7 @@ MUTANTS = {
     # A re-partition that does not mark recovery's lost ids before it writes the new generation.
     "repartition-skips-mark": ("include/journal/host.h",
         "\t\tmark_lost(lost);\n\t\tconst auto next = generation_ + 1;", "\t\tconst auto next = generation_ + 1;",
-        "journal_placement_test", ["remap"]),
+        "journal_placement_test", ["repartition_damaged"]),
     # An open that does not mark the lost ids: retention then forgets them.
     "open-skips-mark": ("include/journal/host.h",
         "\t\tfor (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }\n\t\tmark_lost(lost);",
