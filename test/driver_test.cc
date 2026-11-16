@@ -152,6 +152,35 @@ void cancel_waiting() {
 	check(refused.done && throws<task::cancelled>(refused.error) && core.turns->idle(), "a caller cancelled before the call stages nothing");
 }
 
+// A cancel that claims a waiter after its barrier completed, before the cancel's hop runs: the
+// barrier unlinks it but loses the claim, so only the hop resumes the caller, once.
+void cancel_races_barrier() {
+	Core core;
+	auto& store = core.store(11);
+	task::inline_scheduler loop;
+	auto ref = task::scheduler_ref::of(loop);
+	j::HeldCompletion held;
+	task::cancel_source stop, caller;
+	Outcome<int> ran;
+	task::spawn(ref, capture(ran, [&]() -> task::task<int> { co_await core.turns->run(j::completion_ref::of(held), stop.token()); co_return 0; }));
+	int resumes = 0;
+	Outcome<j::Frontier> append;
+	task::spawn(ref, capture(append, [&]() -> task::task<j::Frontier> {
+		auto result = store.append(core.reserve(11, 4), "race", j::completion_ref::of(held), caller.token());
+		struct Count { int& n; ~Count() { ++n; } } count{resumes};
+		co_return co_await std::move(result);
+	}));
+	loop.run();
+	held.complete(held.tickets().front()); loop.run();  // the write; the barrier is held
+	held.complete(held.tickets().front());  // the barrier's completion queues the runner
+	caller.request();  // the claim: its hop queues behind the runner
+	loop.run();
+	check(append.done && throws<task::cancelled>(append.error) && resumes == 1, "the cancel's claim wins and the caller resumes once");
+	check(core.turns->sequence(11) == 2 && store.frontier().sequence == 1, "the record is durable all the same");
+	stop.request(); loop.run();
+	check(ran.done && !ran.error, "the runner ends");
+}
+
 // A failed write fails the turn: the append and the runner throw it, and the Store fences.
 void failed_turn() {
 	Core core;
@@ -296,7 +325,7 @@ void entry_threads() {
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
-		{"runner", runner}, {"cancel_waiting", cancel_waiting}, {"failed_turn", failed_turn},
+		{"runner", runner}, {"cancel_waiting", cancel_waiting}, {"cancel_races_barrier", cancel_races_barrier}, {"failed_turn", failed_turn},
 		{"entry_append", entry_append}, {"entry_lost_wake", entry_lost_wake}, {"entry_live_token", entry_live_token},
 		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads},
 	};
