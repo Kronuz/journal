@@ -218,9 +218,11 @@ L. A group holds a table entry and no descriptor (`bench/idle_cost.cc`).
   Reclamation and the admission census probe the serial range by name and never list the
   directory; reclaiming one group names only its own files.
 - **Close and reopen.** A group whose last record is a durable checkpoint covering every batch
-  closes into the table, and its loop's log forgets it. Reopening restores it from the table
-  without reading a turn log and stages that record again as its first.
-- **Lost ids.** Every open marks the ids recovery calls lost in the table before it serves, and
+  closes into the table, and once that is durable its loop's log forgets it. Reopening
+  restores it from the table without reading a turn log and stages that record again as its
+  first.
+- **Lost ids.** Every open marks the ids recovery calls lost in the table before it serves (a
+  damaged log calls lost every open group it holds nothing of), and
   each loop's `TurnLog` opens with them and refuses each, after a re-partition and after
   retention reclaims the damage alike.
 - **Placement.** A group's loop is `(slot × L) >> 12` over 4,096 slots. Opened with another L,

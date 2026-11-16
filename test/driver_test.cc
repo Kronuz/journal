@@ -326,7 +326,7 @@ void entry_threads() {
 // A cancel from another thread while the loop links and unlinks other waiters: the callback
 // only claims and hops, so the loop alone touches the driver's waiters (run under TSan).
 void entry_threads_busy() {
-	constexpr int rounds = 20;
+	constexpr int rounds = 200;
 	Core core;
 	core.store(12); core.store(13);
 	int cancelled = 0;

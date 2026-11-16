@@ -85,6 +85,8 @@ template <class T> EntryRoot entry_root(task::task<T> work, EntryResult<T>& resu
 // with an operation deadline armed it sleeps toward it (a post from another thread, such as a
 // cancel's hop, cuts the sleep short), and with none it throws `stalled`. A turn that fails
 // is the task's to see; if the task succeeds anyway, the entry throws the turn's failure.
+// After `stalled`, the scheduler may still queue a cancel's hop into the destroyed task: the
+// caller drops it and never drives it again.
 template <class T> T run(TurnDriver& turns, task::blocking_scheduler& scheduler, task::task<T> work) {
 	TurnDriver::Hold hold(turns, TurnDriver::Holder::entry);
 	detail::EntryResult<T> result;

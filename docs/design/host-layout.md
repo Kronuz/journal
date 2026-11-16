@@ -37,7 +37,8 @@ One entry per group: incarnation, state (open, closed, lost), the serial range `
 and, once the group has closed, its last checkpoint record (`base`, its sequence, and the
 manifest bytes). The table is sharded by slot, each shard replaced whole (`groups-<slot>.pending`,
 synced, renamed, then the directory synced); at a million groups a shard holds about 244 entries.
-It is read once when the host opens.
+It is read once when the host opens. Every transition writes its shard before anything acts on
+it; a failed write restores the entry in memory, so the table there never runs ahead of the disk.
 
 - **Naming without a scan.** After a crash, the names a group's artifacts may have are the
   serials in `[mark, high)`. A group's view lists those that exist by probing each name
@@ -49,15 +50,19 @@ It is read once when the host opens.
   (the earlier incarnation's artifacts go first). Then the group's first checkpoint record is
   staged, as before.
 - **Close.** The group's last record must be a durable checkpoint covering every batch. The
-  table takes it as `base`, the loop's log forgets the group (`TurnLog::forget`), and retention
-  reclaims its records.
+  table takes it as `base`; once that shard is durable the loop's log forgets the group
+  (`TurnLog::forget`), and retention reclaims its records. A failed write leaves the group open
+  with its records live.
 - **Reopen.** The table flips the entry to open, then the journal restores the frontier from
   the table's record and stages it again as the group's record `base + 1`. No turn log is read.
   `TurnLog` ignores a group's records through its `base` (`TurnLogGroups::base`), so a log that
   still holds records from before the close never costs the group, and a crash between the flip
-  and that record's barrier leaves the table's record authoritative.
+  and that record's barrier leaves the table's record authoritative. The table's record serves
+  only while the log holds nothing of the group: a group whose records the log already handed to
+  a Store of this host recovers again only after the host reopens.
 - **Lost.** Every open marks the ids recovery calls lost, synced, before it serves; their
-  artifacts then go. `TurnLog` opens with the table's lost ids (`TurnLogGroups::lost`) and refuses
+  artifacts then go. A damaged log also calls lost every open group it holds nothing of
+  (`TurnLogGroups::open`): the damage may have held its acknowledged records. `TurnLog` opens with the table's lost ids (`TurnLogGroups::lost`) and refuses
   each, so a lost id stays lost after a re-partition and after retention reclaims the damage.
 
 ## Placement and re-partition
