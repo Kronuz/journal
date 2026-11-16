@@ -20,8 +20,8 @@
  * THE SOFTWARE.
  */
 
-// Stores on the shared backend: several groups' batches and checkpoint records in one
-// turn log, their artifacts in directories of their own, all on one in-memory disk.
+// Stores on the shared backend: several groups of one host, their batches and checkpoint
+// records in one turn log and their artifacts in the host's one directory, on an in-memory disk.
 // Power is cut after every I/O operation of a randomized run: every acknowledged batch
 // and checkpoint survives, nothing unstaged appears, and the groups carry on. Checkpoints
 // cross every publication step (artifacts durable, record staged, barrier, reclamation),
@@ -41,7 +41,7 @@ namespace jt = kronuz::journal::testing;
 
 namespace {
 int checks = 0, failures = 0;
-std::uint64_t published = 0, acknowledged_batches = 0, reclaimed = 0, recovered_checkpoints = 0, migrated = 0;
+std::uint64_t published = 0, acknowledged_batches = 0, reclaimed = 0, recovered_checkpoints = 0;
 void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
@@ -65,7 +65,6 @@ std::vector<std::string> decode(std::string_view bytes) {
 }
 
 struct Group {
-	std::shared_ptr<jt::MemoryIO> io;
 	std::unique_ptr<j::Store> store;
 	std::vector<std::string> attempted, acknowledged;  // every batch staged; those completed
 };
@@ -77,39 +76,31 @@ struct Call { std::uint64_t group = 0; std::string batch; bool done = false; std
 
 struct Node {
 	jt::Disk& disk;
-	jt::MemoryIO log_io;
-	std::unique_ptr<j::TurnDriver> driver;
+	std::unique_ptr<j::Host> host;
+	j::TurnDriver* driver = nullptr;
 	std::map<std::uint64_t, Group> groups;
 	std::vector<std::pair<std::uint64_t, std::shared_ptr<j::StoreAppend>>> appends;
 	task::inline_scheduler loop;
 	j::HeldCompletion held;
 	std::deque<Call> calls;  // the task round's appends, in order
-	explicit Node(jt::Disk& d) : disk(d), log_io(d, "log/") {}
-	~Node() { if (driver) { settle_tasks(); } }
+	explicit Node(jt::Disk& d) : disk(d) {}
+	~Node() { close(); }
+	// The process ends: the Stores, then the host and its lock.
+	void close() {
+		if (driver) { settle_tasks(); }
+		for (auto& [g, group] : groups) { group.store.reset(); }
+		driver = nullptr; host.reset();
+	}
 
-	// Opens the driver and every group: recovers it, or creates it when it has no records.
+	// Opens the host and every group: recovers it, or creates it when it has no records.
 	void open() {
-		driver = std::make_unique<j::TurnDriver>(log_io, log_identity, options);
+		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), log_identity, j::HostOptions{1, options});
+		driver = &host->driver(0);
 		for (std::uint64_t g = 1; g <= group_count; ++g) {
 			auto& group = groups[g];
 			group.store.reset();
-			group.io = std::make_shared<jt::MemoryIO>(disk, "g" + std::to_string(g) + "/");
-			group.store = std::make_unique<j::Store>(group.io, *driver, g, limits);
-			const auto layout = j::Journal::layout(*group.io);
-			if (layout == j::Journal::Layout::Legacy) {
-				// R20: a per-group journal moves into the turn log; its batches are acknowledged.
-				std::vector<std::string> recovered;
-				group.store->migrate([&](std::uint64_t, std::string_view bytes) { recovered.emplace_back(bytes); },
-					[&](const j::Frontier&, j::ArtifactReader& bundle, std::span<j::ArtifactReader>) {
-						std::string bytes(static_cast<std::size_t>(bundle.descriptor().length), '\0');
-						for (std::size_t at = 0; at < bytes.size();) { at += bundle.read_at(at, std::span<char>(bytes.data() + at, bytes.size() - at)); }
-						recovered = decode(bytes);
-					});
-				while (!driver->idle()) { driver->commit(); }
-				group.store->finish_migration();
-				++migrated;
-				group.acknowledged = recovered; group.attempted = recovered;
-			} else if (layout == j::Journal::Layout::Shared && driver->has_group(g)) {
+			group.store = std::make_unique<j::Store>(*host, g, limits);
+			if (host->status(g) == j::GroupStatus::stored) {
 				std::vector<std::string> recovered;
 				group.store->recover([&](std::uint64_t sequence, std::string_view bytes) {
 					check(sequence == recovered.size() + 1, "batches replay in sequence");
@@ -122,7 +113,7 @@ struct Node {
 				});
 				group.acknowledged = recovered; group.attempted = recovered;
 			} else {
-				check(group.acknowledged.empty() && !driver->has_group(g), "a group without records acknowledged nothing");
+				check(group.acknowledged.empty() && host->status(g) == j::GroupStatus::none, "a group without records acknowledged nothing");
 				group.store->create(identity(g));
 				group.acknowledged.clear(); group.attempted.clear();
 			}
@@ -263,61 +254,6 @@ struct Node {
 	}
 };
 
-// Legacy groups: per-group journals with batches and a checkpoint, written without power
-// cuts; the cuts start with the migration.
-void legacy(jt::Disk& disk, std::mt19937_64& random, std::map<std::uint64_t, std::vector<std::string>>& written) {
-	for (std::uint64_t g = 1; g <= group_count; ++g) {
-		auto io = std::make_shared<jt::MemoryIO>(disk, "g" + std::to_string(g) + "/");
-		j::Store store(io, limits);
-		store.create(identity(g));
-		while (!store.inventory_step(64).complete) {}
-		auto& batches = written[g];
-		for (int b = 0, n = int(random() % 30); b < n; ++b) {
-			if (b == 10) {
-				auto id = store.reserve_replacement(1024, 1u << 20);
-				store.begin_artifact(*id, j::ArtifactPart::Application); store.write_chunk(*id, "application"); store.finish_artifact(*id);
-				store.begin_artifact(*id, j::ArtifactPart::Bundle); store.write_chunk(*id, encode(batches)); store.finish_artifact(*id);
-				store.publish(*id, store.frontier().sequence);
-			}
-			std::string batch = "legacy-" + std::to_string(g) + "-" + std::to_string(b);
-			auto permit = store.reserve_append(j::AdmissionClass::Normal, batch.size());
-			store.append(*permit, batch); batches.push_back(batch);
-		}
-	}
-}
-
-std::uint64_t run_migration(std::uint64_t seed, std::uint64_t cut) {
-	jt::Disk disk; disk.random.seed(seed * 104729 + cut);
-	std::mt19937_64 random(seed);
-	std::map<std::uint64_t, std::vector<std::string>> written;
-	legacy(disk, random, written);
-	Node node(disk);
-	for (auto& [g, batches] : written) { node.groups[g].acknowledged = batches; node.groups[g].attempted = batches; }
-	try {
-		disk.cut = cut;
-		node.open();
-		for (unsigned r = 0; r < 10; ++r) { node.round(random); }
-	} catch (const jt::PowerLoss&) {}
-	node.collect();
-	const auto operations = disk.operations;
-	disk.power_loss();
-	const auto at = "migration seed " + std::to_string(seed) + " cut " + std::to_string(cut);
-	try {
-		Node again(disk);
-		for (auto& [g, group] : node.groups) { again.groups[g].acknowledged = group.acknowledged; }
-		again.open();
-		for (auto& [g, group] : again.groups) {
-			const auto& before = node.groups[g];
-			bool kept = group.acknowledged.size() >= before.acknowledged.size() && group.acknowledged.size() <= before.attempted.size() &&
-				std::equal(before.acknowledged.begin(), before.acknowledged.end(), group.acknowledged.begin());
-			check(kept, "group " + std::to_string(g) + " keeps its legacy and migrated batches: " + at);
-			check(j::Journal::layout(*group.io) == j::Journal::Layout::Shared, "a reopened group is shared: " + at);
-		}
-		for (unsigned r = 0; r < 6; ++r) { again.round(random); }
-	} catch (const std::exception& error) { check(false, at + ": " + error.what()); }
-	return operations;
-}
-
 std::uint64_t run(std::uint64_t seed, std::uint64_t cut, unsigned rounds) {
 	jt::Disk disk; disk.random.seed(seed * 7919 + cut);
 	std::mt19937_64 random(seed);
@@ -329,6 +265,7 @@ std::uint64_t run(std::uint64_t seed, std::uint64_t cut, unsigned rounds) {
 	} catch (const jt::PowerLoss&) {}
 	node.collect();
 	const auto operations = disk.operations;
+	node.close();
 	disk.power_loss();
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	try {
@@ -365,17 +302,9 @@ int main(int argc, char** argv) {
 			}
 			for (std::uint64_t cut = 1; cut <= total; ++cut, ++points) { run(seed, cut, 40); }
 		}
-		for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-			const auto total = run_migration(seed, std::numeric_limits<std::uint64_t>::max());
-			if (tasks) {
-				tasks = false; const auto sync = run_migration(seed, std::numeric_limits<std::uint64_t>::max()); tasks = true;
-				check(total == sync, "migration seed " + std::to_string(seed) + ": the tasks write the synchronous history (" + std::to_string(total) + " operations, " + std::to_string(sync) + " synchronously)");
-			}
-			for (std::uint64_t cut = 1; cut <= total; ++cut, ++points) { run_migration(seed, cut); }
-		}
 		std::cout << (mode ? "tasks: " : "sync: ") << points << " crash points so far, " << failures << " failures\n";
 	}
 	std::cout << points << " crash points, " << checks << " shared store checks, " << failures << " failures (" << acknowledged_batches << " batches and "
-		<< published << " checkpoints acknowledged, " << recovered_checkpoints << " checkpoints recovered, " << reclaimed << " artifacts reclaimed, " << migrated << " groups migrated)\n";
+		<< published << " checkpoints acknowledged, " << recovered_checkpoints << " checkpoints recovered, " << reclaimed << " artifacts reclaimed)\n";
 	return failures ? 1 : 0;
 }

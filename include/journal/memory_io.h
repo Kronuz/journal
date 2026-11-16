@@ -37,6 +37,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace kronuz::journal::testing {
@@ -51,6 +52,7 @@ struct Disk {
 	struct Inode { std::string durable; std::map<std::uint64_t, std::string> pending; std::uint64_t size = 0; };
 	std::map<std::uint64_t, Inode> inodes; std::map<std::string, std::uint64_t> names, durable_names;
 	std::uint64_t next_inode = 1, operations = 0, cut = std::numeric_limits<std::uint64_t>::max();
+	std::map<std::string, std::uint64_t> locks; std::uint64_t next_lock = 1;  // held directory locks; power loss drops them
 	std::mt19937_64 random{0};
 	// From the cut on, every operation fails: a disk without power stays without it, even
 	// when a caller turns the first failure into an error and carries on.
@@ -78,7 +80,7 @@ struct Disk {
 			}
 			after.size = after.durable.size();
 		}
-		inodes = std::move(survived); names = durable_names;
+		inodes = std::move(survived); names = durable_names; locks.clear();
 		cut = std::numeric_limits<std::uint64_t>::max();
 	}
 };
@@ -163,7 +165,19 @@ public:
 		std::erase_if(disk_.durable_names, [&](const auto& entry) { return mine(entry.first); });
 		for (const auto& [name, id] : disk_.names) { if (mine(name)) { disk_.durable_names[name] = id; } }
 	}
+protected:
+	// The directory's own lock, in every mode: busy while another holder keeps it.
+	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions&) override {
+		if (disk_.locks.contains(prefix_)) { throw std::system_error(std::make_error_code(std::errc::operation_would_block), "owner lock busy"); }
+		const auto token = disk_.next_lock++; disk_.locks[prefix_] = token;
+		return std::make_unique<Lock>(disk_, prefix_, token);
+	}
 private:
+	struct Lock final : j::OwnerLock {
+		Lock(Disk& disk, std::string prefix, std::uint64_t token) : disk(disk), prefix(std::move(prefix)), token(token) {}
+		~Lock() override { if (auto found = disk.locks.find(prefix); found != disk.locks.end() && found->second == token) { disk.locks.erase(found); } }
+		Disk& disk; std::string prefix; std::uint64_t token;
+	};
 	std::string path(std::string_view name) const { return prefix_ + std::string(name); }
 	// A name of this directory, not of a nested one.
 	bool mine(const std::string& name) const { return name.starts_with(prefix_) && name.find('/', prefix_.size()) == std::string::npos; }

@@ -55,16 +55,19 @@ void segment(std::string_view bytes) {
 
 void checkpoint_record(std::string_view bytes) {
 	if (bytes.size() > 1024) { bytes = bytes.substr(0, 1024); }  // within one turn of the fuzz geometry
-	jt::Disk disk; jt::MemoryIO log_io(disk, "log/");
+	jt::Disk disk; auto io = std::make_shared<jt::MemoryIO>(disk, "host/");
 	{
-		j::TurnRecovery recovered; j::TurnLog log(log_io, identity, recovered, options);
-		std::vector<j::TurnRecord> turn{{1, 1, j::TurnRecordKind::Checkpoint, std::string(bytes)}, {1, 2, j::TurnRecordKind::Batch, "after"}};
-		log.append(turn);
+		j::Host host(io, identity, j::HostOptions{1, options});
+		j::Store store(host, 1, limits);
+		store.create(identity);
+		auto& turns = host.driver(0);
+		turns.commit();
+		turns.stage({1, 2, j::TurnRecordKind::Checkpoint, std::string(bytes)});
+		turns.stage({1, 3, j::TurnRecordKind::Batch, "after"});
+		turns.commit();
 	}
-	auto io = std::make_shared<jt::MemoryIO>(disk, "g1/");
-	{ io->create_exclusive("journal.shared")->sync(); io->sync_directory(); }
-	j::TurnDriver driver(log_io, identity, options);
-	j::Store store(io, driver, 1, limits);
+	j::Host host(io, identity, j::HostOptions{1, options});
+	j::Store store(host, 1, limits);
 	try {
 		auto frontier = store.recover([](std::uint64_t, std::string_view) {}, [](const j::Frontier&, j::ArtifactReader&, std::span<j::ArtifactReader>) {});
 		if (frontier.sequence < frontier.base_sequence) { std::abort(); }

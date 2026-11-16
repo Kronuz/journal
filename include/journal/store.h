@@ -325,20 +325,16 @@ public:
 		InventoryStats empty; empty.complete = true;
 		Admission validate(empty, limits);
 	}
-	// The shared backend (D11): batches and checkpoint records go to the core's turn
-	// driver, artifacts to this group's directory. Appends and publication complete at
-	// their turn's barrier, so the host drives them through the driver, never as IO.
-	Store(std::shared_ptr<IO> io, TurnDriver& turns, std::uint64_t group, AdmissionLimits limits,
+	// The shared backend (D11): a group of a host (host.h), its batches and checkpoint records
+	// in its loop's turn log, its artifacts in the host's directory under its own names.
+	// Appends and publication complete at their turn's barrier, so the host drives them
+	// through the driver, never as IO. The host outlives the Store.
+	Store(Host& host, std::uint64_t group, AdmissionLimits limits,
 		std::size_t maximum_batch = 64u * 1024 * 1024, std::uint64_t maximum_artifact = 512ull * 1024 * 1024)
-		: io_(owned_io(io)), limits_(limits), journal_(std::make_shared<Journal>(std::move(io), turns, group, maximum_batch, maximum_artifact)) {
-		InventoryStats empty; empty.complete = true;
-		Admission validate(empty, limits);
-	}
+		: Store(std::make_shared<Journal>(host, group, maximum_batch, maximum_artifact), limits) {}
 	Store(const Store&) = delete;
 	Store& operator=(const Store&) = delete;
 	bool shared() const noexcept { return journal_->shared(); }
-	Journal::Layout layout() const { return Journal::layout(io_); }
-	bool migrating() const noexcept { return journal_->migrating(); }
 	~Store() {
 		if (replacement_ && replacement_->active_job) { replacement_->detached = true; replacement_.reset(); }
 		if (replacement_ && replacement_->disposed) { replacement_.reset(); }
@@ -365,14 +361,13 @@ public:
 		}
 		try {
 			// Trusted caller excludes external mutations during bootstrap. Reject
-			// every existing name before the first owned namespace change.
-			// A shared group whose first turn never became durable is created again over its
-			// lock and unreferenced artifacts, which reclamation removes.
-			auto cursor = io_.scan_directory();
-			while (auto name = cursor->next()) {
-				if (!shared() || (*name != "owner.lock" && *name != "journal.shared" && !name->starts_with("artifact-"))) { throw std::invalid_argument("bootstrap requires an empty directory"); }
+			// every existing name before the first owned namespace change; the host's
+			// table decides for a shared group.
+			if (!shared()) {
+				auto cursor = io_.scan_directory();
+				if (cursor->next()) { throw std::invalid_argument("bootstrap requires an empty directory"); }
 			}
-			cursor.reset(); auto result = journal_->create(identity);
+			auto result = journal_->create(identity);
 			opened_ = true; inventory_.emplace(io_); return result;
 		} catch (...) { fence(); throw; }
 	}
@@ -388,15 +383,13 @@ public:
 			throw Corruption("checkpoint restore callback required");
 		});
 	}
-	// R20 (shared backend): see Journal::migrate and Journal::finish_migration.
-	template <class Replay, class Restore> Frontier migrate(Replay replay, Restore restore) {
-		unopened();
-		try { auto result = journal_->migrate(std::move(replay), std::move(restore)); opened_ = true; inventory_.emplace(io_); return result; }
-		catch (...) { fence(); throw; }
-	}
-	void finish_migration() {
-		healthy();
-		try { journal_->finish_migration(); } catch (...) { fence(); throw; }
+	// A shared group closes (Journal::close): its replacement cycle and every mutation are
+	// settled, and its last record is a durable checkpoint covering every batch. The Store is
+	// done; a new one recovers the group from the host's table.
+	void close() {
+		ready();
+		if (replacement_ && !replacement_->disposed) { throw std::logic_error("a replacement is pending"); }
+		try { journal_->close(); closed_ = true; } catch (...) { if (journal_->fenced()) { fence(); } throw; }
 	}
 	InventoryStats inventory_step(std::size_t budget = 128) {
 		healthy();
@@ -622,6 +615,10 @@ private:
 	static IO& owned_io(const std::shared_ptr<IO>& io) {
 		if (!io) { throw std::invalid_argument("null owned store IO"); } return *io;
 	}
+	Store(std::shared_ptr<Journal> journal, AdmissionLimits limits) : io_(journal->io()), limits_(limits), journal_(std::move(journal)) {
+		InventoryStats empty; empty.complete = true;
+		Admission validate(empty, limits);
+	}
 	std::shared_ptr<StoreAppend> start_append(AppendReservation&& reservation, std::string_view bytes, bool asynchronous) {
 		ready();
 		if (reservation.owner_ != owner_ || bytes.size() > reservation.bound_) { throw std::invalid_argument("foreign or oversized append reservation"); }
@@ -659,7 +656,10 @@ private:
 		return *replacement_;
 	}
 	void unopened() const { healthy(); if (opened_) { throw std::logic_error("store already opened"); } }
-	void healthy() const { if (fenced()) { throw std::logic_error("store fenced; close and recover"); } }
+	void healthy() const {
+		if (closed_) { throw std::logic_error("store closed"); }
+		if (fenced()) { throw std::logic_error("store fenced; close and recover"); }
+	}
 	void mutation_ready() const { ready(); if (journal_->mutation_pending()) { throw std::logic_error("storage mutation is pending"); } }
 	void ready() const { healthy(); if (!admission_) { throw std::logic_error("storage inventory not ready"); } }
 	void fence() noexcept { failed_ = true; journal_->fence_storage(); if (admission_) { admission_->taint(); } }
@@ -671,6 +671,6 @@ private:
 	std::shared_ptr<Admission> admission_;
 	std::shared_ptr<Replacement> replacement_;
 	std::uint64_t next_replacement_ = 0, staged_ = 0;  // staged_: the last record staged in the turn
-	bool opened_ = false, failed_ = false;
+	bool opened_ = false, failed_ = false, closed_ = false;
 };
 } // namespace kronuz::journal

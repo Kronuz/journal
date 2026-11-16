@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <functional>
 #include <map>
 #include <optional>
 #include <utility>
@@ -53,6 +54,8 @@ struct OwnerSession {
 	unsigned verification_handles = 0;
 	std::optional<Identity> preparing_identity;
 	std::map<Identity, unsigned> pins;
+	// Names the next artifact; a host's group takes its next serial (host.h). Random otherwise.
+	std::function<Identity()> name_artifact;
 };
 constexpr unsigned maximum_prepared_artifacts = 9;
 constexpr unsigned maximum_verification_handles = 9;
@@ -133,7 +136,7 @@ struct ArtifactBuildState {
 	ArtifactBuildState(IO& backend, std::shared_ptr<OwnerSession> session, Identity store, std::uint64_t cap)
 		: io(backend), owner(std::move(session)), storage(store), maximum(cap) {
 		if (owner->preparing || owner->prepared >= maximum_prepared_artifacts) { throw std::logic_error("artifact preparation slots exhausted"); }
-		descriptor.identity = random_identity();
+		descriptor.identity = owner->name_artifact ? owner->name_artifact() : random_identity();
 		owner->preparing_identity = descriptor.identity; ++owner->preparing;
 	}
 	ArtifactBuildState(const ArtifactBuildState&) = delete;

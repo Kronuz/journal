@@ -69,6 +69,13 @@ struct TurnRecovery {
 	std::set<std::uint64_t> lost;
 	bool damaged = false;
 };
+// What the host's group table knows before a log recovers (one directory per host): a lost id
+// stays lost and refused whatever the log holds, and a group's records through its base
+// sequence are superseded by the table's copy, so recovery ignores them.
+struct TurnLogGroups {
+	std::set<std::uint64_t> lost;
+	std::map<std::uint64_t, std::uint64_t> base;
+};
 struct TurnLogStats {
 	std::uint64_t turns = 0, barriers = 0, bytes_appended = 0, bytes_written = 0, segments_prepared = 0, prepared_inline = 0;
 	std::uint64_t forwarded_records = 0, forwarded_bytes = 0, segments_recycled = 0, segments_removed = 0;
@@ -165,12 +172,9 @@ class TurnLog {
 public:
 	// Recovers the journal in the IO's directory (empty for a new one), then starts a new
 	// epoch whose open record is durable before any turn is admitted (condition 8).
-	TurnLog(IO& io, Identity identity, TurnRecovery& recovered, TurnLogOptions options = {}) : io_(io), identity_(identity), options_(options) {
-		if (!options_.block_bytes || !framing::valid_block_bytes(options_.block_bytes) ||
-			options_.segment_bytes < options_.block_bytes || options_.segment_bytes % options_.block_bytes) {
-			throw std::invalid_argument("invalid turn log geometry");
-		}
-		recovered = recover();
+	TurnLog(IO& io, Identity identity, TurnRecovery& recovered, TurnLogOptions options = {}, const TurnLogGroups& known = {})
+		: io_(io), identity_(identity), options_(valid(options)) {
+		recovered = recover(known);
 		epoch_ = recovered.epoch; turn_ = recovered.last_turn;
 		for (const auto& [group, records] : recovered.groups) { if (!records.empty()) { sequences_[group] = records.back().sequence; } }
 		for (auto group : recovered.lost) { lost_.insert(group); }
@@ -178,6 +182,21 @@ public:
 		begin_segment();
 		data_segments_.insert(segment_);
 		write({[&](framing::Emitter& emitter) { emitter.record(turn_log_detail::logical(turn_log_detail::open_record, turn_, 0, 0, {})); }});
+	}
+	// What a log holds, read without writing to it: a re-partition reads the stored generation.
+	static TurnRecovery read(IO& io, Identity identity, TurnLogOptions options = {}, const TurnLogGroups& known = {}) {
+		TurnLog log(io, identity, valid(options));
+		return log.recover(known);
+	}
+	// Drops a group the host closed: its records stop being live, so retention reclaims them,
+	// and it starts again with a checkpoint record, as a new group does.
+	void forget(std::uint64_t group) {
+		if (staged_ && staged_->next.contains(group)) { throw std::logic_error("the group has a turn in flight"); }
+		if (auto found = index_.find(group); found != index_.end()) {
+			for (const auto& [_, live] : found->second) { if (!--live_counts_[live.segment]) { live_counts_.erase(live.segment); } }
+			index_.erase(found);
+		}
+		sequences_.erase(group);
 	}
 	// Preallocates spare segments; the host calls it off the turn.
 	void prepare() { while (spares_.size() < options_.spare_segments) { spares_.push_back(preallocate()); } }
@@ -258,6 +277,14 @@ public:
 	const std::set<std::uint64_t>& data_segments() const noexcept { return data_segments_; }
 
 private:
+	TurnLog(IO& io, Identity identity, TurnLogOptions options) : io_(io), identity_(identity), options_(options) {}
+	static TurnLogOptions valid(TurnLogOptions options) {
+		if (!options.block_bytes || !framing::valid_block_bytes(options.block_bytes) ||
+			options.segment_bytes < options.block_bytes || options.segment_bytes % options.block_bytes) {
+			throw std::invalid_argument("invalid turn log geometry");
+		}
+		return options;
+	}
 	struct Live { std::uint64_t segment, epoch, offset; TurnRecordKind kind; };
 	// A checkpoint supersedes the group's earlier records; a copy only replaces its original.
 	void note(std::uint64_t group, std::uint64_t sequence, TurnRecordKind kind, std::uint64_t offset, bool copy = false) {
@@ -352,7 +379,7 @@ private:
 		} catch (...) { failed_ = true; throw; }
 		offset_ = emitter.position(); filling_ = emitter.filling(); ++stats_.barriers; stats_.bytes_written += emitter.bytes().size();
 	}
-	TurnRecovery recover();
+	TurnRecovery recover(const TurnLogGroups& known);
 
 	IO& io_; Identity identity_; TurnLogOptions options_;
 	std::unique_ptr<File> file_; std::deque<std::unique_ptr<File>> spares_;
@@ -370,8 +397,9 @@ private:
 // Reads every segment in order. Within the newest epoch the last turn is the torn tail:
 // kept only whole. For an earlier epoch, the next epoch's open record names the last turn
 // that open kept; later turns are ignored, and damage at or before it is corruption.
-inline TurnRecovery TurnLog::recover() {
+inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	using namespace turn_log_detail;
+	auto superseded = [&](std::uint64_t group, std::uint64_t sequence) { auto found = known.base.find(group); return found != known.base.end() && sequence <= found->second; };
 	std::vector<std::uint64_t> segments;
 	auto cursor = io_.scan_directory();
 	while (auto name = cursor->next()) { if (auto number = segment_number(*name)) { segments.push_back(*number); } }
@@ -424,7 +452,7 @@ inline TurnRecovery TurnLog::recover() {
 		damaged = true;
 		auto found = manifests.find({items[g].segment, static_cast<std::uint32_t>(items[g].offset / options_.block_bytes)});
 		if (found == manifests.end()) { unknown = std::min(unknown, g); return; }
-		for (const auto& [group, _] : found->second.groups) { named.insert(group); }
+		for (const auto& [group, sequence] : found->second.groups) { if (!superseded(group, sequence)) { named.insert(group); } }
 	};
 	std::uint64_t last_turn = 0;
 	// Per epoch, the block where its last kept turn ends: a manifest is acknowledged only if
@@ -443,8 +471,8 @@ inline TurnRecovery TurnLog::recover() {
 		for (std::size_t i = open.begin; i < stop; ++i) {
 			const auto& item = items[i];
 			if (item.tail) { tails.push_back(i); continue; }
-			const bool known = (item.kind >= 1 && item.kind <= 3) || item.kind == end_of_turn;
-			if (item.gap || item.epoch != open.epoch || !known) { gaps.push_back(i); continue; }
+			const bool recognized = (item.kind >= 1 && item.kind <= 3) || item.kind == end_of_turn;
+			if (item.gap || item.epoch != open.epoch || !recognized) { gaps.push_back(i); continue; }
 			if (item.turn <= open.kept || item.turn > limit) { continue; }
 			auto [found, fresh] = turns.try_emplace(item.turn);
 			auto& turn = found->second; if (fresh) { turn.first = i; }
@@ -498,6 +526,7 @@ inline TurnRecovery TurnLog::recover() {
 	std::map<std::uint64_t, std::size_t> last_seen;
 	for (auto r : kept_records) {
 		const auto& item = items[r];
+		if (superseded(item.group, item.sequence)) { continue; }
 		auto [it, inserted] = by_group[item.group].try_emplace(item.sequence, r);
 		if (!inserted) {
 			const auto& other = items[it->second];
@@ -535,7 +564,7 @@ inline TurnRecovery TurnLog::recover() {
 		auto end = kept_end.find(manifest.epoch);
 		if (end == kept_end.end() || std::pair<std::uint64_t, std::uint64_t>{manifest.segment, manifest.block} > end->second) { continue; }
 		for (const auto& [group, sequence] : manifest.groups) {
-			if (result.lost.contains(group)) { continue; }
+			if (result.lost.contains(group) || superseded(group, sequence)) { continue; }
 			auto found = result.groups.find(group);
 			if (found == result.groups.end() || found->second.back().sequence < sequence) {
 				damaged = true; result.lost.insert(group);
@@ -544,6 +573,7 @@ inline TurnRecovery TurnLog::recover() {
 		}
 	}
 	for (auto group : named) { if (!result.groups.contains(group)) { result.lost.insert(group); index_.erase(group); } }
+	for (auto group : known.lost) { result.lost.insert(group); result.groups.erase(group); index_.erase(group); }
 	for (const auto& [group, records] : index_) { for (const auto& [_, live] : records) { ++live_counts_[live.segment]; } }
 	result.damaged = damaged;
 	result.epoch = opens.back().epoch + 1; result.last_turn = last_turn;

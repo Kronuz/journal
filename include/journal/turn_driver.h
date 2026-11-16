@@ -100,7 +100,8 @@ struct TurnWaiter {
 
 class TurnDriver {
 public:
-	TurnDriver(IO& io, Identity identity, TurnLogOptions options = {}) : io_(io), identity_(identity), log_(io, identity, recovered_, options) {}
+	TurnDriver(IO& io, Identity identity, TurnLogOptions options = {}, const TurnLogGroups& known = {})
+		: io_(io), identity_(identity), log_(io, identity, recovered_, options, known) {}
 	TurnDriver(const TurnDriver&) = delete;
 	TurnDriver& operator=(const TurnDriver&) = delete;
 	~TurnDriver() {
@@ -117,6 +118,12 @@ public:
 		auto found = recovered_.groups.find(group); return found == recovered_.groups.end() ? none : found->second;
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
+	// A closed group leaves the log (TurnLog::forget); nothing of it may be staged.
+	void forget(std::uint64_t group) {
+		for (const auto& item : pending_) { if (item.record.group == group) { throw std::logic_error("the group has records staged"); } }
+		for (const auto& item : flight_) { if (item.record.group == group) { throw std::logic_error("the group has records in flight"); } }
+		log_.forget(group); recovered_.groups.erase(group);
+	}
 	// The group's last durable record sequence, 0 for none.
 	std::uint64_t sequence(std::uint64_t group) const { return log_.sequence(group); }
 	bool failed() const noexcept { return log_failed_; }

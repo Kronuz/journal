@@ -49,19 +49,20 @@ j::Identity identity(std::uint64_t group) { j::Identity id{'G'}; id[1] = static_
 // One core: a turn log and shared Stores on one in-memory disk.
 struct Core {
 	jt::Disk disk;
-	jt::MemoryIO log_io{disk, "log/"};
-	std::unique_ptr<j::TurnDriver> turns;
+	std::unique_ptr<j::Host> host;
+	j::TurnDriver* turns = nullptr;
 	std::map<std::uint64_t, std::unique_ptr<j::Store>> stores;
 	Core() { open(); }
 	void open() {
-		stores.clear();
-		turns = std::make_unique<j::TurnDriver>(log_io, log_identity, options);
+		stores.clear(); host.reset();
+		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), log_identity, j::HostOptions{1, options});
+		turns = &host->driver(0);
 	}
 	j::Store& store(std::uint64_t group) {
 		auto& store = stores[group];
 		if (!store) {
-			store = std::make_unique<j::Store>(std::make_shared<jt::MemoryIO>(disk, "g" + std::to_string(group) + "/"), *turns, group, limits);
-			if (turns->has_group(group)) { store->recover([](std::uint64_t, std::string_view) {}); }
+			store = std::make_unique<j::Store>(*host, group, limits);
+			if (host->status(group) == j::GroupStatus::stored) { store->recover([](std::uint64_t, std::string_view) {}); }
 			else { store->create(identity(group)); }
 			while (!turns->idle()) { turns->commit(); }  // the group's first checkpoint record: sequence 1
 			while (!store->inventory_step(64).complete) {}
