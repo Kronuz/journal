@@ -5,13 +5,13 @@ project(journal LANGUAGES CXX)
 # reclamation, inventory, and storage admission. Header-only; no Asio or reactor.
 include(FetchContent)
 # The coroutine drivers run on task (blocking_scheduler, the wheel). Declared first, so this pin
-# wins over the one completion declares; no Asio.
+# wins over the one completion declares (task:18eb516, an ancestor of this pin); no Asio.
 FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 95798a02f68c86f070401329a05c78d326ac2579)
 set(TASK_ASIO OFF)
 # completion::task: completion_ref, InlineCompletion and HeldCompletion over task.hh.
 set(COMPLETION_TASK ON)
 set(COMPLETION_ASIO OFF)
-FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 90411863d5e421c99da18568b07432954aa83615)
+FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 7731315d0660a953f7b3bf956df3127d5a525a03)
 # Fixed-vector reservation accounting shared with managed local storage.
 FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG 07de45d180f23e2552b9504a6b4d506651594d1e)
 # CRC-32C: one implementation, header-only, no dependencies.
