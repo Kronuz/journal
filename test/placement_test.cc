@@ -26,7 +26,8 @@
 // exactly once on its new loop and every lost group stays lost through two more restarts;
 // `repartition_lost`, `repartition_damaged` and `retention` show the table's mark alone keeps a
 // lost id refused once the damage is gone: after a 1->2 re-partition, after a re-partition that
-// first sees the damage, and after retention. `placement_test [case]`.
+// first sees the damage, and after retention; `absent`, a group whose only records the damage
+// took, is lost rather than offered for create. `placement_test [case]`.
 #include "journal/memory_io.h"
 #include "journal/host.h"
 #include <iostream>
@@ -207,6 +208,46 @@ void repartition_damaged() {
 	verify(*host, written, lost, 3, "a re-partition over fresh damage");
 }
 
+// A group whose only records a damaged log no longer holds, and that no surviving manifest
+// names, is lost, never offered for create: its checkpoint record's bytes flipped, its segment
+// zeroed past the first block, or the segment gone. It stays lost through another restart.
+void absent() {
+	const j::TurnLogOptions options{64 * 1024, 1024, 1, 4, 4096};
+	const std::uint64_t group = 7;
+	for (int mode = 0; mode < 3; ++mode) {
+		const auto at = " (mode " + std::to_string(mode) + ")";
+		jt::Disk disk;
+		{
+			auto host = open(disk, 1, options);
+			host->create_group(group);
+			host->driver(0).stage({group, 1, j::TurnRecordKind::Checkpoint, std::string(3000, 'Q')});
+			commit(*host);
+			for (std::uint64_t g = 1000; g < 1400; ++g) {
+				host->create_group(g);
+				host->driver_of(g).stage({g, 1, j::TurnRecordKind::Checkpoint, "filler-" + std::to_string(g) + std::string(900, 'f')});
+				if (g % 10 == 9) { commit(*host); }
+			}
+			commit(*host);
+		}
+		std::string holder;
+		for (const auto& [name, inode] : disk.durable_names) {
+			if (name.starts_with("host/l") && disk.inodes.at(inode).durable.find(std::string(200, 'Q')) != std::string::npos) { holder = name; }
+		}
+		check(!holder.empty(), "the group's record is on disk" + at);
+		auto& bytes = disk.inodes.at(disk.durable_names.at(holder)).durable;
+		if (mode == 0) { bytes[bytes.find(std::string(200, 'Q')) + 100] ^= 0x5a; }
+		else if (mode == 1) { std::fill(bytes.begin() + 1024, bytes.end(), '\0'); }
+		else { disk.durable_names.erase(holder); disk.names.erase(holder); }
+		for (int restart = 0; restart < 2; ++restart) {
+			auto host = open(disk, 1, options);
+			check(host->status(group) == j::GroupStatus::lost && refused(*host, group), "the group is lost" + at);
+			bool created = false;
+			try { host->create_group(group); created = true; } catch (const std::logic_error&) {}
+			check(!created, "create refuses it" + at);
+		}
+	}
+}
+
 // A lost id stays lost once retention recycled the damaged segment.
 void retention() {
 	jt::Disk disk;
@@ -229,7 +270,7 @@ void retention() {
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
-	const std::vector<std::pair<std::string, void (*)()>> cases{{"map", map}, {"remap", remap}, {"repartition_lost", repartition_lost}, {"repartition_damaged", repartition_damaged}, {"retention", retention}};
+	const std::vector<std::pair<std::string, void (*)()>> cases{{"map", map}, {"remap", remap}, {"repartition_lost", repartition_lost}, {"repartition_damaged", repartition_damaged}, {"retention", retention}, {"absent", absent}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

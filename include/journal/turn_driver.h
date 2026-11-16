@@ -120,10 +120,16 @@ public:
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
 	// A closed group leaves the log (TurnLog::forget); nothing of it may be staged.
 	void forget(std::uint64_t group) {
-		for (const auto& item : pending_) { if (item.record.group == group) { throw std::logic_error("the group has records staged"); } }
-		for (const auto& item : flight_) { if (item.record.group == group) { throw std::logic_error("the group has records in flight"); } }
+		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
 		log_.forget(group); recovered_.groups.erase(group);
 	}
+	// Records of the group wait for a turn or are in the one in flight.
+	bool staged(std::uint64_t group) const {
+		auto of = [group](const auto& item) { return item.record.group == group; };
+		return std::any_of(pending_.begin(), pending_.end(), of) || std::any_of(flight_.begin(), flight_.end(), of);
+	}
+	// The log has the group, durably or staged: its state is the log's, not the host table's.
+	bool holds(std::uint64_t group) const { return log_.sequence(group) || staged(group); }
 	// The group's last durable record sequence, 0 for none.
 	std::uint64_t sequence(std::uint64_t group) const { return log_.sequence(group); }
 	bool failed() const noexcept { return log_failed_; }

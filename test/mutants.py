@@ -39,7 +39,7 @@ MUTANTS = {
         "journal_driver_test", ["entry_threads_busy"]),
     # The table's lost ids never reach the logs: a lost id appends again once the damage is gone.
     "remap-forget": ("include/journal/host.h",
-        "if (entry.state == GroupState::lost) { loop.lost.insert(id); }", "if (false) { loop.lost.insert(id); }",
+        "if (entry.state == GroupState::lost) { loop.lost.insert(id); continue; }", "if (false) { loop.lost.insert(id); continue; }",
         "journal_placement_test", ["repartition_lost"]),
     # A re-partition that does not mark recovery's lost ids before it writes the new generation.
     "repartition-skips-mark": ("include/journal/host.h",
@@ -62,13 +62,30 @@ MUTANTS = {
         "journal_host_test", ["census"]),
     # A closed group recovered from its loop's log, not the table.
     "reopen-from-log": ("include/journal/journal.h",
-        "\t\t\tif (!turns_->has_group(group_)) {\n\t\t\t\tif (status == GroupStatus::closed)",
-        "\t\t\tif (false) {\n\t\t\t\tif (status == GroupStatus::closed)",
+        "\t\t\tif (!turns_->has_group(group_)) {\n\t\t\t\tif (turns_->holds(group_))",
+        "\t\t\tif (false) {\n\t\t\t\tif (turns_->holds(group_))",
         "journal_host_test", ["closed_reopen"]),
     # A group created again keeps its first incarnation's name space.
     "same-incarnation": ("include/journal/host.h",
         "entry = GroupEntry{entry.incarnation + 1, GroupState::open,", "entry = GroupEntry{1, GroupState::open,",
         "journal_host_test", ["recreate"]),
+    # A damaged log keeps quiet about an open group it holds nothing of: create takes its id (F1).
+    "damaged-keeps-absent": ("include/journal/turn_log.h",
+        "if (damaged) { for (auto group : known.open)", "if (false) { for (auto group : known.open)",
+        "journal_placement_test", ["absent"]),
+    # The log forgets a closing group before its table write is durable (F2).
+    "close-forgets-first": ("include/journal/host.h",
+        "\t\tupdate(group, [&](GroupEntry& entry) {\n\t\t\tsettle_mark",
+        "\t\tdriver_of(group).forget(group);\n\t\tupdate(group, [&](GroupEntry& entry) {\n\t\t\tsettle_mark",
+        "journal_host_test", ["close_failure"]),
+    # A failed table write keeps its change in memory (F4).
+    "update-keeps-change": ("include/journal/host.h",
+        "catch (...) { if (before) { entry = std::move(*before); } else { shard.erase(group); } throw; }", "catch (...) { throw; }",
+        "journal_host_test", ["close_failure"]),
+    # A second recovery on one host takes the table's stale checkpoint (F3).
+    "recover-twice-from-table": ("include/journal/journal.h",
+        "if (turns_->holds(group_)) { throw", "if (false) { throw",
+        "journal_host_test", ["recover_twice"]),
 }
 
 def main():

@@ -24,9 +24,11 @@
 // share a name and reclaiming one never touches another; reclamation and the admission census by
 // name with no directory scan; a closed group reopened from the group table after retention
 // recycled every segment that held it; a group whose first turn was lost created again as a new
-// incarnation; and one owner lock, the directory's own. `host_test [case]` runs one case.
+// incarnation; a failed close that leaves the group open; a second recovery on one host refused;
+// and one owner lock, the directory's own. `host_test [case]` runs one case.
 #include "journal/memory_io.h"
 #include "journal/store.h"
+#include <cerrno>
 #include <iostream>
 #include <set>
 
@@ -45,18 +47,23 @@ const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 const j::AdmissionLimits limits{{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3};
 j::Identity identity(std::uint64_t group) { j::Identity id{'G'}; for (unsigned i = 0; i < 8; ++i) { id[1 + i] = static_cast<char>(group >> (8 * i)); } return id; }
 
-// The host's IO, recording every name it is asked about, its scans and its lock's mode.
+// The host's IO, recording every name it is asked about, its scans and its lock's mode; armed,
+// it fails the next table shard write as a full disk would.
 class RecordingIO final : public j::IO {
 public:
 	explicit RecordingIO(std::shared_ptr<j::IO> io) : io_(std::move(io)) {}
-	std::vector<std::string> names; std::size_t scans = 0; std::optional<j::OwnerLockMode> lock_mode;
+	std::vector<std::string> names; std::size_t scans = 0; std::optional<j::OwnerLockMode> lock_mode; bool full = false;
 	std::unique_ptr<j::OwnerLock> acquire_owner(bool create) override { return io_->acquire_owner(create); }
 	void open_existing_read_only_into(std::string_view name, j::File& file) override { note(name); io_->open_existing_read_only_into(name, file); }
 	bool open_reclaim_candidate_read_only_into(std::string_view name, j::File& file) override { note(name); return io_->open_reclaim_candidate_read_only_into(name, file); }
 	std::unique_ptr<j::File> open_reclaim_candidate_read_only(std::string_view name) override { note(name); return io_->open_reclaim_candidate_read_only(name); }
 	std::unique_ptr<j::File> open_existing(std::string_view name) override { note(name); return io_->open_existing(name); }
 	std::unique_ptr<j::File> open_existing_read_only(std::string_view name) override { note(name); return io_->open_existing_read_only(name); }
-	std::unique_ptr<j::File> create_exclusive(std::string_view name) override { note(name); return io_->create_exclusive(name); }
+	std::unique_ptr<j::File> create_exclusive(std::string_view name) override {
+		note(name);
+		if (full && name.starts_with("groups-")) { full = false; throw std::system_error(ENOSPC, std::generic_category(), "no space for the table shard"); }
+		return io_->create_exclusive(name);
+	}
 	void replace(std::string_view source, std::string_view destination) override { note(source); note(destination); io_->replace(source, destination); }
 	void remove(std::string_view name) override { note(name); io_->remove(name); }
 	std::unique_ptr<j::DirectoryCursor> scan_directory() override { ++scans; return io_->scan_directory(); }
@@ -269,6 +276,58 @@ void recreate() {
 	check(node.artifacts(5).contains(hd::artifact_name(5, 2, 1)), "the new ones are named by the new incarnation");
 }
 
+// A close whose table write fails (a full disk) leaves the group open and its records live in
+// the log: retention keeps them, and after a restart the group recovers, never offered for create.
+void close_failure() {
+	jt::Disk disk;
+	{
+		Node node(disk);
+		node.checkpoint(7, "state");
+		node.append(8, "warm");
+		node.io->full = true;
+		bool threw = false;
+		try { node.store(7).close(); } catch (const std::system_error&) { threw = true; }
+		check(threw && !node.io->full, "the close's table write fails");
+		check(node.host->status(7) == j::GroupStatus::stored && node.host->entry(7)->state == j::GroupState::open, "the table still holds the group open");
+		node.stores.erase(7);
+		for (int b = 0; b < 200; ++b) { node.append(8, std::string(900, 'x')); }
+	}
+	Node node(disk);
+	check(node.host->status(7) == j::GroupStatus::stored, "after a restart the group is stored, not offered for create");
+	node.store(7);
+	check(node.recovered[7].bundle == "state" && node.host->entry(7)->incarnation == 1, "it recovers its checkpoint in its first incarnation");
+}
+
+// A group closed, reopened from the table, then recovered by a second Store of the same host:
+// its state is in the log, not the table, so the recovery is refused; its loop keeps running,
+// and the reopened host recovers the group's latest state.
+void recover_twice() {
+	jt::Disk disk;
+	{
+		Node node(disk);
+		node.checkpoint(7, "old");
+		node.store(7).close(); node.stores.erase(7);
+		node.store(7);
+		node.checkpoint(7, "new"); node.append(7, "after-new");
+		node.append(9, "neighbor");
+		node.stores.erase(7);
+		bool refused = false;
+		try {
+			j::Store store(*node.host, 7, limits);
+			store.recover([](std::uint64_t, std::string_view) { check(false, "a refused recovery replays nothing"); },
+				[](const j::Frontier&, j::ArtifactReader&, std::span<j::ArtifactReader>) { check(false, "a refused recovery restores nothing"); });
+		} catch (const j::Corruption&) { refused = true; }
+		check(refused, "a second recovery on the same host is refused");
+		node.commit(7);
+		check(!node.host->driver(0).failed(), "the group's loop keeps running");
+		node.append(9, "still");
+	}
+	Node node(disk);
+	node.store(7); node.store(9);
+	check(node.recovered[7].bundle == "new" && node.recovered[7].batches == std::vector<std::string>{"after-new"}, "the reopened host recovers the latest state");
+	check(node.recovered[9].batches == std::vector<std::string>{"neighbor", "still"}, "the neighbor keeps both batches");
+}
+
 // One owner lock, the directory's own (what strata's cold tier takes): a second host on the
 // directory is refused while the first holds it.
 void lock() {
@@ -291,7 +350,7 @@ int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
-		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"lock", lock}};
+		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"close_failure", close_failure}, {"recover_twice", recover_twice}, {"lock", lock}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

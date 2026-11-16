@@ -61,7 +61,7 @@ struct TurnRecord {
 // What recovery kept: each group's records from its latest checkpoint, in sequence order.
 // A group whose sequence has a gap, or that wrote nothing after damage that may have held
 // its records, is lost: it rejoins as a new incarnation (D11, D5). When damaged, a group
-// the host knows that is in neither map is lost too.
+// the host holds open (TurnLogGroups::open) that is in neither map is lost too.
 struct TurnRecovery {
 	std::uint64_t epoch = 0;      // the epoch this open started
 	std::uint64_t last_turn = 0;  // the last turn kept
@@ -70,11 +70,13 @@ struct TurnRecovery {
 	bool damaged = false;
 };
 // What the host's group table knows before a log recovers (one directory per host): a lost id
-// stays lost and refused whatever the log holds, and a group's records through its base
-// sequence are superseded by the table's copy, so recovery ignores them.
+// stays lost and refused whatever the log holds, a group's records through its base sequence
+// are superseded by the table's copy, so recovery ignores them, and the open groups are the
+// ones a damaged log loses when it holds nothing of them.
 struct TurnLogGroups {
 	std::set<std::uint64_t> lost;
 	std::map<std::uint64_t, std::uint64_t> base;
+	std::vector<std::uint64_t> open;
 };
 struct TurnLogStats {
 	std::uint64_t turns = 0, barriers = 0, bytes_appended = 0, bytes_written = 0, segments_prepared = 0, prepared_inline = 0;
@@ -573,6 +575,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 		}
 	}
 	for (auto group : named) { if (!result.groups.contains(group)) { result.lost.insert(group); index_.erase(group); } }
+	if (damaged) { for (auto group : known.open) { if (!result.groups.contains(group)) { result.lost.insert(group); } } }
 	for (auto group : known.lost) { result.lost.insert(group); result.groups.erase(group); index_.erase(group); }
 	for (const auto& [group, records] : index_) { for (const auto& [_, live] : records) { ++live_counts_[live.segment]; } }
 	result.damaged = damaged;

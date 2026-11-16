@@ -576,7 +576,8 @@ private:
 	// the checkpoint's sequence plus its distance from the checkpoint record.
 	// A group the table holds closed, or one reopened before its first record became durable,
 	// starts from the table's checkpoint record: no turn log is read, and that record is staged
-	// again as the group's first, so its loop holds the group again.
+	// again as the group's first, so its loop holds the group again. A group whose records the
+	// log already handed to a Store of this host recovers only after the host reopens.
 	template <class Replay, class Restore>
 	Frontier recover_shared(Replay& replay, Restore& restore) {
 		try {
@@ -584,6 +585,7 @@ private:
 			if (status == GroupStatus::lost) { throw Corruption("the turn log lost this group"); }
 			if (status == GroupStatus::none) { throw Corruption("the group has no checkpoint record"); }
 			if (!turns_->has_group(group_)) {
+				if (turns_->holds(group_)) { throw Corruption("the group was recovered on this host; reopen the host to recover it again"); }
 				if (status == GroupStatus::closed) { host_->reopen_group(group_); }
 				const auto* entry = host_->entry(group_);
 				owner_->lock = io_.acquire_owner(false);

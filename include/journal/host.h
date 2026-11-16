@@ -306,30 +306,31 @@ public:
 	// hold, or one whose first turn never became durable, whose artifacts go first.
 	void create_group(std::uint64_t group) {
 		if (status(group) != GroupStatus::none) { throw std::logic_error("the group exists, is closed, or is lost"); }
-		auto& entry = shards_[host_detail::slot(group)][group];
-		if (remove_artifacts(group, entry)) { io_->sync_directory(); }
-		entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, host_detail::serial_block, 0, {}, 0};
-		commit({host_detail::slot(group)});
+		update(group, [&](GroupEntry& entry) {
+			if (remove_artifacts(group, entry)) { io_->sync_directory(); }
+			entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, host_detail::serial_block, 0, {}, 0};
+		});
 		opened_.insert(group);
 	}
 	void reopen_group(std::uint64_t group) {
-		auto& entry = held(group, GroupState::closed);
-		entry.state = GroupState::open; commit({host_detail::slot(group)});
+		held(group, GroupState::closed);
+		update(group, [](GroupEntry& entry) { entry.state = GroupState::open; });
 	}
-	// The table takes the group's last record, a checkpoint covering every batch; the log
-	// forgets it, so retention reclaims its records.
+	// The table takes the group's last record, a checkpoint covering every batch; once that is
+	// durable the log forgets the group, so retention reclaims its records.
 	void close_group(std::uint64_t group, std::uint64_t sequence, std::string manifest) {
-		auto& entry = held(group, GroupState::open);
+		held(group, GroupState::open);
+		if (driver_of(group).staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
+		update(group, [&](GroupEntry& entry) {
+			settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
+		});
 		driver_of(group).forget(group);
-		settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
-		commit({host_detail::slot(group)});
 	}
 	// The group's next artifact identity; a used-up block reserves the next one in the table.
 	Identity next_artifact(std::uint64_t group) {
 		auto& entry = held(group, GroupState::open);
 		if (entry.next == entry.high) {
-			settle_mark(group, entry); entry.high += host_detail::serial_block;
-			commit({host_detail::slot(group)});
+			update(group, [&](GroupEntry& reserved) { settle_mark(group, reserved); reserved.high += host_detail::serial_block; });
 		}
 		return host_detail::artifact_identity(entry.incarnation, entry.next++);
 	}
@@ -354,6 +355,16 @@ private:
 		}
 		entry.mark = entry.high;
 		return removed;
+	}
+	// Changes the group's entry and commits its shard. A failed write restores the entry, so
+	// the table in memory never runs ahead of the disk and nothing acts on an undurable change.
+	template <class Change> void update(std::uint64_t group, Change&& change) {
+		auto& shard = shards_[host_detail::slot(group)];
+		std::optional<GroupEntry> before;
+		if (auto found = shard.find(group); found != shard.end()) { before = found->second; }
+		auto& entry = shard[group];
+		try { change(entry); commit({host_detail::slot(group)}); }
+		catch (...) { if (before) { entry = std::move(*before); } else { shard.erase(group); } throw; }
 	}
 	// Replaces the shards, then syncs the directory once; the groups' views see their ranges.
 	void commit(const std::set<std::uint32_t>& slots) {
@@ -382,8 +393,9 @@ private:
 		for (std::uint32_t slot = 0; slot < host_detail::slots; ++slot) {
 			auto& loop = groups[host_detail::loop(slot, loops)];
 			for (const auto& [id, entry] : shards_[slot]) {
-				if (entry.state == GroupState::lost) { loop.lost.insert(id); }
-				else if (!entry.manifest.empty()) { loop.base[id] = entry.base; }
+				if (entry.state == GroupState::lost) { loop.lost.insert(id); continue; }
+				if (!entry.manifest.empty()) { loop.base[id] = entry.base; }
+				if (entry.state == GroupState::open) { loop.open.push_back(id); }
 			}
 		}
 		return groups;
