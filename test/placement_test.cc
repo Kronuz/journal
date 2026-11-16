@@ -53,12 +53,13 @@ bool damage(jt::Disk& disk, const std::string& marker) {
 	for (const auto& [name, inode] : disk.durable_names) {
 		if (!name.starts_with("host/l")) { continue; }
 		auto& bytes = disk.inodes.at(inode).durable;
-		if (auto at = bytes.find(marker); at != std::string::npos) { bytes[at] ^= 0x5a; return true; }
+		if (auto at = bytes.find(marker); at != std::string::npos) { bytes[at + marker.size() / 2] ^= 0x5a; return true; }
 	}
 	return false;
 }
-// The marker sits in the middle of a victim's first batch, which spans whole blocks of its own.
-std::string marker(std::uint64_t group) { return "damage-here-" + std::to_string(group); }
+// A victim's first batch is a run of its own letter spanning whole blocks; the damage lands in
+// the middle of the run.
+std::string marker(std::uint64_t group) { return std::string(200, static_cast<char>('A' + group / 50 % 26)); }
 // Refused by the group's loop's log, which a lost id never reaches.
 bool refused(j::Host& host, std::uint64_t group) {
 	const j::TurnRecord record{group, 1, j::TurnRecordKind::Batch, "again"};
@@ -85,7 +86,7 @@ Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& v
 				auto& records = written[g];
 				const auto kind = round == 2 && g % 3 == 0 ? j::TurnRecordKind::Checkpoint : j::TurnRecordKind::Batch;
 				auto payload = "group-" + std::to_string(g) + "-round-" + std::to_string(round) + std::string(g % 40, '.');
-				if (round == 0 && g % 50 == 0) { payload += std::string(1100, 'v') + marker(g) + std::string(1100, 'v'); }
+				if (round == 0 && g % 50 == 0) { payload += std::string(2400, marker(g)[0]); }
 				j::TurnRecord record{g, records.back().sequence + 1, kind, payload};
 				host->driver_of(g).stage(record);
 				if (kind == j::TurnRecordKind::Checkpoint) { records.clear(); }

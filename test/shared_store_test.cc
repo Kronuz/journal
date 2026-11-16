@@ -100,7 +100,7 @@ struct Node {
 			auto& group = groups[g];
 			group.store.reset();
 			group.store = std::make_unique<j::Store>(*host, g, limits);
-			if (host->status(g) == j::GroupStatus::stored) {
+			if (host->status(g) == j::GroupStatus::stored || host->status(g) == j::GroupStatus::closed) {
 				std::vector<std::string> recovered;
 				group.store->recover([&](std::uint64_t sequence, std::string_view bytes) {
 					check(sequence == recovered.size() + 1, "batches replay in sequence");

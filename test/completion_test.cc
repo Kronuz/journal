@@ -291,6 +291,36 @@ void admitted_store(const std::filesystem::path& parent) {
 	check(batches == std::vector<std::string>({"stored", "retired"}), "Store retirement preserves both terminal durable appends");
 }
 } // namespace
+// One directory per host: the host holds the directory's own lock, the one strata's cold tier
+// takes (acquire_directory_owner), so a second holder is refused until the host closes; and
+// every name the host and its groups write sits in that one directory.
+void host_lock(const std::filesystem::path& parent) {
+	auto directory = parent / "host"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
+	const AdmissionLimits limits{{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3};
+	{
+		Host host(std::make_shared<PosixIO>(directory), {'H', 'O', 'S', 'T'}, HostOptions{2, {1u << 20, 32u << 10, 1, 4, 256u << 10}});
+		bool busy = false;
+		try { PosixIO other(directory); auto lock = other.acquire_directory_owner(); }
+		catch (const std::system_error& error) { busy = error.code() == std::errc::operation_would_block || error.code() == std::errc::resource_unavailable_try_again; }
+		check(busy, "the host holds the directory lock strata's cold tier takes");
+		Store store(host, 42, limits);
+		store.create({'G'});
+		while (!store.inventory_step(64).complete) {}
+		host.driver_of(42).commit();
+		auto id = store.reserve_replacement(1024, 1u << 20);
+		store.begin_artifact(*id, ArtifactPart::Application); store.write_chunk(*id, "app"); store.finish_artifact(*id);
+		store.begin_artifact(*id, ArtifactPart::Bundle); store.write_chunk(*id, "bundle"); store.finish_artifact(*id);
+		auto publication = store.begin_publication(*id, store.frontier().sequence);
+		host.driver_of(42).commit(); publication->result();
+		std::size_t entries = 0; bool flat = true;
+		for (const auto& entry : std::filesystem::directory_iterator(directory)) { ++entries; flat &= entry.is_regular_file(); }
+		check(flat && entries > 4, "the host's layout, table, logs and artifacts are regular files of one directory");
+	}
+	PosixIO other(directory);
+	auto lock = other.acquire_directory_owner();
+	check(lock != nullptr, "the lock is free once the host closes");
+}
+
 int main() {
 	auto directory =
 		std::filesystem::current_path() / ".scratch" / ("completion-test-" + std::to_string(::getpid()));
@@ -312,6 +342,7 @@ int main() {
 		actual_artifacts(directory);
 		admitted_artifacts(directory);
 		retired_publication(directory);
+		host_lock(directory);
 	} catch (const std::exception &error) {
 		check(false, error.what());
 	}
