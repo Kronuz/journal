@@ -199,7 +199,7 @@ new call: its watcher awaits `durable` for the open record.
 | `repeat_turns` | `first` is true only for the turn's first call until a record seals, across groups; two groups that each fill a turn alternate as its first group |
 | `repeat_throw` | A repeat call that throws, or returns a refused record, leaves the earlier records written and acknowledged; the next turn fails with the error before calling a sealer; a first call's throw fails its turn unwritten |
 | `repeat_unseal` | A group unsealed or re-sealed during a call is not called again in the turn and its record is durable; `forget` between repeat calls is refused |
-| `repeat_threads` | Under TSan: another thread unseals a sealer called many times per turn; no call starts after `unseal` returns, and every record a call returned is durable |
+| `repeat_threads` | Under TSan: the third call of a turn waits until another thread's `unseal` has dropped the group; the turn holds three records, no fourth call starts, and `unseal` returns only once the calls end; across 100 rounds of random unseals no call starts after `unseal` returns |
 
 `test/turn_seal_mutants.sh` applies each guard's mutant (`one-call`, `framing`, `staged`, `rotation`,
 `unsealed-again`, `repeat-throw` and the earlier ones); the case named beside it fails at each.

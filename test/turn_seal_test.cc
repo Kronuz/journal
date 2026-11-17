@@ -1041,36 +1041,53 @@ void repeat_unseal() {
 	}
 }
 
-// journal-seal-repeat A3, under TSan. A sealer that always has a record is called many times
-// per turn while another thread unseals it at a random moment: running_ covers the whole loop,
-// so no call starts once unseal returns, and every record a call returned is durable.
+// journal-seal-repeat A3, under TSan. Gated first: the third call of a turn starts another
+// thread's unseal and waits until it has dropped the group; the turn then holds three records,
+// no fourth call starts, and unseal returns only once the group's calls end. Then rounds of turns
+// with an unseal at a random moment: no call ever starts once unseal returns.
 void repeat_threads() {
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		int owner = 0, calls = 0;
+		std::atomic<bool> returned{false};
+		bool returned_during = true;
+		std::thread unsealer;
+		driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+			if (++calls == 3) {
+				unsealer = std::thread([&] { driver.unseal(1, &owner); returned.store(true, std::memory_order_release); });
+				while (driver.sealed(1)) { std::this_thread::yield(); }  // unseal dropped the group and waits
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));  // time it would need to return early
+				returned_during = returned.load(std::memory_order_acquire);
+			}
+			return record(1, calls, 8);
+		}, &owner);
+		const auto turns = driver.log().stats().turns;
+		driver.wake(); driver.commit();
+		unsealer.join();
+		check(calls == 3 && driver.sequence(1) == 3 && driver.log().stats().turns == turns + 1, "three calls seal records 1 to 3 in one turn, and no fourth call starts after the unseal (" + std::to_string(calls) + " calls)");
+		check(!returned_during && returned.load() && !driver.sealed(1) && !driver.failed(), "unseal from another thread returns only once the group's calls end");
+	}
 	jt::Disk disk; jt::MemoryIO io(disk);
 	j::TurnDriver driver(io, identity, options);
 	std::atomic<int> late{0};
-	std::uint64_t staged = 0, other = 0, calls = 0, most = 0;
+	std::uint64_t staged = 0, other = 0;
 	std::mt19937_64 random(11);
 	for (int round = 0; round < 100; ++round) {
 		int key = 0;
 		std::atomic<bool> gone{false};
 		staged = driver.seal(1, [&](std::uint64_t room, bool) -> std::optional<j::TurnRecord> {
 			if (gone.load(std::memory_order_acquire)) { late.fetch_add(1); }
-			++calls;
 			std::this_thread::yield();
 			if (d::record_cost(8) > room) { return std::nullopt; }
 			return record(1, ++staged, 8, j::TurnRecordKind::Checkpoint);  // each drops the last: the log stays small
 		}, &key);
 		const auto delay = std::chrono::microseconds(random() % 400);
 		std::thread unsealer([&] { std::this_thread::sleep_for(delay); driver.unseal(1, &key); gone.store(true, std::memory_order_release); });
-		for (int turn = 0; turn < 10; ++turn) {
-			const auto before = calls;
-			driver.stage(record(2, ++other, 4, j::TurnRecordKind::Checkpoint)); driver.commit();
-			most = std::max(most, calls - before);
-		}
+		for (int turn = 0; turn < 10; ++turn) { driver.stage(record(2, ++other, 4, j::TurnRecordKind::Checkpoint)); driver.commit(); }
 		unsealer.join();
 	}
 	check(late.load() == 0, "no sealer call starts after its unseal returns (" + std::to_string(late.load()) + " late)");
-	check(most > 2, "the sealer is called several times in a turn (at most " + std::to_string(most) + ")");
 	check(driver.sequence(1) == staged && !driver.failed(), "every record a call returned is durable");
 }
 }  // namespace
