@@ -8,6 +8,12 @@
 #   run-any-scheduler TurnDriver::run drops its post_call check (journal-host-guards A2)
 #   keep-waiters      TurnDriver::forget leaves the group's durable() waiters linked (review F1)
 #   reuse-sequence    TurnDriver::forget retires no sequence, so a reopen reuses them (review F1)
+#   one-call          seal_turn calls a group once per turn (journal-seal-repeat A1)
+#   framing           seal_turn charges a record's payload but not its framing (A1)
+#   staged            seal_turn does not advance the group's staged sequence between calls (A1)
+#   rotation          seal_turn never moves next_seal_ (A2)
+#   unsealed-again    seal_turn calls a group unsealed or replaced during its last call (A3)
+#   repeat-throw      a repeat call's throw fails its turn unwritten (A3)
 set -eu
 new='if (false) {'
 case "$1" in
@@ -17,6 +23,12 @@ case "$1" in
 	run-any-scheduler) file=include/journal/turn_driver.h; old='if (!task::current().post_call([](void*) {}, nullptr)) {' ;;
 	keep-waiters) file=include/journal/turn_driver.h; old='resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);'; new='' ;;
 	reuse-sequence) file=include/journal/turn_driver.h; old='return found == retired_.end() ? 0 : found->second;'; new='return 0;' ;;
+	one-call) file=include/journal/turn_driver.h; old='pending_.push_back({std::move(*record), {}, {}});'; new='pending_.push_back({std::move(*record), {}, {}}); break;' ;;
+	framing) file=include/journal/turn_driver.h; old='used += turn_log_detail::record_cost(record->payload.size()); first = false;'; new='used += record->payload.size(); first = false;' ;;
+	staged) file=include/journal/turn_driver.h; old='if (found != sealers_.end()) { found->second.staged = record->sequence; mark(found->second); }'; new='' ;;
+	rotation) file=include/journal/turn_driver.h; old='if (resume_at) { next_seal_ = *resume_at; }'; new='' ;;
+	unsealed-again) file=include/journal/turn_driver.h; old='if (found == sealers_.end() || found->second.fn != fn) { break; }'; new='' ;;
+	repeat-throw) file=include/journal/turn_driver.h; old='catch (...) { if (!repeat) { throw; } deferred_ = std::current_exception(); return; }'; new='catch (...) { throw; }' ;;
 	*) echo "unknown mutant: $1" >&2; exit 2 ;;
 esac
 git checkout -- "$file" 2>/dev/null || true

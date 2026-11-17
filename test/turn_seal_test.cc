@@ -267,9 +267,11 @@ void budget() {
 		// Next turn starts with group 2: it takes the whole, 3 takes a share, 4's 2500 bytes do not fit.
 		consumer.append(1, 10);
 		driver.commit();
-		check(consumer.calls.size() == 4 && consumer.calls[0].first == 2 && consumer.calls[0].second == whole, "the sealer left waiting is called first, with the whole segment");
-		check(consumer.calls[1] == std::pair<std::uint64_t, std::uint64_t>{3, half - d::record_cost(2500)} && !consumer.firsts[1], "the next one gets the share's rest, not as the first");
-		check(consumer.calls[2].first == 4 && consumer.calls[2].second < d::record_cost(2500) && consumer.open[4], "group 4 declines a share too small for its record");
+		// Each group that seals is called again with the rest, and answers nothing.
+		check(consumer.calls.size() == 7 && consumer.calls[0].first == 2 && consumer.calls[0].second == whole, "the sealer left waiting is called first, with the whole segment");
+		check(consumer.calls[1] == std::pair<std::uint64_t, std::uint64_t>{2, half - d::record_cost(2500)} && !consumer.firsts[1], "and again with the share's rest");
+		check(consumer.calls[2] == std::pair<std::uint64_t, std::uint64_t>{3, half - d::record_cost(2500)} && !consumer.firsts[2], "the next one gets the share's rest, not as the first");
+		check(consumer.calls[4].first == 4 && consumer.calls[4].second < d::record_cost(2500) && consumer.open[4], "group 4 declines a share too small for its record");
 		check(sealed.size() == 3, "groups 2, 3 and 1 seal");
 		fold(expected, sealed); sealed.clear(); consumer.calls.clear(); consumer.firsts.clear();
 		// Group 4 declined a share: it is called first next turn and seals.
@@ -353,7 +355,7 @@ void forget_in_flight() {
 	driver.stage(record(3, 1, 4));
 	consumer.append(2, 10);
 	const auto& write = driver.begin();
-	check(consumer.calls.size() == 2, "both sealers ran for the turn");
+	check(consumer.calls.size() == 3, "both sealers ran for the turn, and group 2's again after its record");
 	driver.forget(1);
 	check(!driver.sealed(1), "a group with nothing in flight is forgotten while the turn is in flight");
 	bool refused = false;
@@ -364,7 +366,7 @@ void forget_in_flight() {
 	consumer.append(1, 10); consumer.append(2, 10);
 	driver.stage(record(3, 2, 4));
 	driver.commit();
-	check(consumer.calls.size() == 1 && consumer.calls[0].first == 2, "the forgotten sealer never runs again");
+	check(consumer.calls.size() == 2 && consumer.calls[0].first == 2 && consumer.calls[1].first == 2, "the forgotten sealer never runs again");
 	driver.forget(2);
 	consumer.calls.clear(); consumer.firsts.clear();
 	driver.stage(record(3, 3, 4));
@@ -479,7 +481,7 @@ void trigger() {
 	consumer.append(1, 12);
 	task::spawn(ref, wait(first, 1, 1));
 	drain();
-	check(first.done && !first.error && driver.sequence(1) == 1 && consumer.calls.size() == 1, "a waiter on the open record makes run() seal it");
+	check(first.done && !first.error && driver.sequence(1) == 1 && consumer.calls.size() == 2, "a waiter on the open record makes run() seal it, then asks for more");
 	// Nothing open: the sealer answers nothing once and run() goes back to sleep.
 	consumer.calls.clear(); consumer.firsts.clear();
 	task::spawn(ref, wait(second, 1, 2));
@@ -522,7 +524,7 @@ void staged_room() {
 		driver.stage(record(2, 1, 200));  // costs more than the 100 left
 		try { j::run(driver, driver.durable(1, 1)); } catch (const std::exception& error) { check(false, std::string("the blocking entry threw: ") + error.what()); }
 		check(driver.sequence(1) == 1 && driver.sequence(2) == 1, "blocking entry: the record behind a staged one is durable");
-		check(consumer.calls.size() == 2 && consumer.calls[0].second < whole && consumer.calls[1].second == whole, "blocking entry: declined behind the staged record, then sealed with the whole room");
+		check(consumer.calls.size() == 3 && consumer.calls[0].second < whole && consumer.calls[1].second == whole, "blocking entry: declined behind the staged record, then sealed with the whole room");
 	}
 	jt::Disk disk; jt::MemoryIO io(disk);
 	j::TurnDriver driver(io, identity, options);
@@ -540,7 +542,7 @@ void staged_room() {
 	driver.stage(record(2, 1, 200));
 	drain();
 	check(waited.done && !waited.error && driver.sequence(1) == 1, "run(): the waiter's record behind a staged one is durable");
-	check(consumer.calls.size() == 2 && consumer.calls[1].second == whole, "run(): sealed on the next turn with the whole room");
+	check(consumer.calls.size() == 3 && consumer.calls[1].second == whole, "run(): sealed on the next turn with the whole room");
 	stop.request(); loop.run();
 	check(ran.done && !ran.error, "run() ends");
 }
@@ -833,6 +835,244 @@ void unseal_threads() {
 		check(after && !shape.failed(), "unseal after the sealer's " + name + " returns only once the call has finished");
 	}
 }
+
+// A group with a backlog of records, as strata's log with several closed records: each call
+// seals the oldest one when its cost fits the room. Every call of every Backlog lands in `calls`.
+struct Call {
+	std::uint64_t group = 0, room = 0;
+	bool first = false;
+	bool operator==(const Call&) const = default;
+};
+std::string show(const std::vector<Call>& calls) {
+	std::string text;
+	for (const auto& c : calls) { text += " (" + std::to_string(c.group) + ", " + std::to_string(c.room) + (c.first ? ", first)" : ")"); }
+	return text;
+}
+struct Backlog {
+	Backlog(std::uint64_t id, std::vector<Call>& log) : group(id), calls(&log) {}
+	std::uint64_t group, staged = 0;
+	std::vector<Call>* calls;
+	std::deque<std::size_t> sizes;
+	std::vector<j::TurnRecord> sealed;
+	j::TurnDriver::Sealer sealer() {
+		return [this](std::uint64_t room, bool first) -> std::optional<j::TurnRecord> {
+			calls->push_back({group, room, first});
+			if (sizes.empty() || d::record_cost(sizes.front()) > room) { return std::nullopt; }
+			sealed.push_back(record(group, ++staged, sizes.front())); sizes.pop_front();
+			return sealed.back();
+		};
+	}
+};
+std::string message_of(const std::function<void()>& run) {
+	try { run(); } catch (const std::exception& error) { return error.what(); }
+	return {};
+}
+
+// journal-seal-repeat A1. One sealer gives three records in one turn, at staged + 1, + 2 and
+// + 3; each record's record_cost is charged before the next call. The third record meets the
+// room exactly and seals, or passes it by one byte and seals first in the next turn.
+void repeat() {
+	const auto whole = d::turn_room(options.segment_bytes, options.block_bytes);
+	const auto half = d::turn_room(options.segment_bytes / 2, options.block_bytes);
+	const std::size_t s1 = 100, s2 = 200;
+	const auto rest = half - d::record_cost(s1) - d::record_cost(s2);  // the room the third call gets
+	for (const bool over : {false, true}) {
+		const std::string at = over ? " (one byte over)" : " (room met)";
+		jt::Disk disk; jt::MemoryIO io(disk);
+		std::vector<Call> calls;
+		Backlog backlog{1, calls};
+		Model expected;
+		{
+			j::TurnDriver driver(io, identity, options);
+			driver.stage(record(1, 1, 10)); driver.commit(); fold(expected, {record(1, 1, 10)});
+			backlog.staged = driver.seal(1, backlog.sealer());
+			check(backlog.staged == 1, "seal returns the staged sequence 1" + at);
+			backlog.sizes = {s1, s2, rest - d::record_cost(0) + (over ? 1 : 0)};
+			const auto turns = driver.log().stats().turns;
+			driver.commit();
+			const std::vector<Call> want{{1, whole, true}, {1, half - d::record_cost(s1), false}, {1, rest, false}};
+			check(calls == want, "each call gets the room less every earlier record's cost, framing included" + at + ":" + show(calls));
+			if (!over) {
+				check(driver.log().stats().turns == turns + 1 && driver.sequence(1) == 4 && backlog.sizes.empty(), "three records seal in one turn" + at);
+				check(backlog.sealed.size() == 3 && backlog.sealed[0].sequence == 2 && backlog.sealed[1].sequence == 3 && backlog.sealed[2].sequence == 4, "at staged + 1, + 2 and + 3" + at);
+			} else {
+				check(driver.log().stats().turns == turns + 1 && driver.sequence(1) == 3 && backlog.sizes.size() == 1, "the record one byte past the room waits" + at);
+				calls.clear();
+				driver.commit();
+				check(!calls.empty() && calls[0] == Call{1, whole, true} && driver.sequence(1) == 4 && driver.log().stats().turns == turns + 2, "and seals first in the next turn" + at + ":" + show(calls));
+			}
+			check(!driver.failed(), "no turn fails" + at);
+		}
+		fold(expected, backlog.sealed);
+		j::TurnDriver after(io, identity, options);
+		check(after.recovered().groups == expected, "recovery holds records 1 to 4 in order" + at);
+	}
+}
+
+// journal-seal-repeat A2. `first` is true only until the turn's first record seals, across
+// groups; a repeat call passes false. The rotation still starts the next turn at the group the
+// last one left waiting, so two groups that each fill the room alternate. There is no per-group
+// cap: a group may take the whole room.
+void repeat_turns() {
+	const auto whole = d::turn_room(options.segment_bytes, options.block_bytes);
+	const auto half = d::turn_room(options.segment_bytes / 2, options.block_bytes);
+	const auto c10 = d::record_cost(10);
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		std::vector<Call> calls;
+		Backlog a{1, calls}, b{2, calls};
+		driver.seal(1, a.sealer()); driver.seal(2, b.sealer());
+		a.sizes = {10, 10}; b.sizes = {10, 10};
+		driver.commit();
+		const std::vector<Call> both{{1, whole, true}, {1, half - c10, false}, {1, half - 2 * c10, false}, {2, half - 2 * c10, false}, {2, half - 3 * c10, false}, {2, half - 4 * c10, false}};
+		check(calls == both, "only the turn's first call is first; repeat calls and the next group's are not:" + show(calls));
+		calls.clear(); b.sizes = {10, 10};
+		driver.commit();
+		const std::vector<Call> second{{1, whole, true}, {2, whole, true}, {2, half - c10, false}, {2, half - 2 * c10, false}};
+		check(calls == second, "a group with nothing leaves `first` to the next group's first record:" + show(calls));
+		check(driver.sequence(1) == 2 && driver.sequence(2) == 4 && !driver.failed(), "every record is durable");
+	}
+	// Two groups whose backlogs each fill a turn: group 1 fills turn 1, so group 2 is offered
+	// what is left, declines it, and starts turn 2; then group 1 starts turn 3.
+	jt::Disk disk; jt::MemoryIO io(disk);
+	Model expected;
+	std::vector<Call> calls;
+	Backlog a{1, calls}, b{2, calls};
+	{
+		j::TurnDriver driver(io, identity, options);
+		driver.seal(1, a.sealer()); driver.seal(2, b.sealer());
+		a.sizes.assign(30, 1000); b.sizes.assign(30, 1000);
+		std::vector<std::uint64_t> starts;
+		std::vector<std::size_t> taken;
+		for (int turn = 0; turn < 4; ++turn) {
+			calls.clear();
+			const auto before = a.sealed.size() + b.sealed.size();
+			driver.commit();
+			starts.push_back(calls.empty() ? 0 : calls[0].group);
+			check(!calls.empty() && calls[0].room == whole && calls[0].first, "turn " + std::to_string(turn) + " starts with the whole room:" + show(calls));
+			check(std::all_of(calls.begin(), calls.end(), [&](const Call& c) { return c.group == calls[0].group || c == Call{c.group, c.room, false}; }), "the other group is offered only the rest");
+			taken.push_back(a.sealed.size() + b.sealed.size() - before);
+		}
+		check(starts == std::vector<std::uint64_t>{1, 2, 1, 2}, "the turns start at groups 1, 2, 1, 2");
+		check(a.sealed.size() == 2 * taken[0] && b.sealed.size() == 2 * taken[1] && taken[0] > 1, "each turn's first group takes the room alone, several records each");
+		check(!driver.failed(), "no turn fails");
+	}
+	fold(expected, a.sealed); fold(expected, b.sealed);
+	j::TurnDriver after(io, identity, options);
+	check(after.recovered().groups == expected, "every record is durable once and in order");
+}
+
+// journal-seal-repeat A3. A sealer that throws on a repeat call, or returns a record the
+// driver refuses, leaves its earlier records in the turn: they are written and acknowledged,
+// and the next turn fails with the error, as separate turns would. A throw on a group's first
+// call fails its turn unwritten, as before.
+void repeat_throw() {
+	for (const bool refuse : {false, true}) {
+		const std::string at = refuse ? " (refused record)" : " (throw)";
+		const std::string error = refuse ? "sealed record out of its group's sequence" : "sealer failed";
+		jt::Disk disk; jt::MemoryIO io(disk);
+		std::vector<j::TurnRecord> sealed;
+		{
+			j::TurnDriver driver(io, identity, options);
+			int calls = 0;
+			driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+				if (++calls <= 2) { sealed.push_back(record(1, calls, 10)); return sealed.back(); }
+				if (refuse) { return record(1, 7, 10); }
+				throw std::runtime_error("sealer failed");
+			});
+			bool acknowledged = false;
+			auto wait = [&]() -> task::task<void> { co_await driver.durable(1, 2); acknowledged = true; };
+			check(message_of([&] { j::run(driver, wait()); }).empty(), "the turn with the earlier records completes" + at);
+			check(calls == 3 && acknowledged && driver.sequence(1) == 2 && !driver.failed(), "records 1 and 2 are durable and acknowledged" + at);
+			driver.stage(record(2, 1, 4));
+			const auto message = message_of([&] { driver.commit(); });
+			check(message == error && driver.failed() && calls == 3, "the next turn fails with the error before any sealer runs" + at + ": " + message);
+			check(driver.sequence(2) == 0, "and its staged record is never written" + at);
+		}
+		j::TurnDriver after(io, identity, options);
+		check(after.records(1) == sealed && after.records(2).empty(), "recovery holds records 1 and 2" + at);
+	}
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	driver.seal(1, [](std::uint64_t, bool) -> std::optional<j::TurnRecord> { throw std::runtime_error("sealer failed"); });
+	driver.stage(record(2, 1, 4));
+	check(message_of([&] { driver.commit(); }) == "sealer failed" && driver.failed() && driver.sequence(2) == 0, "a throw on a group's first call fails its turn unwritten");
+}
+
+// journal-seal-repeat A3. A group unsealed, re-sealed or forgotten during a call is not called
+// again in the turn; the call's record is the group's. forget() between repeat calls is
+// refused, because the group has a record in the turn.
+void repeat_unseal() {
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		int owner = 0, calls = 0;
+		driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { ++calls; driver.unseal(1, &owner); return record(1, calls, 10); }, &owner);
+		driver.wake(); driver.commit();
+		check(calls == 1 && driver.sequence(1) == 1 && !driver.sealed(1) && !driver.failed(), "a sealer that unseals its group during a call is not called again; its record is durable");
+	}
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		int old_calls = 0, new_calls = 0;
+		driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+			++old_calls;
+			driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { ++new_calls; return std::nullopt; });
+			return record(1, old_calls, 10);
+		});
+		driver.wake(); driver.commit();
+		check(old_calls == 1 && new_calls == 0 && driver.sequence(1) == 1, "a sealer replaced during its call is not called again, and its replacement waits for the next turn");
+		driver.wake(); driver.commit();
+		check(old_calls == 1 && new_calls == 1, "the replacement runs next turn");
+	}
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		int calls = 0;
+		bool refused = false;
+		driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+			if (++calls == 1) { return record(1, 1, 10); }
+			try { driver.forget(1); } catch (const std::logic_error&) { refused = true; }
+			return std::nullopt;
+		});
+		driver.wake(); driver.commit();
+		check(calls == 2 && refused && driver.sealed(1) && driver.sequence(1) == 1 && !driver.failed(), "forget between repeat calls is refused while the group's record is in the turn");
+	}
+}
+
+// journal-seal-repeat A3, under TSan. A sealer that always has a record is called many times
+// per turn while another thread unseals it at a random moment: running_ covers the whole loop,
+// so no call starts once unseal returns, and every record a call returned is durable.
+void repeat_threads() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	std::atomic<int> late{0};
+	std::uint64_t staged = 0, other = 0, calls = 0, most = 0;
+	std::mt19937_64 random(11);
+	for (int round = 0; round < 100; ++round) {
+		int key = 0;
+		std::atomic<bool> gone{false};
+		staged = driver.seal(1, [&](std::uint64_t room, bool) -> std::optional<j::TurnRecord> {
+			if (gone.load(std::memory_order_acquire)) { late.fetch_add(1); }
+			++calls;
+			std::this_thread::yield();
+			if (d::record_cost(8) > room) { return std::nullopt; }
+			return record(1, ++staged, 8, j::TurnRecordKind::Checkpoint);  // each drops the last: the log stays small
+		}, &key);
+		const auto delay = std::chrono::microseconds(random() % 400);
+		std::thread unsealer([&] { std::this_thread::sleep_for(delay); driver.unseal(1, &key); gone.store(true, std::memory_order_release); });
+		for (int turn = 0; turn < 10; ++turn) {
+			const auto before = calls;
+			driver.stage(record(2, ++other, 4, j::TurnRecordKind::Checkpoint)); driver.commit();
+			most = std::max(most, calls - before);
+		}
+		unsealer.join();
+	}
+	check(late.load() == 0, "no sealer call starts after its unseal returns (" + std::to_string(late.load()) + " late)");
+	check(most > 2, "the sealer is called several times in a turn (at most " + std::to_string(most) + ")");
+	check(driver.sequence(1) == staged && !driver.failed(), "every record a call returned is durable");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -840,6 +1080,7 @@ int main(int argc, char** argv) {
 		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"staged_room", staged_room}, {"bound", bound},
 		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger}, {"supersede", supersede},
 {"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads}, {"wake_refused", wake_refused}, {"wake_after_run", wake_after_run}, {"unseal_threads", unseal_threads},
+		{"repeat", repeat}, {"repeat_turns", repeat_turns}, {"repeat_throw", repeat_throw}, {"repeat_unseal", repeat_unseal}, {"repeat_threads", repeat_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {

@@ -1,13 +1,15 @@
-> Status: CURRENT (2026-11-17) how `TurnDriver::seal` in `include/journal/turn_driver.h` works.
+> Status: CURRENT (2026-11-17) how `TurnDriver::seal` in `include/journal/turn_driver.h` works,
+> repeat calls per turn included (journal-seal-repeat).
 > Consumer: strata `docs/design/standalone-turn-log.md` revision 1 (D3, D4, D5; review R3), at
 > strata:8e919415, and the shim it replaces, strata:efe25bcd `include/strata/core/turn_seal.hh`.
 > Format: `RFTW0001`, unchanged.
 
-# Sealed records: one record per group per turn
+# Sealed records: a group's records per turn
 
 A group that collects work between turns (strata's logged index, with its open record) registers a
-sealer instead of staging one record per operation. Each turn asks every sealer for at most one
-record, so the turn writes every group's work with one `pwrite` and one `File::sync_data`.
+sealer instead of staging one record per operation. Each turn asks every sealer for records until
+it has none or the turn's room is spent, so the turn writes every group's work, a backlog of
+several closed records included, with one `pwrite` and one `File::sync_data`.
 
 ## The contract
 
@@ -19,9 +21,12 @@ void TurnDriver::wake() noexcept;  // any thread
 ```
 
 - **When it runs.** `start()` (behind `begin()`, `commit()`, `run()` and the blocking entry) calls
-  each registered sealer once, on the driver's loop, after the turn's pending records and before
-  encoding. Its record joins the turn after them, so a checkpoint staged before it keeps its lower
-  sequence. The driver is loop-confined like the rest of `TurnDriver`: `seal`, `forget` and the
+  each registered sealer, on the driver's loop, after the turn's pending records and before
+  encoding. Its records join the turn after them, so a checkpoint staged before them keeps its
+  lower sequence.
+- **Repeat calls.** A sealer that returns a record is called again at once, with the room left,
+  until it returns nothing or less than `record_cost(0)` is left; then the next group's sealer is
+  called. A sealer holding several closed records hands them over one per call, each in sequence. The driver is loop-confined like the rest of `TurnDriver`: `seal`, `forget` and the
   sealers run on the loop's thread; `unseal()` and `wake()` may come from any thread.
 - **The loop's scheduler.** `wake()` reaches `run()` through its loop's `post_call`, so `run()`
   throws `std::logic_error` before it holds the driver when that scheduler declares none: no
@@ -34,11 +39,16 @@ void TurnDriver::wake() noexcept;  // any thread
   call.
   `wake()` takes only a leaf lock that no sealer call runs under, so a writer may call it while it
   holds its record mutex. Nothing in the driver ever waits for a record mutex holder.
-- **What it gets.** `room` is what the turn has left in `turn_log_detail::record_cost` units, and
-  `first` says no record has sealed in this turn yet (its room is then the whole segment's).
+- **What it gets.** `room` is what the turn has left in `turn_log_detail::record_cost` units: every
+  record pending or sealed earlier in the turn, its framing included, is charged before the next
+  call. `first` is true only until the turn's first record seals, across groups: a repeat call,
+  and every call after any group's record, passes false, and then the room is the share's
+  (below).
 - **What it returns.** Nothing, or one `TurnRecord` of its group whose `record_cost` fits `room` and
   whose sequence is the group's last staged sequence + 1: the last record of the group pending, in
-  flight or durable, which `seal` returns. A sealer that frames its record with a stricter bound,
+  flight, durable, or sealed by its previous call in this turn, so three calls of one turn return
+  `staged + 1`, `+ 2` and `+ 3`. `seal` returns that staged sequence. A record that does not fit
+  stays with the sealer, which returns nothing, and seals in a later turn. A sealer that frames its record with a stricter bound,
   as strata's `turn_framed_bytes` is, stays within the room. A sealer
   continues its group and never starts one, so the log's rule that a checkpoint may open a new group
   at any sequence does not apply to sealed records.
@@ -47,6 +57,12 @@ void TurnDriver::wake() noexcept;  // any thread
   refuses does: every pending operation and every `durable()` waiter fails, so no client is told a
   refused record was written. A sealer that throws fails the turn the same way, and a sealer may not
   call `stage()`.
+- **A failing repeat call.** A repeat call that throws, or returns a record refused as above,
+  leaves the group's earlier records in the turn, as separate turns would have written them: no
+  more sealers are called, the turn is written, and its records are acknowledged. The next turn
+  then fails with that error before it calls any sealer, as it would had the call begun it, and
+  with it every operation pending then. A throw or refusal on a group's first call of the turn
+  fails that turn, as above.
 - **One per group, keyed by its owner.** `seal` refuses group 0; registering a group again
   replaces its sealer and owner, as a reopened index does. `unseal(group, owner)` removes it only if
   `owner` registered it, so the old index's destructor leaves the reopened one's sealer in place.
@@ -57,7 +73,11 @@ void TurnDriver::wake() noexcept;  // any thread
   sealed before `unseal` returned and is staged as the group's. From inside the sealer itself,
   `unseal` returns at once. `forget(group)` removes it whatever its owner. Neither lets a call start
   once it returns, including later in the turn being
-  sealed when another sealer forgets the group. A sealer that forgets its own group finishes its
+  sealed when another sealer forgets the group. The driver marks a sealer running (`running_`)
+  from its group's first call of the turn to its last, and checks the table before each repeat
+  call: a group unsealed, re-sealed or forgotten during a call is not called again in the turn, and
+  an `unseal` from another thread waits for the group's calls, not only the one in progress. A
+  `forget` between repeat calls is refused, since the group's earlier record is pending. A sealer that forgets its own group finishes its
   call, because the driver holds its function for the call. `forget` still refuses a group with a
   record pending or in flight, and the sealer stays registered then.
 - **Closing drops the open record.** `forget` (a group's close) drops its open record unwritten,
@@ -113,11 +133,18 @@ For 32 KiB blocks the overhead past the records is about 16.2 KiB plus 0.4%.
   seals first in its turn once `segment_bytes` is at least about 64.3 MiB, and seals behind other
   records within a share once it is at least about 128.5 MiB (`turn_room(segment_bytes / 2) - 65 >=
   command_bytes`).
-- **Later sealed records** share `turn_room(segment_bytes / 2)`. When less than `record_cost(0)` is
-  left, the remaining sealers are not called this turn.
-- **Nothing is dropped.** A sealer the turn did not call, or one that returned nothing under a
-  share, is the first called next turn, with the first record's budget. Its record stays open in
-  the consumer meanwhile. A sealer that passes its budget breaks the contract and fails the turn.
+- **Later sealed records**, a group's repeat calls and the other groups' calls alike, share
+  `turn_room(segment_bytes / 2)`, each charged its `record_cost` before the next call. When less
+  than `record_cost(0)` is left, no sealer is called again this turn.
+- **Nothing is dropped.** A sealer the turn did not call, or one whose first call returned nothing
+  under a share, is the first called next turn, with the first record's budget. Its record stays
+  open in the consumer meanwhile. A sealer that passes its budget breaks the contract and fails the
+  turn.
+- **Fairness.** There is no per-group cap: a group may take the whole room, one record per call.
+  A group that sealed in the turn has been served, so its repeat call's nothing claims no first
+  place; the group after it that was not called, or declined its first call, starts the next turn
+  (`next_seal_`). Two groups that each fill a turn alternate, and a record that needs the whole room
+  waits at most one turn behind a group that sealed first.
 - Pending records staged with `stage()` are not budgeted: they count against the sealers' room,
   and a turn of pending records alone that does not fit fails as before.
 
@@ -168,3 +195,11 @@ new call: its watcher awaits `durable` for the open record.
 | `wake_after_run` | Under ASan: a wake still queued when `run()` returns reaches nothing once the owner destroys the driver on the loop |
 | `unseal_threads` | Under TSan: `unseal` from another thread while a turn calls the sealer returns only after the call; its record is durable; across 200 racing rounds no call starts after `unseal` returns; after the sealer forgets its group or re-seals it for another owner, the original owner's `unseal` still waits for the call |
 | `trigger` | A waiter makes `run()` seal; a quiet sealer sleeps; a new waiter asks again; the entry reports a lost wake |
+| `repeat` | One sealer gives three records in one turn at staged + 1, + 2, + 3; each call's room is the share less every earlier record's `record_cost`; a third record that meets the room exactly seals, one a byte over seals first next turn; recovery holds them in order |
+| `repeat_turns` | `first` is true only for the turn's first call until a record seals, across groups; two groups that each fill a turn alternate as its first group |
+| `repeat_throw` | A repeat call that throws, or returns a refused record, leaves the earlier records written and acknowledged; the next turn fails with the error before calling a sealer; a first call's throw fails its turn unwritten |
+| `repeat_unseal` | A group unsealed or re-sealed during a call is not called again in the turn and its record is durable; `forget` between repeat calls is refused |
+| `repeat_threads` | Under TSan: another thread unseals a sealer called many times per turn; no call starts after `unseal` returns, and every record a call returned is durable |
+
+`test/turn_seal_mutants.sh` applies each guard's mutant (`one-call`, `framing`, `staged`, `rotation`,
+`unsealed-again`, `repeat-throw` and the earlier ones); the case named beside it fails at each.
