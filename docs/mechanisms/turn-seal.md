@@ -147,7 +147,8 @@ For 32 KiB blocks the overhead past the records is about 16.2 KiB plus 0.4%.
   A group that sealed in the turn has been served, so its repeat call's nothing claims no first
   place; the group after it that was not called, or declined its first call, starts the next turn
   (`next_seal_`). Two groups that each fill a turn alternate, and a record that needs the whole room
-  waits at most one turn for each group ahead of it in the rotation.
+  waits at most one turn for each group ahead of it in the rotation, while staged records
+  leave it the whole room (staged records are not budgeted, so they can stretch the wait).
 - Pending records staged with `stage()` are not budgeted: they count against the sealers' room,
   and a turn of pending records alone that does not fit fails as before.
 
