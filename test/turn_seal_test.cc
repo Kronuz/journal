@@ -524,7 +524,7 @@ void staged_room() {
 		driver.stage(record(2, 1, 200));  // costs more than the 100 left
 		try { j::run(driver, driver.durable(1, 1)); } catch (const std::exception& error) { check(false, std::string("the blocking entry threw: ") + error.what()); }
 		check(driver.sequence(1) == 1 && driver.sequence(2) == 1, "blocking entry: the record behind a staged one is durable");
-		check(consumer.calls.size() == 3 && consumer.calls[0].second < whole && consumer.calls[1].second == whole, "blocking entry: declined behind the staged record, then sealed with the whole room");
+		check(consumer.calls.size() == 2 && consumer.calls[0].second < whole && consumer.calls[1].second == whole, "blocking entry: declined behind the staged record, then sealed with the whole room, which it spends");
 	}
 	jt::Disk disk; jt::MemoryIO io(disk);
 	j::TurnDriver driver(io, identity, options);
@@ -542,7 +542,7 @@ void staged_room() {
 	driver.stage(record(2, 1, 200));
 	drain();
 	check(waited.done && !waited.error && driver.sequence(1) == 1, "run(): the waiter's record behind a staged one is durable");
-	check(consumer.calls.size() == 3 && consumer.calls[1].second == whole, "run(): sealed on the next turn with the whole room");
+	check(consumer.calls.size() == 2 && consumer.calls[1].second == whole, "run(): sealed on the next turn with the whole room");
 	stop.request(); loop.run();
 	check(ran.done && !ran.error, "run() ends");
 }
