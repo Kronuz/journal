@@ -59,10 +59,13 @@ void TurnDriver::wake() noexcept;  // any thread
   call `stage()`.
 - **A failing repeat call.** A repeat call that throws, or returns a record refused as above,
   leaves the group's earlier records in the turn, as separate turns would have written them: no
-  more sealers are called, the turn is written, and its records are acknowledged. The next turn
-  then fails with that error before it calls any sealer, as it would had the call begun it, and
-  with it every operation pending then. A throw or refusal on a group's first call of the turn
-  fails that turn, as above.
+  more sealers are called and the turn is written. The error is parked until that turn completes,
+  and `idle()` is false meanwhile. `completed()` then acknowledges the turn's records (their
+  operations complete, and a `durable()` waiter they satisfy is answered even though the driver
+  fails next), fails the driver with the error, failing every operation and waiter left, and
+  throws it; so `commit()` and `run()` throw it too, with no further turn asked for. If the turn's
+  write or barrier fails instead, the driver fails with that failure. A throw or refusal on a
+  group's first call of the turn fails that turn, as above.
 - **One per group, keyed by its owner.** `seal` refuses group 0; registering a group again
   replaces its sealer and owner, as a reopened index does. `unseal(group, owner)` removes it only if
   `owner` registered it, so the old index's destructor leaves the reopened one's sealer in place.
@@ -144,7 +147,7 @@ For 32 KiB blocks the overhead past the records is about 16.2 KiB plus 0.4%.
   A group that sealed in the turn has been served, so its repeat call's nothing claims no first
   place; the group after it that was not called, or declined its first call, starts the next turn
   (`next_seal_`). Two groups that each fill a turn alternate, and a record that needs the whole room
-  waits at most one turn behind a group that sealed first.
+  waits at most one turn for each group ahead of it in the rotation.
 - Pending records staged with `stage()` are not budgeted: they count against the sealers' room,
   and a turn of pending records alone that does not fit fails as before.
 
@@ -197,9 +200,10 @@ new call: its watcher awaits `durable` for the open record.
 | `trigger` | A waiter makes `run()` seal; a quiet sealer sleeps; a new waiter asks again; the entry reports a lost wake |
 | `repeat` | One sealer gives three records in one turn at staged + 1, + 2, + 3; each call's room is the share less every earlier record's `record_cost`; a third record that meets the room exactly seals, one a byte over seals first next turn; recovery holds them in order |
 | `repeat_turns` | `first` is true only for the turn's first call until a record seals, across groups; two groups that each fill a turn alternate as its first group |
-| `repeat_throw` | A repeat call that throws, or returns a refused record, leaves the earlier records written and acknowledged; the next turn fails with the error before calling a sealer; a first call's throw fails its turn unwritten |
+| `repeat_throw` | A repeat call that throws, or returns a refused record, leaves the earlier records written and their waiter acknowledged, then the turn's completion fails the driver with the error; a first call's throw fails its turn unwritten |
+| `repeat_latent` | Review F1: with no waiter and nothing more asked for, `commit()`, `completed()` after `begin()` (the driver busy meanwhile) and `run()` with its stop requested each throw the repeat call's error, and `failed()` is true |
 | `repeat_unseal` | A group unsealed or re-sealed during a call is not called again in the turn and its record is durable; `forget` between repeat calls is refused |
 | `repeat_threads` | Under TSan: the third call of a turn waits until another thread's `unseal` has dropped the group; the turn holds three records, no fourth call starts, and `unseal` returns only once the calls end; across 100 rounds of random unseals no call starts after `unseal` returns |
 
 `test/turn_seal_mutants.sh` applies each guard's mutant (`one-call`, `framing`, `staged`, `rotation`,
-`unsealed-again`, `repeat-throw` and the earlier ones); the case named beside it fails at each.
+`unsealed-again`, `repeat-throw`, `deferred-ignored` and the earlier ones); the case named beside it fails at each.

@@ -102,7 +102,7 @@ namespace detail {
 // callback, on any thread, claims it and hops to the loop (post_call), which unlinks it before
 // the resume. Only the claim's winner resumes the caller.
 struct TurnWaiter {
-	enum : int { linked = 0, completed = 1, cancelled = 2, closed = 3 };
+	enum : int { linked = 0, completed = 1, cancelled = 2, closed = 3, failed = 4 };
 	bool claim(int outcome) noexcept { int expected = linked; return state.compare_exchange_strong(expected, outcome, std::memory_order_acq_rel); }
 	std::atomic<int> state{linked};
 	std::coroutine_handle<> handle;
@@ -232,9 +232,9 @@ public:
 		resume([](const detail::TurnWaiter& waiter) { return waiter.group == 0; });
 		return sequence;
 	}
-	// Nothing waits for a turn: no record is pending, no sealer owes a waited-for record, and
-	// no wake() is unanswered.
-	bool idle() const noexcept { return pending_.empty() && !owed_.load(std::memory_order_acquire) && !woken_.load(std::memory_order_acquire); }
+	// Nothing waits for a turn: no record is pending, no sealer owes a waited-for record, no
+	// wake() is unanswered, and no sealer's failure waits for its turn to complete.
+	bool idle() const noexcept { return pending_.empty() && !owed_.load(std::memory_order_acquire) && !woken_.load(std::memory_order_acquire) && !deferred_; }
 	bool in_flight() const noexcept { return write_.has_value(); }
 
 	// Stages the pending records as one turn and submits their operations; the host writes
@@ -255,6 +255,9 @@ public:
 		auto flight = std::move(flight_); flight_.clear();
 		for (auto& item : flight) { finish(item, nullptr); }
 		resume([this](const detail::TurnWaiter& waiter) { return waiter.group && log_.sequence(waiter.group) >= waiter.sequence; });
+		// A repeat sealer call failed while sealing this turn: its records are acknowledged above,
+		// then the driver fails with that call's error.
+		if (deferred_) { auto error = std::exchange(deferred_, nullptr); fail(error); std::rethrow_exception(error); }
 	}
 	// The turn's write or barrier failed: the log fails, and so does every operation
 	// staged with it or after it.
@@ -375,7 +378,8 @@ private:
 			const auto state = waiter.state.load(std::memory_order_acquire);
 			if (state == detail::TurnWaiter::closed) { throw group_closed(waiter.group, waiter.sequence); }
 			if (state == detail::TurnWaiter::cancelled || (token.requested() && !turns.satisfied(waiter))) { throw task::cancelled{}; }
-			if (waiter.group && turns.log_failed_) { std::rethrow_exception(turns.failure_); }
+			// A waiter its turn made durable is answered even if the driver failed after that turn.
+			if (waiter.group && turns.log_failed_ && state != detail::TurnWaiter::completed) { std::rethrow_exception(turns.failure_); }
 		}
 		struct Cancel {
 			detail::TurnWaiter* waiter;
@@ -434,7 +438,6 @@ private:
 	// Seals, then stages the pending records as one turn; nullptr when there are none.
 	const TurnLog::TurnWrite* start() {
 		if (write_) { throw std::logic_error("a turn is already in flight"); }
-		if (deferred_) { auto error = std::exchange(deferred_, nullptr); fail(error); std::rethrow_exception(error); }
 		try { seal_turn(); } catch (...) { fail(std::current_exception()); throw; }
 		if (pending_.empty()) { return nullptr; }
 		std::vector<TurnRecord> records; records.reserve(pending_.size());
@@ -572,7 +575,7 @@ private:
 			if (!item.submitted) { try { item.operation->submitted(); } catch (...) { continue; } }
 			finish(item, error);
 		}
-		resume([](const detail::TurnWaiter& waiter) { return waiter.group != 0; });
+		resume([](const detail::TurnWaiter& waiter) { return waiter.group != 0; }, detail::TurnWaiter::failed);
 	}
 
 	IO& io_;
@@ -599,7 +602,7 @@ private:
 	std::optional<TurnLog::TurnWrite> write_;
 	detail::TurnWaiter* waiters_ = nullptr;
 	std::exception_ptr failure_;
-	std::exception_ptr deferred_;  // a repeat sealer call's failure: the next turn's
+	std::exception_ptr deferred_;  // a repeat sealer call's failure: fails the driver once its turn completes
 	Holder holder_ = Holder::none;
 	bool log_failed_ = false;
 };

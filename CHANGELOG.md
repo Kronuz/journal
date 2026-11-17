@@ -14,9 +14,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   after each record's `record_cost` and `first = false`, until it returns nothing or less than
   `record_cost(0)` is left, so one turn carries a group's backlog. A sealer returns nothing when it
   has no more. A repeat call that throws or returns a refused record leaves the earlier records in
-  the turn, written and acknowledged, and the next turn fails with its error. The rotation still
-  starts the next turn at the group the last one left waiting; there is no per-group cap. See
+  the turn; once that turn completes and acknowledges them, the driver fails with the error and
+  `completed()`, `commit()` and `run()` throw it. The rotation still starts the next turn at the
+  group the last one left waiting; there is no per-group cap. See
   [the turn-seal note](docs/mechanisms/turn-seal.md).
+- `TurnDriver::unseal(group, owner)` from another thread waits for all of the group's calls in the
+  turn being sealed, not only the one in progress.
+- A `durable()` waiter whose record a turn made durable is answered even if the driver fails
+  right after that turn; waiters the failure resolves still throw it.
 - `Host::close_group(group, sequence, manifest)` throws `std::logic_error` when `sequence` is
   below the group's last acknowledged record, the log's durable sequence or the table's earlier
   `base`, and writes nothing: the forget would drop the records after it. `Journal::close` always

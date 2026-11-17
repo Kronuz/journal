@@ -965,8 +965,8 @@ void repeat_turns() {
 
 // journal-seal-repeat A3. A sealer that throws on a repeat call, or returns a record the
 // driver refuses, leaves its earlier records in the turn: they are written and acknowledged,
-// and the next turn fails with the error, as separate turns would. A throw on a group's first
-// call fails its turn unwritten, as before.
+// then the driver fails with the error as that turn completes. A throw on a group's first call
+// fails its turn unwritten, as before.
 void repeat_throw() {
 	for (const bool refuse : {false, true}) {
 		const std::string at = refuse ? " (refused record)" : " (throw)";
@@ -983,12 +983,10 @@ void repeat_throw() {
 			});
 			bool acknowledged = false;
 			auto wait = [&]() -> task::task<void> { co_await driver.durable(1, 2); acknowledged = true; };
-			check(message_of([&] { j::run(driver, wait()); }).empty(), "the turn with the earlier records completes" + at);
-			check(calls == 3 && acknowledged && driver.sequence(1) == 2 && !driver.failed(), "records 1 and 2 are durable and acknowledged" + at);
-			driver.stage(record(2, 1, 4));
-			const auto message = message_of([&] { driver.commit(); });
-			check(message == error && driver.failed() && calls == 3, "the next turn fails with the error before any sealer runs" + at + ": " + message);
-			check(driver.sequence(2) == 0, "and its staged record is never written" + at);
+			const auto message = message_of([&] { j::run(driver, wait()); });
+			check(message == error && calls == 3, "the turn's completion fails the driver with the error" + at + ": " + message);
+			check(acknowledged && driver.sequence(1) == 2 && driver.failed() && driver.idle(), "records 1 and 2 are durable and their waiter is acknowledged first" + at);
+			check(message_of([&] { driver.stage(record(2, 1, 4)); }) == "turn driver failed" && calls == 3, "no later turn starts" + at);
 		}
 		j::TurnDriver after(io, identity, options);
 		check(after.records(1) == sealed && after.records(2).empty(), "recovery holds records 1 and 2" + at);
@@ -998,6 +996,52 @@ void repeat_throw() {
 	driver.seal(1, [](std::uint64_t, bool) -> std::optional<j::TurnRecord> { throw std::runtime_error("sealer failed"); });
 	driver.stage(record(2, 1, 4));
 	check(message_of([&] { driver.commit(); }) == "sealer failed" && driver.failed() && driver.sequence(2) == 0, "a throw on a group's first call fails its turn unwritten");
+}
+
+// journal-seal-repeat review F1. With no waiter and nothing more asked for, a repeat call's
+// error still surfaces as its turn completes: commit(), completed() after begin(), and run()
+// with its stop already requested each throw it, and failed() is true.
+void repeat_latent() {
+	auto setup = [](j::TurnDriver& driver, int& calls) {
+		driver.seal(1, [&calls](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+			if (++calls == 1) { return record(1, 1, 10); }
+			throw std::runtime_error("repeat call failed");
+		});
+	};
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		int calls = 0; setup(driver, calls);
+		driver.wake();
+		const auto message = message_of([&] { driver.commit(); });
+		check(message == "repeat call failed" && calls == 2 && driver.sequence(1) == 1 && driver.failed(), "commit(): record 1 is written, then commit throws the error: " + message);
+	}
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		int calls = 0; setup(driver, calls);
+		driver.wake();
+		const auto& write = driver.begin();
+		check(!driver.idle() && !driver.failed(), "begin(): the parked error keeps the driver busy");
+		write.file->write_at(write.offset, write.bytes); write.file->sync_data();
+		const auto message = message_of([&] { driver.completed(); });
+		check(message == "repeat call failed" && driver.sequence(1) == 1 && driver.failed(), "completed() acknowledges record 1, then throws the error: " + message);
+	}
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	int calls = 0; setup(driver, calls);
+	task::inline_scheduler loop; auto ref = task::scheduler_ref::of(loop);
+	j::InlineCompletion inline_io; task::cancel_source stop;
+	std::string outcome = "(not finished)";
+	auto host = [&]() -> task::task<void> {
+		try { co_await driver.run(j::completion_ref::of(inline_io), stop.token()); outcome = ""; }
+		catch (const std::exception& error) { outcome = error.what(); }
+	};
+	driver.wake();
+	stop.request();  // a stop already asked: run() writes what is asked, then returns
+	task::spawn(ref, host()); loop.run();
+	check(calls == 2 && driver.sequence(1) == 1, "run() writes record 1");
+	check(outcome == "repeat call failed" && driver.failed(), "run() throws the error, not success, and the driver is failed: '" + outcome + "'");
 }
 
 // journal-seal-repeat A3. A group unsealed, re-sealed or forgotten during a call is not called
@@ -1097,7 +1141,7 @@ int main(int argc, char** argv) {
 		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"staged_room", staged_room}, {"bound", bound},
 		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger}, {"supersede", supersede},
 {"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads}, {"wake_refused", wake_refused}, {"wake_after_run", wake_after_run}, {"unseal_threads", unseal_threads},
-		{"repeat", repeat}, {"repeat_turns", repeat_turns}, {"repeat_throw", repeat_throw}, {"repeat_unseal", repeat_unseal}, {"repeat_threads", repeat_threads},
+		{"repeat", repeat}, {"repeat_turns", repeat_turns}, {"repeat_throw", repeat_throw}, {"repeat_latent", repeat_latent}, {"repeat_unseal", repeat_unseal}, {"repeat_threads", repeat_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {

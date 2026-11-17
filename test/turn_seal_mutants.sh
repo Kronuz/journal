@@ -14,6 +14,7 @@
 #   rotation          seal_turn never moves next_seal_ (A2)
 #   unsealed-again    seal_turn calls a group unsealed or replaced during its last call (A3)
 #   repeat-throw      a repeat call's throw fails its turn unwritten (A3)
+#   deferred-ignored  a repeat call's throw is dropped, never failing the driver (review F1)
 set -eu
 new='if (false) {'
 case "$1" in
@@ -29,6 +30,7 @@ case "$1" in
 	rotation) file=include/journal/turn_driver.h; old='if (resume_at) { next_seal_ = *resume_at; }'; new='' ;;
 	unsealed-again) file=include/journal/turn_driver.h; old='if (found == sealers_.end() || found->second.fn != fn) { break; }'; new='' ;;
 	repeat-throw) file=include/journal/turn_driver.h; old='catch (...) { if (!repeat) { throw; } deferred_ = std::current_exception(); return; }'; new='catch (...) { throw; }' ;;
+	deferred-ignored) file=include/journal/turn_driver.h; old='catch (...) { if (!repeat) { throw; } deferred_ = std::current_exception(); return; }'; new='catch (...) { if (!repeat) { throw; } return; }' ;;
 	*) echo "unknown mutant: $1" >&2; exit 2 ;;
 esac
 git checkout -- "$file" 2>/dev/null || true
