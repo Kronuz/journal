@@ -53,7 +53,7 @@ j::TurnRecord record(std::uint64_t group, std::uint64_t sequence, std::size_t si
 	for (std::size_t i = 0; i < size; ++i) { payload[i] = static_cast<char>('a' + (group * 7 + sequence * 3 + i) % 26); }
 	return {group, sequence, kind, payload};
 }
-void apply(Model& model, const std::vector<j::TurnRecord>& records) {
+void fold(Model& model, const std::vector<j::TurnRecord>& records) {
 	for (const auto& r : records) { if (r.kind == j::TurnRecordKind::Checkpoint) { model[r.group].clear(); } model[r.group].push_back(r); }
 }
 // The refusal's message, or empty when `run` did not throw std::invalid_argument.
@@ -125,7 +125,7 @@ bool crash_run(std::uint64_t seed, std::uint64_t cut, bool& reached) {
 			else { continue; }
 			check(in_flight.empty() || std::all_of(consumer.open.begin(), consumer.open.end(), [](const auto& o) { return !o.second; }),
 				"every open record seals in its turn under an unspent budget: " + at);
-			apply(acknowledged, in_flight); in_flight.clear();
+			fold(acknowledged, in_flight); in_flight.clear();
 			driver.log().prepare();
 		}
 		reached = true;
@@ -138,7 +138,7 @@ bool crash_run(std::uint64_t seed, std::uint64_t cut, bool& reached) {
 		j::TurnDriver after(io, identity, options);
 		const auto& recovered = after.recovered();
 		check(!recovered.damaged && recovered.lost.empty(), "power loss alone damages nothing: " + at);
-		auto with = acknowledged; apply(with, in_flight);
+		auto with = acknowledged; fold(with, in_flight);
 		const bool none = recovered.groups == acknowledged, whole = recovered.groups == with;
 		check(none || whole, "every acknowledged record survives and the in-flight turn, sealed records included, is whole or absent: " + at);
 	} catch (const std::exception& error) {
@@ -258,7 +258,7 @@ void budget() {
 		driver.commit();
 		check(consumer.calls.size() == 1 && consumer.calls[0] == std::pair<std::uint64_t, std::uint64_t>{1, whole - cost}, "the first sealer is offered the whole segment");
 		check(sealed.size() == 1 && driver.sequence(2) == 0, "a spent budget calls no other sealer");
-		apply(expected, sealed); sealed.clear(); consumer.calls.clear();
+		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
 		// Next turn starts with group 2: it takes the whole, 3 takes a share, 4's 2500 bytes do not fit.
 		consumer.append(1, 10);
 		driver.commit();
@@ -266,12 +266,12 @@ void budget() {
 		check(consumer.calls[1] == std::pair<std::uint64_t, std::uint64_t>{3, half - d::record_cost(2500) - cost}, "the next one gets the share's rest");
 		check(consumer.calls[2].first == 4 && consumer.calls[2].second < 2500 && consumer.open[4], "group 4 declines a share too small for its record");
 		check(sealed.size() == 3, "groups 2, 3 and 1 seal");
-		apply(expected, sealed); sealed.clear(); consumer.calls.clear();
+		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
 		// Group 4 declined a share: it is called first next turn and seals.
 		driver.commit();
 		check(!consumer.calls.empty() && consumer.calls[0].first == 4 && consumer.calls[0].second == whole - cost, "the sealer that declined a share is called first");
 		check(sealed.size() == 1 && sealed[0].group == 4 && !consumer.open[4], "and its record seals");
-		apply(expected, sealed); sealed.clear(); consumer.calls.clear();
+		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
 		// Records past the budget break the contract: the driver refuses them.
 		jt::Disk other_disk; jt::MemoryIO other_io(other_disk);
 		j::TurnDriver other(other_io, identity, options);
@@ -298,10 +298,10 @@ void full_size() {
 		consumer.append(1, 100); consumer.append(2, big);
 		driver.commit();
 		check(sealed.size() == 1 && sealed[0].group == 1 && consumer.open[2], "behind another record, the full-size record waits");
-		apply(expected, sealed); sealed.clear();
+		fold(expected, sealed); sealed.clear();
 		driver.commit();
 		check(sealed.size() == 1 && sealed[0].group == 2 && sealed[0].payload.size() == big && !driver.failed(), "first in its turn, it seals");
-		apply(expected, sealed);
+		fold(expected, sealed);
 	}
 	j::TurnDriver after(io, identity, options);
 	check(after.recovered().groups == expected, "the full-size record is durable");
