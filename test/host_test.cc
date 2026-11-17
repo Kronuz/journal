@@ -24,8 +24,9 @@
 // share a name and reclaiming one never touches another; reclamation and the admission census by
 // name with no directory scan; a closed group reopened from the group table after retention
 // recycled every segment that held it; a group whose first turn was lost created again as a new
-// incarnation; a failed close that leaves the group open; a second recovery on one host refused;
-// and one owner lock, the directory's own. `host_test [case]` runs one case.
+// incarnation; a failed close that leaves the group open; a close behind an acknowledged record
+// refused; a second recovery on one host refused; and one owner lock, the directory's own.
+// `host_test [case]` runs one case.
 #include "journal/memory_io.h"
 #include "journal/store.h"
 #include <cerrno>
@@ -298,6 +299,52 @@ void failed_close() {
 	check(node.recovered[7].bundle == "state" && node.host->entry(7)->incarnation == 1, "it recovers its checkpoint in its first incarnation");
 }
 
+// journal-host-guards A1. A close whose record is below the group's last acknowledged one, here
+// the group's real checkpoint record with two batches acknowledged after it, is refused: the
+// forget would drop those batches. The group stays open in the table and the log, retention
+// keeps the batches, and recovery returns them. A reopened group's close below the table's
+// earlier base is refused the same way.
+void close_behind() {
+	jt::Disk disk;
+	{ Node node(disk); node.checkpoint(7, "state"); }
+	std::uint64_t last = 0;
+	{
+		Node node(disk);
+		const auto records = node.turns(7).records(7);
+		check(records.size() == 1 && records[0].kind == j::TurnRecordKind::Checkpoint, "the log holds the group's checkpoint record");
+		const auto checkpoint = records[0];
+		node.store(7); node.append(7, "a1"); node.append(7, "a2");
+		last = node.turns(7).sequence(7);
+		check(last == checkpoint.sequence + 2, "two batches are acknowledged after the checkpoint");
+		std::string error;
+		try { node.host->close_group(7, checkpoint.sequence, checkpoint.payload); }
+		catch (const std::logic_error& refused) { error = refused.what(); }
+		check(error == "a close behind the group's last acknowledged record", "a close at the checkpoint's sequence is refused: " + error);
+		check(node.host->entry(7)->state == j::GroupState::open && node.host->entry(7)->manifest.empty(), "the table keeps the group open, with no record");
+		check(node.turns(7).sequence(7) == last && node.host->status(7) == j::GroupStatus::stored, "the log keeps the group");
+		node.stores.erase(7);
+		for (int b = 0; b < 200; ++b) { node.append(8, std::string(900, 'x')); }
+	}
+	{
+		Node node(disk);
+		node.store(7);
+		check(node.recovered[7].bundle == "state" && node.recovered[7].batches == std::vector<std::string>{"a1", "a2"}, "recovery keeps both acknowledged batches");
+		node.checkpoint(7, "closing");
+		const auto base = node.turns(7).sequence(7);
+		node.store(7).close(); node.stores.erase(7);
+		check(node.host->entry(7)->base == base, "the close at the last record is taken");
+		node.host->reopen_group(7);
+		bool refused = false;
+		try { node.host->close_group(7, base - 1, node.host->entry(7)->manifest); } catch (const std::logic_error&) { refused = true; }
+		check(refused && node.host->entry(7)->state == j::GroupState::open && node.host->entry(7)->base == base, "a reopened group's close below the table's base is refused");
+		node.host->close_group(7, base, node.host->entry(7)->manifest);
+		check(node.host->status(7) == j::GroupStatus::closed, "its close at the base is taken");
+	}
+	Node node(disk);
+	node.store(7);
+	check(node.recovered[7].bundle == "closing" && node.recovered[7].batches.empty(), "the closed group recovers its last checkpoint");
+}
+
 // A group closed, reopened from the table, then recovered by a second Store of the same host:
 // its state is in the log, not the table, so the recovery is refused; its loop keeps running,
 // and the reopened host recovers the group's latest state.
@@ -350,7 +397,7 @@ int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
-		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"second_recovery", second_recovery}, {"lock", lock}};
+		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"close_behind", close_behind}, {"second_recovery", second_recovery}, {"lock", lock}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

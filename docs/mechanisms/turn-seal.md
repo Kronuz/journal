@@ -23,6 +23,11 @@ void TurnDriver::wake() noexcept;  // any thread
   encoding. Its record joins the turn after them, so a checkpoint staged before it keeps its lower
   sequence. The driver is loop-confined like the rest of `TurnDriver`: `seal`, `forget` and the
   sealers run on the loop's thread; `unseal()` and `wake()` may come from any thread.
+- **The loop's scheduler.** `wake()` reaches `run()` through its loop's `post_call`, so `run()`
+  throws `std::logic_error` before it holds the driver when that scheduler declares none: no
+  wake is ever refused while it serves. A `wake()` from another thread needs that `post_call` to
+  be thread-safe, as task's `asio_scheduler` and `blocking_scheduler` are; `inline_scheduler`'s is
+  not, so on it only the loop's own thread calls `wake()`.
 - **Lock order: the turn, then the group's record mutex.** The turn is the loop's own context; the
   driver holds no lock of its own while a sealer runs, so a sealer takes its record mutex freely.
   The sealer table has its own mutex, taken only around table reads and writes, never across a
@@ -119,8 +124,9 @@ an open record gets it written, under `run()` or the blocking entry, with no sta
 new call: its watcher awaits `durable` for the open record.
 
 - `wake()` sets a flag `idle()` reads and, while `run()` serves the driver, posts to its loop to
-  resume it; the blocking entry sees it at its next pass, so a wake from another thread reaches
-  `journal::run` only while that entry sleeps toward a deadline (a post cuts the sleep short). The
+  resume it. The blocking entry sees it at its next pass; `wake()` posts nothing there, so a wake
+  from another thread reaches `journal::run` only while that entry sleeps toward a deadline, when
+  the deadline or another post ends the sleep. The
   post reaches the driver only while that `run()` lasts, so the owner may destroy the driver once
   `run()` returns with a wake still queued; that wake's flag stays set for the next turn.
 - A sealer that returns nothing when offered the whole room, the turn's first with nothing pending,
@@ -149,6 +155,7 @@ new call: its watcher awaits `durable` for the open record.
 | `unseal_owner` | A second registration replaces the first; the first owner's `unseal` leaves it, its own removes it; `seal` returns the last staged sequence |
 | `lock_order` | A sealer holding its record mutex calls `wake()`, which asks for exactly one more turn |
 | `wake_threads` | Under TSan: a writer thread calls `wake()` under its record mutex at each record's first transaction; `run()` on another thread's loop makes every record durable with no waiter or staged record |
+| `wake_refused` | `run()` on a scheduler that declares no `post_call` throws before it holds the driver; the wake it could not carry stays asked for, and `run()` on a loop with `post_call` seals it |
 | `wake_after_run` | Under ASan: a wake still queued when `run()` returns reaches nothing once the owner destroys the driver on the loop |
 | `unseal_threads` | Under TSan: `unseal` from another thread while a turn calls the sealer returns only after the call; its record is durable; across 200 racing rounds no call starts after `unseal` returns; after the sealer forgets its group or re-seals it for another owner, the original owner's `unseal` still waits for the call |
 | `trigger` | A waiter makes `run()` seal; a quiet sealer sleeps; a new waiter asks again; the entry reports a lost wake |

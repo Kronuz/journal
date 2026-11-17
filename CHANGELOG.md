@@ -6,6 +6,19 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-17
+
+### Changed
+
+- `Host::close_group(group, sequence, manifest)` throws `std::logic_error` when `sequence` is
+  below the group's last acknowledged record, the log's durable sequence or the table's earlier
+  `base`, and writes nothing: the forget would drop the records after it. `Journal::close` always
+  passes its last record and is unaffected.
+- `TurnDriver::run` throws `std::logic_error` before it holds the driver when its loop's scheduler
+  declares no `post_call`, where `wake()` reaches it, so a wake is never refused while `run()`
+  serves. A `wake()` from another thread needs that `post_call` to be thread-safe (task's
+  `asio_scheduler` and `blocking_scheduler`; not `inline_scheduler`).
+
 ## 2026-11-16
 
 ### Added

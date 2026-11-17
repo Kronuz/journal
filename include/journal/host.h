@@ -317,14 +317,20 @@ public:
 		update(group, [](GroupEntry& entry) { entry.state = GroupState::open; });
 	}
 	// The table takes the group's last record, a checkpoint covering every batch; once that is
-	// durable the log forgets the group, so retention reclaims its records.
+	// durable the log forgets the group, so retention reclaims its records. As TurnLog's
+	// checkpoint guard does, it refuses a sequence below the group's last acknowledged record,
+	// in the log or the table, whose records the forget would drop.
 	void close_group(std::uint64_t group, std::uint64_t sequence, std::string manifest) {
-		held(group, GroupState::open);
-		if (driver_of(group).staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
+		const auto base = held(group, GroupState::open).base;
+		auto& turns = driver_of(group);
+		if (turns.staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
+		if (sequence < std::max(base, turns.sequence(group))) {
+			throw std::logic_error("a close behind the group's last acknowledged record");
+		}
 		update(group, [&](GroupEntry& entry) {
 			settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
 		});
-		driver_of(group).forget(group);
+		turns.forget(group);
 	}
 	// The group's next artifact identity; a used-up block reserves the next one in the table.
 	Identity next_artifact(std::uint64_t group) {

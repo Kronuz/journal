@@ -178,14 +178,16 @@ public:
 	}
 	bool sealed(std::uint64_t group) const { std::lock_guard hold(sealers_mutex_); return sealers_.contains(group); }
 	// Any thread, under any lock: an open record took its first transaction, so the next turn
-	// seals it. Takes only a lock no sealer call runs under; reaches run() on its loop, and the
-	// blocking entry at its next pass.
+	// seals it. Takes only a lock no sealer call runs under; reaches run() through its loop's
+	// post_call, which run() requires, and the blocking entry at its next pass. From another
+	// thread, that post_call must be thread-safe: task's asio_scheduler and blocking_scheduler
+	// are; inline_scheduler is not.
 	void wake() noexcept {
 		if (woken_.exchange(true, std::memory_order_acq_rel)) { return; }
 		std::lock_guard hold(loop_mutex_);
 		if (!wakeup_) { return; }
 		wakeup_->refs.fetch_add(1, std::memory_order_relaxed);
-		if (!loop_.post_call(&TurnDriver::woken, wakeup_)) { Wakeup::release(wakeup_); }
+		loop_.post_call(&TurnDriver::woken, wakeup_);  // never refused: run() checked its loop
 	}
 	// Records of the group wait for a turn or are in the one in flight.
 	bool staged(std::uint64_t group) const {
@@ -258,8 +260,12 @@ public:
 
 	// The loop's task: writes each turn as records are staged, through `io`, one turn at a
 	// time, with no caller's token: a staged record is always written. Returns once `stop` is
-	// requested and nothing is staged or in flight; throws the failure when a turn fails.
+	// requested and nothing is staged or in flight; throws the failure when a turn fails. Its
+	// loop's scheduler must declare post_call, where wake() reaches it: on one that declares
+	// none, run() throws std::logic_error before it holds the driver.
 	task::task<void> run(completion_ref io, task::cancel_token stop = {}) {
+		// scheduler_ref::post_call is refused only by a scheduler that declares none.
+		if (!task::current().post_call([](void*) {}, nullptr)) { throw std::logic_error("run() needs a loop whose scheduler declares post_call"); }
 		Hold hold(*this, Holder::driver);
 		struct Loop {
 			TurnDriver& turns;

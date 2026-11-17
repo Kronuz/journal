@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -544,6 +545,49 @@ void staged_room() {
 	check(ran.done && !ran.error, "run() ends");
 }
 
+// A scheduler that declares no post_call, as a host loop might: wake() could not reach run() on it.
+struct NoPostCall {
+	std::deque<std::coroutine_handle<>> ready;
+	void post(std::coroutine_handle<> h) { ready.push_back(h); }
+	std::uint64_t now() const noexcept { return 0; }
+	void run() {
+		task::running_on scope(task::scheduler_ref::of(*this));
+		while (!ready.empty()) { auto h = ready.front(); ready.pop_front(); h.resume(); }
+	}
+};
+// journal-host-guards A2. run() refuses a loop whose scheduler declares no post_call, before it
+// holds the driver, so no wake() is refused while it serves; the wake it could not carry stays
+// asked for, and run() on a loop with post_call seals the woken record.
+void wake_refused() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	j::InlineCompletion inline_io; task::cancel_source stop;
+	std::optional<j::TurnRecord> open;
+	driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { auto taken = std::move(open); open.reset(); return taken; });
+	std::string error; bool ended = false;
+	auto runner = [&]() -> task::task<void> {
+		try { co_await driver.run(j::completion_ref::of(inline_io), stop.token()); }
+		catch (const std::logic_error& refused) { error = refused.what(); }
+		ended = true;
+	};
+	NoPostCall bare;
+	task::spawn(task::scheduler_ref::of(bare), runner()); bare.run();
+	check(ended && error == "run() needs a loop whose scheduler declares post_call", "run() on a scheduler without post_call is refused: " + error);
+	if (!ended) { stop.request(); bare.run(); }  // a run() that served would sleep here, deaf to wake()
+	check(driver.holder() == j::TurnDriver::Holder::none, "the refused run() leaves the driver free");
+	open = record(1, 1, 8);
+	driver.wake();
+	check(!driver.idle() && driver.sequence(1) == 0, "the wake stays asked for");
+	task::inline_scheduler loop; ended = false; error.clear();
+	task::spawn(task::scheduler_ref::of(loop), runner()); loop.run();
+	check(!ended && driver.sequence(1) == 1, "run() on a loop with post_call seals the woken record");
+	open = record(1, 2, 8);
+	driver.wake(); loop.run();  // the wake posts to run()'s loop, which resumes it
+	check(driver.sequence(1) == 2, "a wake while run() sleeps reaches it through post_call");
+	stop.request(); loop.run();
+	check(ended && error.empty(), "run() ends");
+}
+
 // A8 (review F2), under ASan. A wake() still queued on the loop when run() returns reaches no
 // driver: the owner destroys the driver on the loop right after run(), then the loop drains.
 void wake_after_run() {
@@ -795,7 +839,7 @@ int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"staged_room", staged_room}, {"bound", bound},
 		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger}, {"supersede", supersede},
-{"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads}, {"wake_after_run", wake_after_run}, {"unseal_threads", unseal_threads},
+{"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads}, {"wake_refused", wake_refused}, {"wake_after_run", wake_after_run}, {"unseal_threads", unseal_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {

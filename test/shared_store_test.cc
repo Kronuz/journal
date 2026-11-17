@@ -122,9 +122,13 @@ struct Node {
 	}
 
 	// A group whose checkpoint covers every batch closes into the host's table and reopens from
-	// it, staging that record again as its first.
+	// it, staging that record again as its first. A close below that record is refused first,
+	// writing nothing, so every crash point also follows a refused close.
 	void cycle(std::uint64_t g) {
 		auto& group = groups[g];
+		bool refused = false;
+		try { host->close_group(g, driver->sequence(g) - 1, "stale"); } catch (const std::logic_error&) { refused = true; }
+		check(refused, "a close behind the group's last acknowledged record is refused");
 		group.store->close();
 		group.store = std::make_unique<j::Store>(*host, g, limits);
 		std::vector<std::string> recovered;

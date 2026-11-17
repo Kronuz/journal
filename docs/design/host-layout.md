@@ -52,7 +52,10 @@ it; a failed write restores the entry in memory, so the table there never runs a
 - **Close.** The group's last record must be a durable checkpoint covering every batch. The
   table takes it as `base`; once that shard is durable the loop's log forgets the group
   (`TurnLog::forget`), and retention reclaims its records. A failed write leaves the group open
-  with its records live.
+  with its records live. `Host::close_group` refuses a `base` below the group's last
+  acknowledged record, the log's durable sequence or the table's earlier `base`, since the
+  forget would drop the records after it: the rule TurnLog's checkpoint guard applies to a
+  checkpoint's `covers`. Nothing is written, and the group stays open.
 - **Reopen.** The table flips the entry to open, then the journal restores the frontier from
   the table's record and stages it again as the group's record `base + 1`. No turn log is read.
   `TurnLog` ignores a group's records through its `base` (`TurnLogGroups::base`), so a log that
