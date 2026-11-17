@@ -6,6 +6,25 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-16
+
+### Added
+
+- `TurnDriver::seal(group, fn)`: a group's sealer returns at most one record per turn, its open
+  record at the group's last staged sequence + 1, called after the turn's pending records and
+  before encoding, so every group's record shares the turn's one write and data barrier. The first
+  sealed record of a turn may fill an empty segment; later ones share `segment_bytes / 2`, and a
+  sealer the budget leaves out is called first next turn. A record out of sequence or past its
+  budget fails the turn. A `durable()` waiter above a sealed group's staged sequence asks for a
+  turn, so `idle()` is false while one is owed. `forget(group)` unregisters the sealer. No format
+  change. `TurnLog::options()` and the turn bound (`turn_log_detail::turn_bound`, `turn_room`) are
+  new too. [docs/mechanisms/turn-seal.md](docs/mechanisms/turn-seal.md) has the contract.
+
+### Changed
+
+- `commit()` with nothing pending calls the sealers and writes what they return; it throws "no
+  records to write" only when nothing was pending, owed, or sealed.
+
 ## 2026-11-02
 
 ### Changed
