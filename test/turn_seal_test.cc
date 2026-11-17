@@ -505,6 +505,68 @@ void trigger() {
 	check(stalled, "the entry throws stalled for a sealer with nothing to seal");
 }
 
+// A3 (review F1). A waiter's open record fits an empty turn but not the room a staged record
+// of another group leaves: its sealer, called first, declines, and is called first next turn
+// with the whole room instead of going quiet; the record is durable after two turns, under the
+// blocking entry and under run().
+void staged_room() {
+	const auto whole = d::turn_room(options.segment_bytes, options.block_bytes);
+	const auto large = whole - d::record_cost(0) - 100;  // costs whole - 100
+	{
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		Consumer consumer;
+		driver.seal(1, consumer.sealer(1));
+		consumer.append(1, large);
+		driver.stage(record(2, 1, 200));  // costs more than the 100 left
+		try { j::run(driver, driver.durable(1, 1)); } catch (const std::exception& error) { check(false, std::string("the blocking entry threw: ") + error.what()); }
+		check(driver.sequence(1) == 1 && driver.sequence(2) == 1, "blocking entry: the record behind a staged one is durable");
+		check(consumer.calls.size() == 2 && consumer.calls[0].second < whole && consumer.calls[1].second == whole, "blocking entry: declined behind the staged record, then sealed with the whole room");
+	}
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	Consumer consumer;
+	driver.seal(1, consumer.sealer(1));
+	consumer.append(1, large);
+	task::inline_scheduler loop; auto ref = task::scheduler_ref::of(loop);
+	j::HeldCompletion held; task::cancel_source stop;
+	Outcome ran, waited;
+	auto wait = [&]() -> task::task<void> { try { co_await driver.durable(1, 1); } catch (...) { waited.error = std::current_exception(); } waited.done = true; };
+	auto run = [&]() -> task::task<void> { try { co_await driver.run(j::completion_ref::of(held), stop.token()); } catch (...) { ran.error = std::current_exception(); } ran.done = true; };
+	auto drain = [&] { loop.run(); while (held.held()) { held.complete(held.tickets().front()); loop.run(); } };
+	task::spawn(ref, run()); loop.run();
+	task::spawn(ref, wait());  // links before anything is staged
+	driver.stage(record(2, 1, 200));
+	drain();
+	check(waited.done && !waited.error && driver.sequence(1) == 1, "run(): the waiter's record behind a staged one is durable");
+	check(consumer.calls.size() == 2 && consumer.calls[1].second == whole, "run(): sealed on the next turn with the whole room");
+	stop.request(); loop.run();
+	check(ran.done && !ran.error, "run() ends");
+}
+
+// A8 (review F2), under ASan. A wake() still queued on the loop when run() returns reaches no
+// driver: the owner destroys the driver on the loop right after run(), then the loop drains.
+void wake_after_run() {
+	jt::Disk disk; jt::MemoryIO io(disk);  // outlive the driver
+	auto driver = std::make_unique<j::TurnDriver>(io, identity, options);
+	task::inline_scheduler loop; auto ref = task::scheduler_ref::of(loop);
+	j::InlineCompletion inline_io; task::cancel_source stop;
+	int calls = 0;
+	driver->seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+		if (++calls == 1) { driver->wake(); stop.request(); }  // a writer's wake as the loop is told to stop
+		return std::nullopt;
+	});
+	bool closed = false;
+	auto close = [&]() -> task::task<void> {  // the owner's close: run() until stopped, then destroy
+		try { co_await driver->run(j::completion_ref::of(inline_io), stop.token()); } catch (...) {}
+		driver.reset(); closed = true;
+	};
+	task::spawn(ref, close()); loop.run();
+	driver->wake();
+	loop.run();  // a wake queued past run() would call into the destroyed driver here
+	check(closed && calls == 2, "run() returns with a wake queued, the driver is destroyed, and the loop drains (" + std::to_string(calls) + " calls)");
+}
+
 // A7. The document-gate design review's supersede probe (P1): 1 is durable through X, 2 is
 // acknowledged after it, and a checkpoint at 3 covering only 1 would drop 2 at its barrier. The
 // log refuses it, through append() and through a driver's turn, and recovery keeps 2.
@@ -694,14 +756,46 @@ void unseal_threads() {
 		unsealer.join();
 	}
 	check(late.load() == 0 && !driver.failed(), "no sealer call starts after its unseal returns (" + std::to_string(late.load()) + " late)");
+	// Review F3: the running sealer forgets its group, or re-seals it for another owner, then
+	// keeps running; the original owner's unseal from another thread still waits for the call.
+	static int other_owner = 0;
+	const std::vector<std::pair<std::string, std::function<void(j::TurnDriver&)>>> removals{
+		{"forget", [](j::TurnDriver& d) { d.forget(1); }},
+		{"re-seal", [](j::TurnDriver& d) { d.seal(1, [](std::uint64_t, bool) -> std::optional<j::TurnRecord> { return std::nullopt; }, &other_owner); }},
+	};
+	for (const auto& [name, remove] : removals) {
+		jt::Disk shape_disk; jt::MemoryIO shape_io(shape_disk);
+		j::TurnDriver shape(shape_io, identity, options);
+		int shape_owner = 0;
+		std::atomic<bool> removed{false}, waiting{false}, done{false};
+		shape.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+			if (done.load(std::memory_order_acquire)) { return std::nullopt; }
+			remove(shape);
+			removed.store(true, std::memory_order_release);
+			while (!waiting.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));  // unseal waits meanwhile
+			done.store(true, std::memory_order_release);
+			return std::nullopt;
+		}, &shape_owner);
+		bool after = false;
+		std::thread owner_thread([&] {
+			while (!removed.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+			waiting.store(true, std::memory_order_release);
+			shape.unseal(1, &shape_owner);  // the owner's destructor: frees what its sealer uses
+			after = done.load(std::memory_order_acquire);
+		});
+		shape.stage(record(2, 1, 4)); shape.commit();
+		owner_thread.join();
+		check(after && !shape.failed(), "unseal after the sealer's " + name + " returns only once the call has finished");
+	}
 }
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
-		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"bound", bound},
+		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"staged_room", staged_room}, {"bound", bound},
 		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger}, {"supersede", supersede},
-{"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads}, {"unseal_threads", unseal_threads},
+{"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads}, {"wake_after_run", wake_after_run}, {"unseal_threads", unseal_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {

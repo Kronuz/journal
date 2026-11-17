@@ -39,6 +39,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace kronuz::journal {
@@ -165,16 +166,15 @@ public:
 		return staged;
 	}
 	// Any thread: unregisters the group's sealer if `owner` registered it, so a later
-	// registration survives an earlier owner's unseal. Returns once that sealer is not running
-	// and never will be, as a timer's cancel does: the caller must not hold a lock the sealer
-	// takes. From inside the sealer itself it returns at once and the call finishes.
+	// registration survives an earlier owner's unseal. Returns once no sealer `owner` registered
+	// for the group is running, even one the table no longer holds, and none ever will, as a
+	// timer's cancel does: the caller must not hold a lock the sealer takes. From inside the
+	// sealer itself it returns at once and the call finishes.
 	void unseal(std::uint64_t group, const void* owner) noexcept {
 		std::unique_lock hold(sealers_mutex_);
-		auto found = sealers_.find(group);
-		if (found == sealers_.end() || found->second.owner != owner) { return; }
-		const auto fn = found->second.fn;
-		drop(found);
-		if (running_ == fn && running_thread_ != std::this_thread::get_id()) { sealer_done_.wait(hold, [&] { return running_ != fn; }); }
+		if (auto found = sealers_.find(group); found != sealers_.end() && found->second.owner == owner) { drop(found); }
+		auto running = [&] { return running_ && running_group_ == group && running_owner_ == owner; };
+		if (running() && running_thread_ != std::this_thread::get_id()) { sealer_done_.wait(hold, [&] { return !running(); }); }
 	}
 	bool sealed(std::uint64_t group) const { std::lock_guard hold(sealers_mutex_); return sealers_.contains(group); }
 	// Any thread, under any lock: an open record took its first transaction, so the next turn
@@ -183,7 +183,9 @@ public:
 	void wake() noexcept {
 		if (woken_.exchange(true, std::memory_order_acq_rel)) { return; }
 		std::lock_guard hold(loop_mutex_);
-		if (loop_) { loop_.post_call(&TurnDriver::woken, this); }
+		if (!wakeup_) { return; }
+		wakeup_->refs.fetch_add(1, std::memory_order_relaxed);
+		if (!loop_.post_call(&TurnDriver::woken, wakeup_)) { Wakeup::release(wakeup_); }
 	}
 	// Records of the group wait for a turn or are in the one in flight.
 	bool staged(std::uint64_t group) const {
@@ -261,8 +263,17 @@ public:
 		Hold hold(*this, Holder::driver);
 		struct Loop {
 			TurnDriver& turns;
-			explicit Loop(TurnDriver& driver) : turns(driver) { std::lock_guard hold(turns.loop_mutex_); turns.loop_ = task::current(); }
-			~Loop() { std::lock_guard hold(turns.loop_mutex_); turns.loop_ = {}; }
+			explicit Loop(TurnDriver& driver) : turns(driver) {
+				auto* wakeup = new Wakeup{&driver};
+				std::lock_guard hold(turns.loop_mutex_); turns.loop_ = task::current(); turns.wakeup_ = wakeup;
+			}
+			// A wake still queued on the loop finds no driver: the owner may destroy it now.
+			~Loop() {
+				Wakeup* wakeup = nullptr;
+				{ std::lock_guard hold(turns.loop_mutex_); turns.loop_ = {}; wakeup = std::exchange(turns.wakeup_, nullptr); }
+				wakeup->driver.store(nullptr, std::memory_order_release);
+				Wakeup::release(wakeup);
+			}
 		} loop(*this);
 		for (;;) {
 			if (log_failed_) { std::rethrow_exception(failure_); }
@@ -436,7 +447,8 @@ private:
 				const auto limit = first ? whole : half;
 				room = limit > used ? limit - used : 0;
 				if (room < turn_log_detail::record_cost(0)) { resume_at = group; break; }
-				fn = found->second.fn; running_ = fn; running_thread_ = std::this_thread::get_id(); running_forgotten_ = false;
+				fn = found->second.fn; running_ = fn; running_group_ = group; running_owner_ = found->second.owner;
+				running_thread_ = std::this_thread::get_id(); running_forgotten_ = false;
 			}
 			std::optional<TurnRecord> record;
 			try { record = (*fn)(room, first); }
@@ -446,9 +458,9 @@ private:
 			auto found = sealers_.find(group);
 			const bool same = found != sealers_.end() && found->second.fn == fn;
 			if (!record) {
-				// Nothing under the whole budget: quiet until a waiter asks again. Nothing under a
-				// share of it: called first next turn, when it may fill the segment.
-				if (same) { if (first) { found->second.quiet = true; mark(found->second); } else if (!resume_at) { resume_at = group; } }
+				// Nothing under the whole room: quiet until a waiter asks again. Nothing under less,
+				// as a share or behind staged records: called first next turn, when it may fill it.
+				if (same) { if (room == whole) { found->second.quiet = true; mark(found->second); } else if (!resume_at) { resume_at = group; } }
 				continue;
 			}
 			// A record sealed before an unseal returned is the group's; one whose group was
@@ -474,8 +486,19 @@ private:
 	// A sealer owes a turn while a waiter wants a sequence past its staged one and it has not
 	// answered nothing to the whole budget since that waiter linked.
 	struct Sealing { std::shared_ptr<Sealer> fn; const void* owner = nullptr; std::uint64_t staged = 0, wanted = 0; bool quiet = false, owed = false; };
-	// On the loop, after a wake() from any thread: resumes run() if it sleeps.
-	static void woken(void* self) { static_cast<TurnDriver*>(self)->resume([](const detail::TurnWaiter& waiter) { return waiter.group == 0; }); }
+	// What a posted wake() reaches: run()'s driver while that run() lasts, then nothing. Held by
+	// run() and by each queued wake.
+	struct Wakeup {
+		std::atomic<TurnDriver*> driver;
+		std::atomic<int> refs{1};
+		static void release(Wakeup* wakeup) noexcept { if (wakeup->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) { delete wakeup; } }
+	};
+	// On the loop, after a wake() from any thread: resumes run() if it still runs and sleeps.
+	static void woken(void* raw) {
+		auto* wakeup = static_cast<Wakeup*>(raw);
+		if (auto* driver = wakeup->driver.load(std::memory_order_acquire)) { driver->resume([](const detail::TurnWaiter& waiter) { return waiter.group == 0; }); }
+		Wakeup::release(wakeup);
+	}
 	// Under sealers_mutex_.
 	void mark(Sealing& sealing) noexcept {
 		const bool owed = !sealing.quiet && sealing.wanted > sealing.staged;
@@ -515,6 +538,8 @@ private:
 	std::condition_variable sealer_done_;  // a sealer call finished
 	std::map<std::uint64_t, Sealing> sealers_;
 	std::shared_ptr<Sealer> running_;  // the sealer being called, on running_thread_
+	std::uint64_t running_group_ = 0;  // and the group and owner it was called for
+	const void* running_owner_ = nullptr;
 	std::thread::id running_thread_;
 	bool running_forgotten_ = false;  // its group was forgotten during the call
 	std::atomic<std::size_t> owed_{0};
@@ -523,6 +548,7 @@ private:
 	std::atomic<bool> woken_{false};
 	std::mutex loop_mutex_;  // guards loop_ for wake(); a leaf: nothing else is taken under it
 	task::scheduler_ref loop_;  // run()'s loop, while it runs
+	Wakeup* wakeup_ = nullptr;  // run()'s, while it runs
 	std::optional<TurnLog::TurnWrite> write_;
 	detail::TurnWaiter* waiters_ = nullptr;
 	std::exception_ptr failure_;

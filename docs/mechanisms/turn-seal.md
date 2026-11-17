@@ -46,8 +46,9 @@ void TurnDriver::wake() noexcept;  // any thread
   replaces its sealer and owner, as a reopened index does. `unseal(group, owner)` removes it only if
   `owner` registered it, so the old index's destructor leaves the reopened one's sealer in place.
   Like a timer's cancel, `unseal` returns only once that sealer is not running and never will be:
-  from another thread it waits for a call in progress to finish, so a destroyed index's sealer
-  never runs; its caller must not hold a lock the sealer takes. A record that call returns was
+  from another thread it waits for a call in progress of a sealer `owner` registered for the group,
+  even one the table no longer holds because the sealer forgot or re-sealed its group, so a
+  destroyed index's sealer never runs; its caller must not hold a lock the sealer takes. A record that call returns was
   sealed before `unseal` returned and is staged as the group's. From inside the sealer itself,
   `unseal` returns at once. `forget(group)` removes it whatever its owner. Neither lets a call start
   once it returns, including later in the turn being
@@ -119,8 +120,11 @@ new call: its watcher awaits `durable` for the open record.
 
 - `wake()` sets a flag `idle()` reads and, while `run()` serves the driver, posts to its loop to
   resume it; the blocking entry sees it at its next pass, so a wake from another thread reaches
-  `journal::run` only while that entry sleeps toward a deadline (a post cuts the sleep short).
-- A sealer that returns nothing when offered the whole budget goes quiet: it owes no turn until a
+  `journal::run` only while that entry sleeps toward a deadline (a post cuts the sleep short). The
+  post reaches the driver only while that `run()` lasts, so the owner may destroy the driver once
+  `run()` returns with a wake still queued; that wake's flag stays set for the next turn.
+- A sealer that returns nothing when offered the whole room, the turn's first with nothing pending,
+  goes quiet: it owes no turn until a
   waiter links on its group again. `run()` then sleeps instead of spinning, and the blocking entry
   reports a waiter whose sealer has nothing as a lost wake (`stalled`).
 - `idle()` is false while a sealer owes a turn. `commit()` with nothing pending calls the sealers
@@ -138,11 +142,13 @@ new call: its watcher awaits `durable` for the open record.
 | `sequence` | Behind, ahead, another group's, a group's start, and a record whose sequence a racing checkpoint took (the review's F1/P1 shape) are refused unwritten; record 2 survives; the right order puts a checkpoint and a sealed record in one turn |
 | `budget` | The first sealer is offered the whole segment, a spent share calls no other sealer, the sealer left waiting or declining is called first next turn, a record past its budget is refused, and every record is durable once |
 | `full_size` | A record past half a segment seals as its turn's first record |
+| `staged_room` | A waiter's record that fits an empty turn but not the room a staged record leaves is declined, then sealed first next turn with the whole room, under the blocking entry and under `run()` |
 | `bound` | The bound against the framing |
 | `forget_in_flight`, `forget_from_sealer`, `forget_threads` | `forget` with a turn in flight, from inside a sealer, and with a writer thread appending under the consumer's lock (TSan) |
 | `supersede` | The review's probe P1: a checkpoint at 3 covering only 1 is refused through `append` and through a driver's turn, and acknowledged record 2 survives recovery; a later checkpoint with no `covers` is refused, a group's first needs none |
 | `unseal_owner` | A second registration replaces the first; the first owner's `unseal` leaves it, its own removes it; `seal` returns the last staged sequence |
 | `lock_order` | A sealer holding its record mutex calls `wake()`, which asks for exactly one more turn |
 | `wake_threads` | Under TSan: a writer thread calls `wake()` under its record mutex at each record's first transaction; `run()` on another thread's loop makes every record durable with no waiter or staged record |
-| `unseal_threads` | Under TSan: `unseal` from another thread while a turn calls the sealer returns only after the call; its record is durable; across 200 racing rounds no call starts after `unseal` returns |
+| `wake_after_run` | Under ASan: a wake still queued when `run()` returns reaches nothing once the owner destroys the driver on the loop |
+| `unseal_threads` | Under TSan: `unseal` from another thread while a turn calls the sealer returns only after the call; its record is durable; across 200 racing rounds no call starts after `unseal` returns; after the sealer forgets its group or re-seals it for another owner, the original owner's `unseal` still waits for the call |
 | `trigger` | A waiter makes `run()` seal; a quiet sealer sleeps; a new waiter asks again; the entry reports a lost wake |
