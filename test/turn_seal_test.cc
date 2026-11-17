@@ -262,7 +262,7 @@ void budget() {
 		driver.commit();
 		check(consumer.calls.size() == 1 && consumer.calls[0] == std::pair<std::uint64_t, std::uint64_t>{1, whole} && consumer.firsts[0], "the first sealer is offered the whole segment, as the turn's first");
 		check(sealed.size() == 1 && driver.sequence(2) == 0, "a spent budget calls no other sealer");
-		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
+		fold(expected, sealed); sealed.clear(); consumer.calls.clear(); consumer.firsts.clear();
 		// Next turn starts with group 2: it takes the whole, 3 takes a share, 4's 2500 bytes do not fit.
 		consumer.append(1, 10);
 		driver.commit();
@@ -270,12 +270,12 @@ void budget() {
 		check(consumer.calls[1] == std::pair<std::uint64_t, std::uint64_t>{3, half - d::record_cost(2500)} && !consumer.firsts[1], "the next one gets the share's rest, not as the first");
 		check(consumer.calls[2].first == 4 && consumer.calls[2].second < d::record_cost(2500) && consumer.open[4], "group 4 declines a share too small for its record");
 		check(sealed.size() == 3, "groups 2, 3 and 1 seal");
-		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
+		fold(expected, sealed); sealed.clear(); consumer.calls.clear(); consumer.firsts.clear();
 		// Group 4 declined a share: it is called first next turn and seals.
 		driver.commit();
 		check(!consumer.calls.empty() && consumer.calls[0].first == 4 && consumer.calls[0].second == whole, "the sealer that declined a share is called first");
 		check(sealed.size() == 1 && sealed[0].group == 4 && !consumer.open[4], "and its record seals");
-		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
+		fold(expected, sealed); sealed.clear(); consumer.calls.clear(); consumer.firsts.clear();
 		// Records past the budget break the contract: the driver refuses them.
 		jt::Disk other_disk; jt::MemoryIO other_io(other_disk);
 		j::TurnDriver other(other_io, identity, options);
@@ -334,8 +334,8 @@ void bound() {
 			std::string count; j::put32(count, static_cast<std::uint32_t>(records));
 			emitter.record(d::logical(d::end_of_turn, 1, 0, 0, count));
 			check(emitter.position() <= d::turn_bound(cost, block), "the bound holds: block " + std::to_string(block) + " records " + std::to_string(records));
-			const auto room = d::turn_room(emitter.position(), block);
-			check(!room || d::turn_bound(room, block) <= emitter.position(), "the room inverts the bound");
+			const auto inverse = d::turn_room(emitter.position(), block);
+			check(!inverse || d::turn_bound(inverse, block) <= emitter.position(), "the room inverts the bound");
 			++turns;
 		}
 	}
@@ -359,13 +359,13 @@ void forget_in_flight() {
 	try { driver.forget(2); } catch (const std::logic_error&) { refused = true; }
 	check(refused && driver.sealed(2), "a group with its sealed record in flight is refused and keeps its sealer");
 	write.file->write_at(write.offset, write.bytes); write.file->sync_data(); driver.completed();
-	consumer.calls.clear();
+	consumer.calls.clear(); consumer.firsts.clear();
 	consumer.append(1, 10); consumer.append(2, 10);
 	driver.stage(record(3, 2, 4));
 	driver.commit();
 	check(consumer.calls.size() == 1 && consumer.calls[0].first == 2, "the forgotten sealer never runs again");
 	driver.forget(2);
-	consumer.calls.clear();
+	consumer.calls.clear(); consumer.firsts.clear();
 	driver.stage(record(3, 3, 4));
 	driver.commit();
 	check(consumer.calls.empty() && !driver.sealed(2), "once its record is durable the group is forgotten too");
@@ -480,7 +480,7 @@ void trigger() {
 	drain();
 	check(first.done && !first.error && driver.sequence(1) == 1 && consumer.calls.size() == 1, "a waiter on the open record makes run() seal it");
 	// Nothing open: the sealer answers nothing once and run() goes back to sleep.
-	consumer.calls.clear();
+	consumer.calls.clear(); consumer.firsts.clear();
 	task::spawn(ref, wait(second, 1, 2));
 	drain();
 	check(!second.done && consumer.calls.size() == 1 && driver.idle(), "a quiet sealer is asked once, then run() sleeps");
