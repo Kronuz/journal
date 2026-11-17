@@ -20,6 +20,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   change. `TurnLog::options()` and the turn bound (`turn_log_detail::turn_bound`, `turn_room`) are
   new too. [docs/mechanisms/turn-seal.md](docs/mechanisms/turn-seal.md) has the contract.
 
+- `TurnRecord::covers`: a checkpoint's covered sequence. `TurnLog::stage` and `append` refuse a
+  checkpoint that covers less than the record before it, which it would drop when it lands. Not
+  stored; unset, a checkpoint covers the record before it, so existing callers are unchanged.
+
 ### Changed
 
 - `commit()` with nothing pending calls the sealers and writes what they return; it throws "no

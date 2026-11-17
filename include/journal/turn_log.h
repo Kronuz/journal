@@ -56,7 +56,13 @@ struct TurnRecord {
 	std::uint64_t group = 0, sequence = 0;
 	TurnRecordKind kind = TurnRecordKind::Batch;
 	std::string payload;
-	bool operator==(const TurnRecord&) const = default;
+	// A checkpoint's covered sequence: the group's last record its state includes. The log
+	// refuses one below the record before it, which it would drop; unset, it covers that record.
+	// Not stored, so not compared.
+	std::optional<std::uint64_t> covers;
+	bool operator==(const TurnRecord& other) const {
+		return group == other.group && sequence == other.sequence && kind == other.kind && payload == other.payload;
+	}
 };
 // What recovery kept: each group's records from its latest checkpoint, in sequence order.
 // A group whose sequence has a gap, or that wrote nothing after damage that may have held
@@ -246,6 +252,9 @@ public:
 			bool start = fresh && !sequences_.contains(record.group) && record.kind == TurnRecordKind::Checkpoint && record.sequence;
 			if (record.sequence != last + 1 && !start) {
 				throw std::invalid_argument("turn record out of its group's sequence");
+			}
+			if (record.kind == TurnRecordKind::Checkpoint && record.covers && *record.covers < last) {
+				throw std::invalid_argument("a checkpoint behind a record it would drop");
 			}
 			last = record.sequence;
 		}

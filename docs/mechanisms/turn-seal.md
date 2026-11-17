@@ -36,6 +36,17 @@ void TurnDriver::seal(std::uint64_t group, Sealer fn);
   call, because the driver holds its function for the call. `forget` still refuses a group with a
   record pending or in flight, and the sealer stays registered then.
 
+## The checkpoint guard
+
+A checkpoint record drops every earlier record of its group when its barrier returns. One whose
+state covers less than the record before it would drop an acknowledged record (the document-gate
+review's F1, reproduced by its probe P1). `TurnRecord::covers` names a checkpoint's covered
+sequence, the group's last record its state includes, and `TurnLog::stage` (so `append`, the
+driver's turns, Journal, Host and strata standalone alike) refuses a checkpoint whose `covers` is
+below the record before it. `covers` is not stored and not compared; unset, a checkpoint covers
+the record before it, as every caller's did before. A group's first checkpoint in the log has no
+record before it, so the guard never refuses one.
+
 ## The budget
 
 `budget` is the payload bytes the record may carry. Each turn must fit an empty segment, or
@@ -97,4 +108,5 @@ new call: its watcher awaits `durable` for the open record.
 | `full_size` | A record past half a segment seals as its turn's first record |
 | `bound` | The bound against the framing |
 | `forget_in_flight`, `forget_from_sealer`, `forget_threads` | `forget` with a turn in flight, from inside a sealer, and with a writer thread appending under the consumer's lock (TSan) |
+| `supersede` | The review's probe P1: a checkpoint at 3 covering only 1 is refused through `append` and through a driver's turn, and acknowledged record 2 survives recovery; an unset `covers` changes nothing |
 | `trigger` | A waiter makes `run()` seal; a quiet sealer sleeps; a new waiter asks again; the entry reports a lost wake |

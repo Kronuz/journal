@@ -25,6 +25,8 @@
 // `turn_seal_test [case]`, every case by default.
 #include "journal/blocking.h"
 #include "journal/memory_io.h"
+#include "completion/posix.h"
+#include <filesystem>
 #include <algorithm>
 #include <atomic>
 #include <functional>
@@ -497,12 +499,57 @@ void trigger() {
 	try { j::run(driver, driver.durable(1, 5)); } catch (const j::stalled& error) { stalled = error.groups == std::vector<std::uint64_t>{1}; }
 	check(stalled, "the entry throws stalled for a sealer with nothing to seal");
 }
+
+// A7. The document-gate design review's supersede probe (P1): 1 is durable through X, 2 is
+// acknowledged after it, and a checkpoint at 3 covering only 1 would drop 2 at its barrier. The
+// log refuses it, through append() and through a driver's turn, and recovery keeps 2.
+void supersede() {
+	const auto dir = std::filesystem::current_path() / ".scratch" / "turn-seal-supersede";
+	std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
+	const j::TurnLogOptions small{8 * 512, 512, 1};
+	{
+		j::PosixIO io(dir); auto owner = io.acquire_owner(true);
+		{
+			j::TurnRecovery rec; j::TurnLog log(io, identity, rec, small);
+			log.append(std::vector<j::TurnRecord>{{1, 1, j::TurnRecordKind::Batch, "tx@X (covered by the head)"}});
+			log.append(std::vector<j::TurnRecord>{{1, 2, j::TurnRecordKind::Batch, "tx after X (acknowledged)"}});
+			check(!refusal([&] { log.append(std::vector<j::TurnRecord>{{1, 2, j::TurnRecordKind::Checkpoint, "ckpt X=seq1", 1}}); }).empty(),
+				"a checkpoint at X's sequence is refused");
+			const auto message = refusal([&] { log.append(std::vector<j::TurnRecord>{{1, 3, j::TurnRecordKind::Checkpoint, "ckpt X=seq1", 1}}); });
+			check(message == "a checkpoint behind a record it would drop", "a checkpoint at 3 covering only 1 is refused: " + message);
+			check(log.sequence(1) == 2, "the refused checkpoint stages nothing");
+		}
+		j::TurnRecovery rec; j::TurnLog log(io, identity, rec, small);
+		const auto& kept = rec.groups[1];
+		check(kept.size() == 2 && kept[1].sequence == 2 && kept[1].payload == "tx after X (acknowledged)", "the acknowledged record above X survives recovery");
+		// The checkpoint that covers 2 supersedes both, as before.
+		log.append(std::vector<j::TurnRecord>{{1, 3, j::TurnRecordKind::Checkpoint, "ckpt X=seq2", 2}});
+		check(log.sequence(1) == 3, "a checkpoint covering the record before it is admitted");
+	}
+	std::filesystem::remove_all(dir);
+	// The driver's turns go through the same guard: a staged checkpoint behind its group's
+	// acknowledged record fails the turn unwritten.
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	driver.stage(record(1, 1, 8)); driver.commit();
+	driver.stage(record(1, 2, 8)); driver.commit();
+	auto checkpoint = record(1, 3, 8, j::TurnRecordKind::Checkpoint); checkpoint.covers = 1;
+	driver.stage(checkpoint);
+	check(refusal([&] { driver.commit(); }) == "a checkpoint behind a record it would drop" && driver.failed() && driver.sequence(1) == 2,
+		"a driver's turn with the checkpoint fails unwritten");
+	// Unset, a checkpoint covers the record before it: existing callers are unchanged.
+	jt::Disk other_disk; jt::MemoryIO other_io(other_disk);
+	j::TurnDriver other(other_io, identity, options);
+	other.stage(record(1, 1, 8)); other.commit();
+	other.stage(record(1, 2, 8, j::TurnRecordKind::Checkpoint)); other.commit();
+	check(!other.failed() && other.sequence(1) == 2, "a checkpoint with no covered sequence is admitted");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"bound", bound},
-		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger},
+		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger}, {"supersede", supersede},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {
