@@ -10,9 +10,12 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Added
 
-- `TurnDriver::seal(group, fn)`: a group's sealer returns at most one record per turn, its open
-  record at the group's last staged sequence + 1, called after the turn's pending records and
-  before encoding, so every group's record shares the turn's one write and data barrier. The first
+- `TurnDriver::seal(group, fn, owner)`: a group's sealer, `fn(room, first)`, returns at most one
+  record per turn, its open record at the group's last staged sequence + 1, called after the
+  turn's pending records and before encoding, so every group's record shares the turn's one write
+  and data barrier. Registering again replaces it; `unseal(group, owner)` removes it only for its
+  owner. `wake()`, from any thread, asks for a turn when an open record takes its first
+  transaction; sealers run under no driver lock. The first
   sealed record of a turn may fill an empty segment; later ones share `segment_bytes / 2`, and a
   sealer the budget leaves out is called first next turn. A record out of sequence or past its
   budget fails the turn. A `durable()` waiter above a sealed group's staged sequence asks for a

@@ -69,17 +69,18 @@ struct Consumer {
 	std::map<std::uint64_t, std::optional<j::TurnRecord>> open;
 	std::map<std::uint64_t, std::uint64_t> staged;
 	std::vector<j::TurnRecord>* sealed = nullptr;  // where taken records go, if anywhere
-	std::vector<std::pair<std::uint64_t, std::uint64_t>> calls;  // (group, budget)
+	std::vector<std::pair<std::uint64_t, std::uint64_t>> calls;  // (group, room)
+	std::vector<bool> firsts;
 	void append(std::uint64_t group, std::size_t size) {
 		auto& o = open[group];
 		if (!o) { o = record(group, staged[group] + 1, size); return; }
 		o->payload += record(group, o->sequence, size).payload;
 	}
 	j::TurnDriver::Sealer sealer(std::uint64_t group) {
-		return [this, group](std::uint64_t budget) -> std::optional<j::TurnRecord> {
-			calls.emplace_back(group, budget);
+		return [this, group](std::uint64_t room, bool first) -> std::optional<j::TurnRecord> {
+			calls.emplace_back(group, room); firsts.push_back(first);
 			auto& o = open[group];
-			if (!o || o->payload.size() > budget) { return std::nullopt; }
+			if (!o || d::record_cost(o->payload.size()) > room) { return std::nullopt; }
 			auto taken = std::move(*o); o.reset();
 			staged[group] = taken.sequence;
 			if (sealed) { sealed->push_back(taken); }
@@ -164,7 +165,7 @@ void crash() {
 // of another group, a group's start, and a record whose sequence a checkpoint staged since
 // took are refused before any byte is written, and the turn fails with them.
 void sequence() {
-	auto refused = [](const std::function<std::optional<j::TurnRecord>(std::uint64_t)>& fn, const std::string& what, bool with_start = true) {
+	auto refused = [](const j::TurnDriver::Sealer& fn, const std::string& what, bool with_start = true) {
 		jt::Disk disk; jt::MemoryIO io(disk);
 		j::TurnDriver driver(io, identity, options);
 		if (with_start) { driver.stage(record(1, 1, 10, j::TurnRecordKind::Checkpoint)); driver.commit(); }
@@ -175,9 +176,9 @@ void sequence() {
 		check(message == "sealed record out of its group's sequence" || message == "a sealer returned another group's record", what + " is refused by the driver: " + message);
 		check(driver.failed() && driver.log().stats().turns == turns, what + ": the turn fails unwritten");
 	};
-	refused([](std::uint64_t) { return std::optional(record(1, 1, 10)); }, "a sealed record behind its group");
-	refused([](std::uint64_t) { return std::optional(record(1, 3, 10)); }, "a sealed record ahead of its group");
-	refused([](std::uint64_t) { return std::optional(record(3, 1, 10)); }, "another group's record");
+	refused([](std::uint64_t, bool) { return std::optional(record(1, 1, 10)); }, "a sealed record behind its group");
+	refused([](std::uint64_t, bool) { return std::optional(record(1, 3, 10)); }, "a sealed record ahead of its group");
+	refused([](std::uint64_t, bool) { return std::optional(record(3, 1, 10)); }, "another group's record");
 	// The log alone admits a checkpoint as a group's first record at any sequence; a sealer
 	// continues a group, it never starts one.
 	{
@@ -186,7 +187,7 @@ void sequence() {
 		driver.stage(record(9, 5, 10, j::TurnRecordKind::Checkpoint));
 		check(refusal([&] { driver.commit(); }).empty() && driver.sequence(9) == 5, "the log admits a group's start at sequence 5");
 	}
-	refused([](std::uint64_t) { return std::optional(record(1, 5, 10, j::TurnRecordKind::Checkpoint)); }, "a sealed checkpoint that would start its group", false);
+	refused([](std::uint64_t, bool) { return std::optional(record(1, 5, 10, j::TurnRecordKind::Checkpoint)); }, "a sealed checkpoint that would start its group", false);
 
 	// The review's F1/P1 shape: 1 (checkpoint) and 2 are acknowledged; the open record took 3;
 	// a checkpoint naming record 1 is then staged at 3. Admitting both would make that checkpoint
@@ -254,32 +255,32 @@ void budget() {
 		j::TurnDriver driver(io, identity, options);
 		for (std::uint64_t g = 1; g <= 4; ++g) { driver.seal(g, consumer.sealer(g)); }
 		// Group 1 takes the share whole: the others are not called this turn.
-		consumer.append(1, half - 2 * cost);
+		consumer.append(1, half - 2 * cost + 1);
 		for (std::uint64_t g = 2; g <= 4; ++g) { consumer.append(g, 2500); }
 		std::vector<j::TurnRecord> sealed; consumer.sealed = &sealed;
 		driver.commit();
-		check(consumer.calls.size() == 1 && consumer.calls[0] == std::pair<std::uint64_t, std::uint64_t>{1, whole - cost}, "the first sealer is offered the whole segment");
+		check(consumer.calls.size() == 1 && consumer.calls[0] == std::pair<std::uint64_t, std::uint64_t>{1, whole} && consumer.firsts[0], "the first sealer is offered the whole segment, as the turn's first");
 		check(sealed.size() == 1 && driver.sequence(2) == 0, "a spent budget calls no other sealer");
 		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
 		// Next turn starts with group 2: it takes the whole, 3 takes a share, 4's 2500 bytes do not fit.
 		consumer.append(1, 10);
 		driver.commit();
-		check(consumer.calls.size() == 4 && consumer.calls[0].first == 2 && consumer.calls[0].second == whole - cost, "the sealer left waiting is called first, with the whole segment");
-		check(consumer.calls[1] == std::pair<std::uint64_t, std::uint64_t>{3, half - d::record_cost(2500) - cost}, "the next one gets the share's rest");
-		check(consumer.calls[2].first == 4 && consumer.calls[2].second < 2500 && consumer.open[4], "group 4 declines a share too small for its record");
+		check(consumer.calls.size() == 4 && consumer.calls[0].first == 2 && consumer.calls[0].second == whole, "the sealer left waiting is called first, with the whole segment");
+		check(consumer.calls[1] == std::pair<std::uint64_t, std::uint64_t>{3, half - d::record_cost(2500)} && !consumer.firsts[1], "the next one gets the share's rest, not as the first");
+		check(consumer.calls[2].first == 4 && consumer.calls[2].second < d::record_cost(2500) && consumer.open[4], "group 4 declines a share too small for its record");
 		check(sealed.size() == 3, "groups 2, 3 and 1 seal");
 		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
 		// Group 4 declined a share: it is called first next turn and seals.
 		driver.commit();
-		check(!consumer.calls.empty() && consumer.calls[0].first == 4 && consumer.calls[0].second == whole - cost, "the sealer that declined a share is called first");
+		check(!consumer.calls.empty() && consumer.calls[0].first == 4 && consumer.calls[0].second == whole, "the sealer that declined a share is called first");
 		check(sealed.size() == 1 && sealed[0].group == 4 && !consumer.open[4], "and its record seals");
 		fold(expected, sealed); sealed.clear(); consumer.calls.clear();
 		// Records past the budget break the contract: the driver refuses them.
 		jt::Disk other_disk; jt::MemoryIO other_io(other_disk);
 		j::TurnDriver other(other_io, identity, options);
-		other.seal(1, [](std::uint64_t budget) { return std::optional(record(1, 1, budget + 1)); });
+		other.seal(1, [](std::uint64_t room, bool) { return std::optional(record(1, 1, room - d::record_cost(0) + 1)); });
 		other.stage(record(2, 1, 1));
-		check(refusal([&] { other.commit(); }) == "sealed record past its budget" && other.failed(), "a record past its budget is refused");
+		check(refusal([&] { other.commit(); }) == "sealed record past its room" && other.failed(), "a record past its room is refused");
 	}
 	j::TurnDriver after(io, identity, options);
 	check(after.recovered().groups == expected, "every sealed record is durable once and in order: none is dropped");
@@ -332,7 +333,8 @@ void bound() {
 			std::string count; j::put32(count, static_cast<std::uint32_t>(records));
 			emitter.record(d::logical(d::end_of_turn, 1, 0, 0, count));
 			check(emitter.position() <= d::turn_bound(cost, block), "the bound holds: block " + std::to_string(block) + " records " + std::to_string(records));
-			check(d::turn_bound(d::turn_room(emitter.position(), block), block) <= emitter.position(), "the room inverts the bound");
+			const auto room = d::turn_room(emitter.position(), block);
+			check(!room || d::turn_bound(room, block) <= emitter.position(), "the room inverts the bound");
 			++turns;
 		}
 	}
@@ -372,17 +374,17 @@ void forget_from_sealer() {
 	j::TurnDriver driver(io, identity, options);
 	std::vector<std::uint64_t> calls;
 	auto alive = std::make_shared<bool>(true);
-	struct Sentinel { std::shared_ptr<bool> alive; ~Sentinel() { if (alive) { *alive = false; } } };
+	struct Sentinel { std::shared_ptr<bool> alive; explicit Sentinel(std::shared_ptr<bool> flag) : alive(std::move(flag)) {} ~Sentinel() { *alive = false; } };
 	bool alive_after = false, stage_refused = false;
-	driver.seal(1, [&, sentinel = std::make_shared<Sentinel>(Sentinel{alive})](std::uint64_t) -> std::optional<j::TurnRecord> {
+	driver.seal(1, [&, sentinel = std::make_shared<Sentinel>(alive)](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
 		calls.push_back(1);
 		driver.forget(2); driver.forget(1);
 		alive_after = *alive && sentinel->alive;
 		try { driver.stage(record(3, 2, 4)); } catch (const std::logic_error&) { stage_refused = true; }
 		return std::nullopt;
 	});
-	driver.seal(2, [&](std::uint64_t) -> std::optional<j::TurnRecord> { calls.push_back(2); return std::nullopt; });
-	driver.seal(4, [&](std::uint64_t) -> std::optional<j::TurnRecord> { calls.push_back(4); return std::nullopt; });
+	driver.seal(2, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { calls.push_back(2); return std::nullopt; });
+	driver.seal(4, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { calls.push_back(4); return std::nullopt; });
 	driver.stage(record(3, 1, 4));
 	driver.commit();
 	check(calls == std::vector<std::uint64_t>{1, 4}, "a sealer forgotten by an earlier one does not run in the same turn");
@@ -392,7 +394,7 @@ void forget_from_sealer() {
 	// A sealer that forgets its group and still returns a record breaks the contract.
 	jt::Disk other_disk; jt::MemoryIO other_io(other_disk);
 	j::TurnDriver other(other_io, identity, options);
-	other.seal(1, [&](std::uint64_t) { other.forget(1); return std::optional(record(1, 1, 4)); });
+	other.seal(1, [&](std::uint64_t, bool) { other.forget(1); return std::optional(record(1, 1, 4)); });
 	other.stage(record(3, 1, 4));
 	bool refused = false;
 	try { other.commit(); } catch (const std::logic_error&) { refused = true; }
@@ -406,14 +408,14 @@ void forget_threads() {
 	j::TurnDriver driver(io, identity, {256 * 1024, 4096, 1, 4, 64 * 1024});
 	struct Open { std::mutex mutex; std::string payload; std::uint64_t staged = 0, sequence = 0; };
 	Open opens[3];
-	std::atomic<bool> stop{false}, forgotten{false};
+	std::atomic<bool> stop{false}, forgotten{false}, quiet{false};
 	std::atomic<int> late{0};
 	for (std::uint64_t g : {1u, 2u}) {
-		driver.seal(g, [&, g](std::uint64_t budget) -> std::optional<j::TurnRecord> {
+		driver.seal(g, [&, g](std::uint64_t room, bool) -> std::optional<j::TurnRecord> {
 			if (g == 1 && forgotten.load(std::memory_order_acquire)) { late.fetch_add(1); }
 			auto& o = opens[g];
 			std::lock_guard hold(o.mutex);
-			if (o.payload.empty() || o.payload.size() > budget) { return std::nullopt; }
+			if (o.payload.empty() || d::record_cost(o.payload.size()) > room) { return std::nullopt; }
 			j::TurnRecord taken{g, o.sequence, j::TurnRecordKind::Batch, std::move(o.payload)};
 			o.payload.clear(); o.staged = o.sequence;
 			return taken;
@@ -423,6 +425,7 @@ void forget_threads() {
 		for (std::uint64_t n = 0; !stop.load(std::memory_order_acquire); ++n) {
 			auto& o = opens[n % 2 + 1];
 			std::lock_guard hold(o.mutex);
+			if (n % 2 == 0 && quiet.load(std::memory_order_acquire)) { continue; }  // group 1 stops writing, still locking
 			if (o.payload.empty()) { o.sequence = o.staged + 1; }  // the position, taken with the append
 			if (o.payload.size() < 500) { o.payload += static_cast<char>('a' + n % 26); }
 		}
@@ -432,6 +435,7 @@ void forget_threads() {
 	for (int turn = 0; turn < 400 && !done; ++turn) {
 		driver.stage(record(3, ++sequence, 4));
 		const auto& write = driver.begin();
+		if (turn == 200) { quiet.store(true, std::memory_order_release); }
 		if (turn >= 200 && !forgotten.load()) {
 			try { driver.forget(1); forgotten.store(true, std::memory_order_release); } catch (const std::logic_error&) {}
 		}
@@ -544,12 +548,104 @@ void supersede() {
 	other.stage(record(1, 2, 8, j::TurnRecordKind::Checkpoint)); other.commit();
 	check(!other.failed() && other.sequence(1) == 2, "a checkpoint with no covered sequence is admitted");
 }
+
+// A8. unseal() is keyed by its owner: a reopened index registers again, replacing the old
+// sealer, and the old index's unseal leaves the new one in place.
+void unseal_owner() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	driver.stage(record(1, 1, 4)); driver.commit();
+	int old_calls = 0, new_calls = 0, old_owner = 0, new_owner = 0;
+	check(driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { ++old_calls; return std::nullopt; }, &old_owner) == 1,
+		"seal returns the group's last staged sequence");
+	driver.stage(record(1, 2, 4));
+	check(driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { ++new_calls; return std::nullopt; }, &new_owner) == 2,
+		"a second registration replaces the first and counts what is pending");
+	driver.unseal(1, &old_owner);
+	driver.commit();
+	check(old_calls == 0 && new_calls == 1 && driver.sealed(1), "the old owner's unseal leaves the new sealer");
+	driver.unseal(1, &new_owner);
+	driver.stage(record(1, 3, 4)); driver.commit();
+	check(new_calls == 1 && !driver.sealed(1), "its own owner's unseal removes it");
+}
+// A8. The lock order is the turn, then the group's record mutex: a sealer runs under no lock
+// of the driver's, so it may hold its record mutex and call wake(), which asks for one more turn.
+void lock_order() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	std::mutex record_mutex;
+	int calls = 0;
+	driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+		std::lock_guard hold(record_mutex);
+		++calls;
+		if (calls == 1) { driver.wake(); }  // would deadlock if the driver held its wake lock here
+		return std::nullopt;
+	});
+	driver.wake();
+	check(!driver.idle(), "a wake makes the driver busy");
+	driver.commit();
+	check(calls == 1 && !driver.idle(), "a wake from inside a sealer asks for the next turn");
+	driver.commit();
+	check(calls == 2 && driver.idle(), "and is answered by it");
+}
+// A8, under TSan. A writer thread opens records under its mutex and calls wake() holding it,
+// the first transaction of each; run() on another thread's loop seals them with no waiter and
+// no staged record. Every record becomes durable, and no lock-order inversion is reported.
+void wake_threads() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, {256 * 1024, 4096, 1, 4, 64 * 1024});
+	struct Open { std::mutex mutex; std::string payload; std::uint64_t staged = 0, sequence = 0, opened = 0; } open;
+	driver.seal(1, [&](std::uint64_t room, bool) -> std::optional<j::TurnRecord> {
+		std::lock_guard hold(open.mutex);
+		if (open.payload.empty() || d::record_cost(open.payload.size()) > room) { return std::nullopt; }
+		j::TurnRecord taken{1, open.sequence, j::TurnRecordKind::Batch, std::move(open.payload)};
+		open.payload.clear(); open.staged = open.sequence;
+		return taken;
+	});
+	task::cancel_source stop;
+	std::atomic<bool> loop_done{false};
+	std::exception_ptr loop_error;
+	std::thread loop([&] {
+		task::blocking_scheduler scheduler;
+		j::InlineCompletion inline_io;
+		auto runner = [&]() -> task::task<void> {
+			try { co_await driver.run(j::completion_ref::of(inline_io), stop.token()); } catch (...) { loop_error = std::current_exception(); }
+			loop_done.store(true, std::memory_order_release);
+		};
+		task::spawn(task::scheduler_ref::of(scheduler), runner());
+		scheduler.drive([&] { return loop_done.load(std::memory_order_acquire); }, [] { return true; });
+	});
+	constexpr std::uint64_t records = 300;
+	std::thread writer([&] {
+		for (int n = 0;; ++n) {
+			std::lock_guard hold(open.mutex);
+			if (open.payload.empty()) {
+				if (open.opened == records) { break; }
+				open.sequence = open.staged + 1; ++open.opened;  // the position, taken with the first append
+				open.payload += 'a';
+				driver.wake();  // under the record mutex, as the consumer calls it
+				continue;
+			}
+			if (open.payload.size() < 64) { open.payload += static_cast<char>('a' + n % 26); }
+		}
+	});
+	writer.join();
+	for (;;) {
+		{ std::lock_guard hold(open.mutex); if (open.payload.empty() && open.staged == open.opened) { break; } }
+		std::this_thread::yield();
+	}
+	stop.request();
+	loop.join();
+	check(!loop_error, "run() ends cleanly");
+	check(driver.sequence(1) == open.opened && open.opened == records, "every woken record is durable (" + std::to_string(driver.sequence(1)) + " of " + std::to_string(open.opened) + ")");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"bound", bound},
 		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger}, {"supersede", supersede},
+{"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {
