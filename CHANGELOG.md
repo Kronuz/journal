@@ -13,8 +13,8 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 - `TurnDriver::seal(group, fn, owner)`: a group's sealer, `fn(room, first)`, returns at most one
   record per turn, its open record at the group's last staged sequence + 1, called after the
   turn's pending records and before encoding, so every group's record shares the turn's one write
-  and data barrier. Registering again replaces it; `unseal(group, owner)` removes it only for its
-  owner. `wake()`, from any thread, asks for a turn when an open record takes its first
+  and data barrier. Registering again replaces it; `unseal(group, owner)`, from any thread,
+  removes it only for its owner and returns once it is not running and never will be. `wake()`, from any thread, asks for a turn when an open record takes its first
   transaction; sealers run under no driver lock. The first
   sealed record of a turn may fill an empty segment; later ones share `segment_bytes / 2`, and a
   sealer the budget leaves out is called first next turn. A record out of sequence or past its
@@ -23,9 +23,11 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   change. `TurnLog::options()` and the turn bound (`turn_log_detail::turn_bound`, `turn_room`) are
   new too. [docs/mechanisms/turn-seal.md](docs/mechanisms/turn-seal.md) has the contract.
 
-- `TurnRecord::covers`: a checkpoint's covered sequence. `TurnLog::stage` and `append` refuse a
-  checkpoint that covers less than the record before it, which it would drop when it lands. Not
-  stored; unset, a checkpoint covers the record before it, so existing callers are unchanged.
+- `TurnRecord::covers`: a checkpoint's covered sequence, carried by every checkpoint record.
+  `TurnLog::stage` and `append` refuse a checkpoint that covers less than the record before it,
+  which it would drop when it lands; 0 (the default) covers nothing, so only a group's first
+  record may leave it unset. Not stored, so no format change. `Journal` sets it on each
+  checkpoint it stages; a caller building checkpoint records itself must set it too.
 
 ### Changed
 

@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -53,7 +54,7 @@ using Model = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
 j::TurnRecord record(std::uint64_t group, std::uint64_t sequence, std::size_t size, j::TurnRecordKind kind = j::TurnRecordKind::Batch) {
 	std::string payload(size, '\0');
 	for (std::size_t i = 0; i < size; ++i) { payload[i] = static_cast<char>('a' + (group * 7 + sequence * 3 + i) % 26); }
-	return {group, sequence, kind, payload};
+	return {group, sequence, kind, payload, sequence - 1};  // a checkpoint covers the records before it
 }
 void fold(Model& model, const std::vector<j::TurnRecord>& records) {
 	for (const auto& r : records) { if (r.kind == j::TurnRecordKind::Checkpoint) { model[r.group].clear(); } model[r.group].push_back(r); }
@@ -541,12 +542,15 @@ void supersede() {
 	driver.stage(checkpoint);
 	check(refusal([&] { driver.commit(); }) == "a checkpoint behind a record it would drop" && driver.failed() && driver.sequence(1) == 2,
 		"a driver's turn with the checkpoint fails unwritten");
-	// Unset, a checkpoint covers the record before it: existing callers are unchanged.
+	// The guard is unconditional: a checkpoint that does not say what it covers covers nothing,
+	// which only a group's first record may.
 	jt::Disk other_disk; jt::MemoryIO other_io(other_disk);
 	j::TurnDriver other(other_io, identity, options);
-	other.stage(record(1, 1, 8)); other.commit();
-	other.stage(record(1, 2, 8, j::TurnRecordKind::Checkpoint)); other.commit();
-	check(!other.failed() && other.sequence(1) == 2, "a checkpoint with no covered sequence is admitted");
+	other.stage({1, 1, j::TurnRecordKind::Checkpoint, "start"}); other.commit();
+	check(!other.failed() && other.sequence(1) == 1, "a group's first checkpoint needs no covered sequence");
+	other.stage(record(1, 2, 8)); other.commit();
+	other.stage({1, 3, j::TurnRecordKind::Checkpoint, "unstated"});
+	check(refusal([&] { other.commit(); }) == "a checkpoint behind a record it would drop" && other.failed(), "a later checkpoint that states no covered sequence is refused");
 }
 
 // A8. unseal() is keyed by its owner: a reopened index registers again, replacing the old
@@ -639,13 +643,65 @@ void wake_threads() {
 	check(!loop_error, "run() ends cleanly");
 	check(driver.sequence(1) == open.opened && open.opened == records, "every woken record is durable (" + std::to_string(driver.sequence(1)) + " of " + std::to_string(open.opened) + ")");
 }
+// R9, under TSan. unseal() from another thread while a turn calls the sealer returns only once
+// that call has finished; a record the call sealed is the group's; no call starts afterwards.
+void unseal_threads() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	int owner = 0;
+	std::atomic<bool> entered{false}, unsealing{false}, finished{false};
+	std::atomic<int> calls{0};
+	driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+		if (calls.fetch_add(1) == 0) {
+			entered.store(true, std::memory_order_release);
+			while (!unsealing.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));  // unseal waits meanwhile
+			finished.store(true, std::memory_order_release);
+			return record(1, 1, 8);
+		}
+		return std::nullopt;
+	}, &owner);
+	bool returned_after = false;
+	std::thread other([&] {
+		while (!entered.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+		unsealing.store(true, std::memory_order_release);
+		driver.unseal(1, &owner);
+		returned_after = finished.load(std::memory_order_acquire);
+	});
+	std::uint64_t sequence = 0;
+	driver.stage(record(2, ++sequence, 4));
+	driver.commit();
+	other.join();
+	check(returned_after, "unseal returns only once the running call has finished");
+	check(driver.sequence(1) == 1 && !driver.failed(), "the record sealed before unseal returned is durable");
+	driver.stage(record(2, ++sequence, 4)); driver.commit();
+	check(calls.load() == 1 && !driver.sealed(1), "the unsealed sealer is never called again");
+	// Rounds of turns on this thread while another thread unseals at a random moment: no call
+	// of a sealer starts once its unseal has returned.
+	std::atomic<int> late{0};
+	std::mt19937_64 random(7);
+	for (int round = 0; round < 200; ++round) {
+		int key = 0;
+		std::atomic<bool> gone{false};
+		driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+			if (gone.load(std::memory_order_acquire)) { late.fetch_add(1); }
+			std::this_thread::yield();
+			return std::nullopt;
+		}, &key);
+		const auto delay = std::chrono::microseconds(random() % 200);
+		std::thread unsealer([&] { std::this_thread::sleep_for(delay); driver.unseal(1, &key); gone.store(true, std::memory_order_release); });
+		for (int turn = 0; turn < 20; ++turn) { driver.stage(record(2, ++sequence, 4)); driver.commit(); }
+		unsealer.join();
+	}
+	check(late.load() == 0 && !driver.failed(), "no sealer call starts after its unseal returns (" + std::to_string(late.load()) + " late)");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"crash", crash}, {"sequence", sequence}, {"budget", budget}, {"full_size", full_size}, {"bound", bound},
 		{"forget_in_flight", forget_in_flight}, {"forget_from_sealer", forget_from_sealer}, {"forget_threads", forget_threads}, {"trigger", trigger}, {"supersede", supersede},
-{"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads},
+{"unseal_owner", unseal_owner}, {"lock_order", lock_order}, {"wake_threads", wake_threads}, {"unseal_threads", unseal_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {

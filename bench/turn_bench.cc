@@ -67,7 +67,7 @@ Result shared(const std::filesystem::path& dir, std::uint64_t groups, std::size_
 		// Each group checkpoints every 64 of its records, so segments go and recycle.
 		for (auto g : active(random, groups, percent)) {
 			auto sequence = log.sequence(g) + 1;
-			batch.push_back({g, sequence, sequence % 64 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint, payload});
+			batch.push_back({g, sequence, sequence % 64 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint, payload, sequence - 1});
 		}
 		const auto t0 = clock_type::now();
 		log.append(batch);

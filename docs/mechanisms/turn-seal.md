@@ -14,17 +14,19 @@ record, so the turn writes every group's work with one `pwrite` and one `File::s
 ```cpp
 using Sealer = std::function<std::optional<TurnRecord>(std::uint64_t room, bool first)>;
 std::uint64_t TurnDriver::seal(std::uint64_t group, Sealer fn, const void* owner = nullptr);
-void TurnDriver::unseal(std::uint64_t group, const void* owner) noexcept;
+void TurnDriver::unseal(std::uint64_t group, const void* owner) noexcept;  // any thread
 void TurnDriver::wake() noexcept;  // any thread
 ```
 
 - **When it runs.** `start()` (behind `begin()`, `commit()`, `run()` and the blocking entry) calls
   each registered sealer once, on the driver's loop, after the turn's pending records and before
   encoding. Its record joins the turn after them, so a checkpoint staged before it keeps its lower
-  sequence. The driver is loop-confined like the rest of `TurnDriver`: `seal`, `unseal`, `forget`
-  and the sealers all run on the loop's thread; only `wake()` may come from any thread.
+  sequence. The driver is loop-confined like the rest of `TurnDriver`: `seal`, `forget` and the
+  sealers run on the loop's thread; `unseal()` and `wake()` may come from any thread.
 - **Lock order: the turn, then the group's record mutex.** The turn is the loop's own context; the
   driver holds no lock of its own while a sealer runs, so a sealer takes its record mutex freely.
+  The sealer table has its own mutex, taken only around table reads and writes, never across a
+  call.
   `wake()` takes only a leaf lock that no sealer call runs under, so a writer may call it while it
   holds its record mutex. Nothing in the driver ever waits for a record mutex holder.
 - **What it gets.** `room` is what the turn has left in `turn_log_detail::record_cost` units, and
@@ -43,7 +45,12 @@ void TurnDriver::wake() noexcept;  // any thread
 - **One per group, keyed by its owner.** `seal` refuses group 0; registering a group again
   replaces its sealer and owner, as a reopened index does. `unseal(group, owner)` removes it only if
   `owner` registered it, so the old index's destructor leaves the reopened one's sealer in place.
-  `forget(group)` removes it whatever its owner. Neither lets a call start once it returns, including later in the turn being
+  Like a timer's cancel, `unseal` returns only once that sealer is not running and never will be:
+  from another thread it waits for a call in progress to finish, so a destroyed index's sealer
+  never runs; its caller must not hold a lock the sealer takes. A record that call returns was
+  sealed before `unseal` returned and is staged as the group's. From inside the sealer itself,
+  `unseal` returns at once. `forget(group)` removes it whatever its owner. Neither lets a call start
+  once it returns, including later in the turn being
   sealed when another sealer forgets the group. A sealer that forgets its own group finishes its
   call, because the driver holds its function for the call. `forget` still refuses a group with a
   record pending or in flight, and the sealer stays registered then.
@@ -52,12 +59,19 @@ void TurnDriver::wake() noexcept;  // any thread
 
 A checkpoint record drops every earlier record of its group when its barrier returns. One whose
 state covers less than the record before it would drop an acknowledged record (the document-gate
-review's F1, reproduced by its probe P1). `TurnRecord::covers` names a checkpoint's covered
-sequence, the group's last record its state includes, and `TurnLog::stage` (so `append`, the
-driver's turns, Journal, Host and strata standalone alike) refuses a checkpoint whose `covers` is
-below the record before it. `covers` is not stored and not compared; unset, a checkpoint covers
-the record before it, as every caller's did before. A group's first checkpoint in the log has no
-record before it, so the guard never refuses one.
+review's F1, reproduced by its probe P1). Every checkpoint record carries `TurnRecord::covers`,
+its covered sequence: the group's last record its state includes. `TurnLog::stage` (so `append`,
+the driver's turns, Journal, Host and strata standalone alike) refuses a checkpoint whose `covers`
+is below the record before it in its group, durable or earlier in the same turn, since that
+record would be acknowledged at the barrier that drops it. The guard is unconditional: `covers`
+defaults to 0, which covers nothing, so only a group's first record in the log may leave it
+unset. `covers` is not stored and not compared.
+
+The callers: `Journal` sets it to its last record when it publishes a checkpoint (its frontier
+must equal the covered sequence and no mutation may be pending, so every batch record is in it),
+to 0 for a new group's first record, and to the table's base when it restages a closed group's
+record. `Host`'s re-partition restages each group's first kept record, which starts the group in
+the new log. `Store` stages no checkpoint of its own.
 
 ## The budget
 
@@ -126,8 +140,9 @@ new call: its watcher awaits `durable` for the open record.
 | `full_size` | A record past half a segment seals as its turn's first record |
 | `bound` | The bound against the framing |
 | `forget_in_flight`, `forget_from_sealer`, `forget_threads` | `forget` with a turn in flight, from inside a sealer, and with a writer thread appending under the consumer's lock (TSan) |
-| `supersede` | The review's probe P1: a checkpoint at 3 covering only 1 is refused through `append` and through a driver's turn, and acknowledged record 2 survives recovery; an unset `covers` changes nothing |
+| `supersede` | The review's probe P1: a checkpoint at 3 covering only 1 is refused through `append` and through a driver's turn, and acknowledged record 2 survives recovery; a later checkpoint with no `covers` is refused, a group's first needs none |
 | `unseal_owner` | A second registration replaces the first; the first owner's `unseal` leaves it, its own removes it; `seal` returns the last staged sequence |
 | `lock_order` | A sealer holding its record mutex calls `wake()`, which asks for exactly one more turn |
 | `wake_threads` | Under TSan: a writer thread calls `wake()` under its record mutex at each record's first transaction; `run()` on another thread's loop makes every record durable with no waiter or staged record |
+| `unseal_threads` | Under TSan: `unseal` from another thread while a turn calls the sealer returns only after the call; its record is durable; across 200 racing rounds no call starts after `unseal` returns |
 | `trigger` | A waiter makes `run()` seal; a quiet sealer sleeps; a new waiter asks again; the entry reports a lost wake |

@@ -62,7 +62,7 @@ void checkpoint_record(std::string_view bytes) {
 		store.create(identity);
 		auto& turns = host.driver(0);
 		turns.commit();
-		turns.stage({1, 2, j::TurnRecordKind::Checkpoint, std::string(bytes)});
+		turns.stage({1, 2, j::TurnRecordKind::Checkpoint, std::string(bytes), 1});
 		turns.stage({1, 3, j::TurnRecordKind::Batch, "after"});
 		turns.commit();
 	}

@@ -66,7 +66,7 @@ using Model = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
 j::TurnRecord record(std::uint64_t group, std::uint64_t sequence, std::size_t size, j::TurnRecordKind kind = j::TurnRecordKind::Batch) {
 	std::string payload(size, '\0');
 	for (std::size_t i = 0; i < size; ++i) { payload[i] = static_cast<char>('a' + (group * 7 + sequence * 3 + i) % 26); }
-	return {group, sequence, kind, payload};
+	return {group, sequence, kind, payload, sequence - 1};  // a checkpoint covers the records before it
 }
 // Appends turns of random groups and sizes, keeping the model of what each group holds.
 std::uint64_t workload(j::TurnLog& log, Model& model, std::mt19937_64& random, unsigned turns, std::size_t largest) {

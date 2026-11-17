@@ -6,7 +6,7 @@
 set -eu
 case "$1" in
 	sequence) file=include/journal/turn_driver.h; old='if (record->sequence != found->second.staged + 1) {' ;;
-	covers) file=include/journal/turn_log.h; old='if (record.kind == TurnRecordKind::Checkpoint && record.covers && *record.covers < last) {' ;;
+	covers) file=include/journal/turn_log.h; old='if (record.kind == TurnRecordKind::Checkpoint && record.covers < last) {' ;;
 	*) echo "unknown mutant: $1" >&2; exit 2 ;;
 esac
 git checkout -- "$file" 2>/dev/null || true

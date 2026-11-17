@@ -444,7 +444,9 @@ private:
 			// Condition 25: the artifacts are sealed, so they and their names are durable.
 			auto operation = std::shared_ptr<CheckpointMutation>(new CheckpointMutation(owned_backend(), owner_, std::move(retained),
 				{owner_->mutation_identity, owner_->mutation_sequence + 1, 1}, CheckpointMutation::Turn{}));
-			turn_record_ = TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(next)};
+			// covered_sequence is the frontier and no mutation is pending, so every batch record is in it.
+			const auto covers = record_sequence_;
+			turn_record_ = TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(next), covers};
 			checkpoint_target_.emplace(std::move(target)); checkpoint_operation_ = operation; ++owner_->mutation_sequence; return operation;
 		}
 		auto backend = io_lifetime_ ? io_lifetime_ : std::shared_ptr<IO>(&io_, [](IO*) {});
@@ -567,7 +569,8 @@ private:
 			host_->create_group(group_);
 			owner_->lock = io_.acquire_owner(false);
 			frontier_ = Frontier{}; frontier_.identity = identity;
-			turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(frontier_)});
+			const auto covers = record_sequence_;  // the group's first record: nothing before it
+			turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(frontier_), covers});
 			ready_ = true;
 			return frontier_;
 		} catch (...) { owner_->failed = true; throw; }
@@ -590,8 +593,8 @@ private:
 				const auto* entry = host_->entry(group_);
 				owner_->lock = io_.acquire_owner(false);
 				restore_checkpoint(entry->manifest, restore);
-				record_sequence_ = entry->base;
-				turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, entry->manifest});
+				record_sequence_ = entry->base;  // the table's record covers through its base
+				turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
 				host_->attach(group_); ready_ = true;
 				return frontier_;
 			}

@@ -32,11 +32,13 @@
 #include "completion/seam.h"
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <vector>
 
 namespace kronuz::journal {
@@ -126,7 +128,13 @@ public:
 	// sealer of it runs once this returns. Nothing of it may be staged.
 	void forget(std::uint64_t group) {
 		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
-		if (auto found = sealers_.find(group); found != sealers_.end()) { if (found->second.owed) { --owed_; } sealers_.erase(found); }
+		{
+			std::lock_guard hold(sealers_mutex_);
+			if (auto found = sealers_.find(group); found != sealers_.end()) {
+				if (running_ && running_ == found->second.fn) { running_forgotten_ = true; }
+				drop(found);
+			}
+		}
 		log_.forget(group); recovered_.groups.erase(group);
 	}
 	// A group's sealer (docs/mechanisms/turn-seal.md). Each turn calls it once, on the loop and
@@ -139,26 +147,36 @@ public:
 	using Sealer = std::function<std::optional<TurnRecord>(std::uint64_t room, bool first)>;
 	// Registers the group's sealer for `owner`, replacing an earlier one; returns the group's
 	// last staged sequence, which its next record follows.
+	// On the loop.
 	std::uint64_t seal(std::uint64_t group, Sealer fn, const void* owner = nullptr) {
 		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
 		if (!fn) { throw std::invalid_argument("a sealer needs a function"); }
-		auto& sealing = sealers_[group];
-		sealing.fn = std::make_shared<Sealer>(std::move(fn)); sealing.owner = owner;
-		sealing.staged = last_staged(group); sealing.wanted = 0; sealing.quiet = false;
-		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { sealing.wanted = std::max(sealing.wanted, waiter->sequence); } }
-		mark(sealing);
-		if (owed_) { resume([](const detail::TurnWaiter& waiter) { return waiter.group == 0; }); }
-		return sealing.staged;
-	}
-	// Unregisters the group's sealer if `owner` registered it: a later registration survives an
-	// earlier owner's unseal. No call of it starts once this returns.
-	void unseal(std::uint64_t group, const void* owner) noexcept {
-		if (auto found = sealers_.find(group); found != sealers_.end() && found->second.owner == owner) {
-			if (found->second.owed) { --owed_; }
-			sealers_.erase(found);
+		std::uint64_t wanted = 0;
+		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { wanted = std::max(wanted, waiter->sequence); } }
+		const auto staged = last_staged(group);
+		{
+			std::lock_guard hold(sealers_mutex_);
+			auto& sealing = sealers_[group];
+			sealing.fn = std::make_shared<Sealer>(std::move(fn)); sealing.owner = owner;
+			sealing.staged = staged; sealing.wanted = wanted; sealing.quiet = false;
+			mark(sealing);
 		}
+		if (owed_.load(std::memory_order_acquire)) { resume([](const detail::TurnWaiter& waiter) { return waiter.group == 0; }); }
+		return staged;
 	}
-	bool sealed(std::uint64_t group) const { return sealers_.contains(group); }
+	// Any thread: unregisters the group's sealer if `owner` registered it, so a later
+	// registration survives an earlier owner's unseal. Returns once that sealer is not running
+	// and never will be, as a timer's cancel does: the caller must not hold a lock the sealer
+	// takes. From inside the sealer itself it returns at once and the call finishes.
+	void unseal(std::uint64_t group, const void* owner) noexcept {
+		std::unique_lock hold(sealers_mutex_);
+		auto found = sealers_.find(group);
+		if (found == sealers_.end() || found->second.owner != owner) { return; }
+		const auto fn = found->second.fn;
+		drop(found);
+		if (running_ == fn && running_thread_ != std::this_thread::get_id()) { sealer_done_.wait(hold, [&] { return running_ != fn; }); }
+	}
+	bool sealed(std::uint64_t group) const { std::lock_guard hold(sealers_mutex_); return sealers_.contains(group); }
 	// Any thread, under any lock: an open record took its first transaction, so the next turn
 	// seals it. Takes only a lock no sealer call runs under; reaches run() on its loop, and the
 	// blocking entry at its next pass.
@@ -186,13 +204,16 @@ public:
 		if (sealing_) { throw std::logic_error("a sealer cannot stage records"); }
 		const auto group = record.group, sequence = record.sequence;
 		pending_.push_back({std::move(record), std::move(operation), token});
-		if (auto found = sealers_.find(group); found != sealers_.end()) { found->second.staged = sequence; mark(found->second); }
+		{
+			std::lock_guard hold(sealers_mutex_);
+			if (auto found = sealers_.find(group); found != sealers_.end()) { found->second.staged = sequence; mark(found->second); }
+		}
 		resume([](const detail::TurnWaiter& waiter) { return waiter.group == 0; });
 		return sequence;
 	}
 	// Nothing waits for a turn: no record is pending, no sealer owes a waited-for record, and
 	// no wake() is unanswered.
-	bool idle() const noexcept { return pending_.empty() && !owed_ && !woken_.load(std::memory_order_acquire); }
+	bool idle() const noexcept { return pending_.empty() && !owed_.load(std::memory_order_acquire) && !woken_.load(std::memory_order_acquire); }
 	bool in_flight() const noexcept { return write_.has_value(); }
 
 	// Stages the pending records as one turn and submits their operations; the host writes
@@ -344,11 +365,15 @@ private:
 		if (waiters_) { waiters_->prev = &waiter; }
 		waiters_ = &waiter;
 		if (!waiter.group) { return; }
-		auto found = sealers_.find(waiter.group);
-		if (found == sealers_.end()) { return; }
-		found->second.quiet = false; found->second.wanted = std::max(found->second.wanted, waiter.sequence);
-		mark(found->second);
-		if (found->second.owed) { resume([](const detail::TurnWaiter& other) { return other.group == 0; }); }
+		bool owed = false;
+		{
+			std::lock_guard hold(sealers_mutex_);
+			auto found = sealers_.find(waiter.group);
+			if (found == sealers_.end()) { return; }
+			found->second.quiet = false; found->second.wanted = std::max(found->second.wanted, waiter.sequence);
+			mark(found->second); owed = found->second.owed;
+		}
+		if (owed) { resume([](const detail::TurnWaiter& other) { return other.group == 0; }); }
 	}
 	void unlink(detail::TurnWaiter& waiter) noexcept {
 		(waiter.prev ? waiter.prev->next : waiters_) = waiter.next;
@@ -381,46 +406,64 @@ private:
 	}
 	// Calls each sealer once, from the first one the last turn left waiting. The first sealed
 	// record may fill an empty segment (so a full-size record seals); later ones share
-	// segment_bytes / 2, and once that is spent the rest wait for the next turn.
+	// segment_bytes / 2, and once that is spent the rest wait for the next turn. A sealer runs
+	// with no lock of the driver's held; sealers_mutex_ guards only the table and running_.
 	void seal_turn() {
 		woken_.store(false, std::memory_order_release);  // a wake from here on asks for the next turn
-		if (sealers_.empty()) { return; }
 		const auto& options = log_.options();
 		const auto whole = turn_log_detail::turn_room(options.segment_bytes, options.block_bytes);
 		const auto half = turn_log_detail::turn_room(options.segment_bytes / 2, options.block_bytes);
 		std::uint64_t used = 0;
 		for (const auto& item : pending_) { used += turn_log_detail::record_cost(item.record.payload.size()); }
-		std::vector<std::uint64_t> order; order.reserve(sealers_.size());
-		for (auto it = sealers_.lower_bound(next_seal_); it != sealers_.end(); ++it) { order.push_back(it->first); }
-		for (auto it = sealers_.begin(); it != sealers_.end() && it->first < next_seal_; ++it) { order.push_back(it->first); }
+		std::vector<std::uint64_t> order;
+		{
+			std::lock_guard hold(sealers_mutex_);
+			if (sealers_.empty()) { return; }
+			order.reserve(sealers_.size());
+			for (auto it = sealers_.lower_bound(next_seal_); it != sealers_.end(); ++it) { order.push_back(it->first); }
+			for (auto it = sealers_.begin(); it != sealers_.end() && it->first < next_seal_; ++it) { order.push_back(it->first); }
+		}
 		struct Guard { bool& flag; explicit Guard(bool& value) : flag(value) { flag = true; } ~Guard() { flag = false; } } guard(sealing_);
-		std::optional<std::uint64_t> resume;
+		std::optional<std::uint64_t> resume_at;
 		bool first = true;
 		for (const auto group : order) {
+			std::shared_ptr<Sealer> fn;  // alive while it runs, even if its group is unsealed
+			std::uint64_t room = 0;
+			{
+				std::lock_guard hold(sealers_mutex_);
+				auto found = sealers_.find(group);
+				if (found == sealers_.end()) { continue; }  // unsealed or forgotten since the turn began
+				const auto limit = first ? whole : half;
+				room = limit > used ? limit - used : 0;
+				if (room < turn_log_detail::record_cost(0)) { resume_at = group; break; }
+				fn = found->second.fn; running_ = fn; running_thread_ = std::this_thread::get_id(); running_forgotten_ = false;
+			}
+			std::optional<TurnRecord> record;
+			try { record = (*fn)(room, first); }
+			catch (...) { std::lock_guard hold(sealers_mutex_); running_.reset(); sealer_done_.notify_all(); throw; }
+			std::unique_lock hold(sealers_mutex_);
+			running_.reset(); sealer_done_.notify_all();
 			auto found = sealers_.find(group);
-			if (found == sealers_.end()) { continue; }  // forgotten by an earlier sealer
-			const auto limit = first ? whole : half;
-			const auto room = limit > used ? limit - used : 0;
-			if (room < turn_log_detail::record_cost(0)) { resume = group; break; }
-			const auto fn = found->second.fn;  // alive while it runs, even if it forgets its group
-			auto record = (*fn)(room, first);
-			found = sealers_.find(group);
+			const bool same = found != sealers_.end() && found->second.fn == fn;
 			if (!record) {
-				if (found == sealers_.end()) { continue; }
 				// Nothing under the whole budget: quiet until a waiter asks again. Nothing under a
 				// share of it: called first next turn, when it may fill the segment.
-				if (first) { found->second.quiet = true; mark(found->second); } else if (!resume) { resume = group; }
+				if (same) { if (first) { found->second.quiet = true; mark(found->second); } else if (!resume_at) { resume_at = group; } }
 				continue;
 			}
-			if (found == sealers_.end()) { throw std::logic_error("a sealer returned a record for the group it forgot"); }
+			// A record sealed before an unseal returned is the group's; one whose group was
+			// forgotten during the call is not.
+			if (running_forgotten_) { throw std::logic_error("a sealer returned a record for the group it forgot"); }
 			if (record->group != group) { throw std::invalid_argument("a sealer returned another group's record"); }
-			if (record->sequence != found->second.staged + 1) { throw std::invalid_argument("sealed record out of its group's sequence"); }
+			const auto staged = found != sealers_.end() ? found->second.staged : last_staged(group);
+			if (record->sequence != staged + 1) { throw std::invalid_argument("sealed record out of its group's sequence"); }
 			if (turn_log_detail::record_cost(record->payload.size()) > room) { throw std::invalid_argument("sealed record past its room"); }
 			used += turn_log_detail::record_cost(record->payload.size()); first = false;
-			found->second.staged = record->sequence; mark(found->second);
+			if (found != sealers_.end()) { found->second.staged = record->sequence; mark(found->second); }
+			hold.unlock();
 			pending_.push_back({std::move(*record), {}, {}});
 		}
-		if (resume) { next_seal_ = *resume; }
+		if (resume_at) { next_seal_ = *resume_at; }
 	}
 	std::uint64_t last_staged(std::uint64_t group) const {
 		auto of = [group](const auto& item) { return item.record.group == group; };
@@ -433,9 +476,14 @@ private:
 	struct Sealing { std::shared_ptr<Sealer> fn; const void* owner = nullptr; std::uint64_t staged = 0, wanted = 0; bool quiet = false, owed = false; };
 	// On the loop, after a wake() from any thread: resumes run() if it sleeps.
 	static void woken(void* self) { static_cast<TurnDriver*>(self)->resume([](const detail::TurnWaiter& waiter) { return waiter.group == 0; }); }
+	// Under sealers_mutex_.
 	void mark(Sealing& sealing) noexcept {
 		const bool owed = !sealing.quiet && sealing.wanted > sealing.staged;
-		if (owed != sealing.owed) { sealing.owed = owed; owed ? ++owed_ : --owed_; }
+		if (owed != sealing.owed) { sealing.owed = owed; owed ? owed_.fetch_add(1, std::memory_order_acq_rel) : owed_.fetch_sub(1, std::memory_order_acq_rel); }
+	}
+	void drop(std::map<std::uint64_t, Sealing>::iterator found) noexcept {
+		if (found->second.owed) { owed_.fetch_sub(1, std::memory_order_acq_rel); }
+		sealers_.erase(found);
 	}
 
 	struct Pending { TurnRecord record; std::shared_ptr<IOOperation> operation; MutationToken token; bool submitted = false; };
@@ -463,8 +511,13 @@ private:
 	TurnRecovery recovered_;
 	TurnLog log_;
 	std::vector<Pending> pending_, flight_;
+	mutable std::mutex sealers_mutex_;  // the sealer table and running_; never held while a sealer runs
+	std::condition_variable sealer_done_;  // a sealer call finished
 	std::map<std::uint64_t, Sealing> sealers_;
-	std::size_t owed_ = 0;
+	std::shared_ptr<Sealer> running_;  // the sealer being called, on running_thread_
+	std::thread::id running_thread_;
+	bool running_forgotten_ = false;  // its group was forgotten during the call
+	std::atomic<std::size_t> owed_{0};
 	std::uint64_t next_seal_ = 0;
 	bool sealing_ = false;
 	std::atomic<bool> woken_{false};

@@ -93,7 +93,7 @@ Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& v
 				const auto kind = round == 2 && g % 3 == 0 ? j::TurnRecordKind::Checkpoint : j::TurnRecordKind::Batch;
 				auto payload = "group-" + std::to_string(g) + "-round-" + std::to_string(round) + std::string(g % 40, '.');
 				if (round == 0 && victim(g)) { payload += std::string(2400, marker(g)[0]); }
-				j::TurnRecord record{g, records.back().sequence + 1, kind, payload};
+				j::TurnRecord record{g, records.back().sequence + 1, kind, payload, records.back().sequence};
 				host->driver_of(g).stage(record);
 				if (kind == j::TurnRecordKind::Checkpoint) { records.clear(); }
 				records.push_back(record);
