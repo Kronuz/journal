@@ -18,6 +18,12 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   declares no `post_call`, where `wake()` reaches it, so a wake is never refused while `run()`
   serves. A `wake()` from another thread needs that `post_call` to be thread-safe (task's
   `asio_scheduler` and `blocking_scheduler`; not `inline_scheduler`).
+- `TurnDriver::forget` (behind `Host::close_group`) fails every `durable()` waiter of the group
+  with the new `group_closed`, whose record is never written, and retires the group's sequences
+  through its durable sequence + 1 and every waited one (`TurnDriver::retired`): a `durable()` at
+  or below them fails with `group_closed`, `stage()` refuses a record there, and `Journal` reopens
+  the group after them. A close with a sealed open record in flight no longer acknowledges it
+  at the reopen.
 
 ## 2026-11-16
 

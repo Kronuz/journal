@@ -25,11 +25,14 @@
 // name with no directory scan; a closed group reopened from the group table after retention
 // recycled every segment that held it; a group whose first turn was lost created again as a new
 // incarnation; a failed close that leaves the group open; a close behind an acknowledged record
-// refused; a second recovery on one host refused; and one owner lock, the directory's own.
+// refused; a close with a sealed open record in flight fails its wait, never acknowledging it,
+// under power loss too; a second recovery on one host refused; and one owner lock, the
+// directory's own.
 // `host_test [case]` runs one case.
 #include "journal/memory_io.h"
 #include "journal/store.h"
 #include <cerrno>
+#include <algorithm>
 #include <iostream>
 #include <set>
 
@@ -345,6 +348,154 @@ void close_behind() {
 	check(node.recovered[7].bundle == "closing" && node.recovered[7].batches.empty(), "the closed group recovers its last checkpoint");
 }
 
+// A writer's wait on group 7's sealed open record, as a turn-seal consumer's: the record joins
+// the group's next turn unless the group closes first.
+struct Writer {
+	j::TurnDriver& turns;
+	std::optional<j::TurnRecord> open;
+	std::vector<std::string> acknowledged;  // in the order their waits completed
+	std::vector<std::string> closed;  // whose waits failed with group_closed
+	std::vector<std::string> errors;  // any other failure
+	j::TurnDriver::Sealer sealer() { return [this](std::uint64_t, bool) { return std::exchange(open, std::nullopt); }; }
+	task::task<void> wait(std::uint64_t sequence, std::string batch) {
+		try { co_await turns.durable(7, sequence); acknowledged.push_back(std::move(batch)); }
+		catch (const j::group_closed& error) { closed.push_back(std::move(batch)); errors.emplace_back(error.what()); }
+		catch (const std::exception& error) { errors.emplace_back(error.what()); }
+	}
+};
+// The reopened group's checkpoint record, as Journal stages it: after the table's base and
+// after every sequence the closed incarnation retired.
+void restage(j::Host& host, std::uint64_t group, const std::string& manifest) {
+	auto& turns = host.driver_of(group);
+	const auto base = host.entry(group)->base;
+	turns.stage({group, std::max(base, turns.retired(group)) + 1, j::TurnRecordKind::Checkpoint, manifest, base});
+}
+
+// The durability review's F1: a writer's transaction sits in group 7's sealed open record
+// (sequence 2), its wait linked, when the group closes at its durable sequence. The close fails
+// the wait with group_closed. The reopened group's records follow the retired sequence 2, so
+// neither its checkpoint record nor a later wait for 2 acknowledges the dropped record, and
+// recovery has no trace of it.
+void sealer_close() {
+	jt::Disk disk;
+	{
+		Node node(disk);
+		auto& host = *node.host;
+		auto& turns = node.turns(7);
+		host.create_group(7);
+		turns.stage({7, 1, j::TurnRecordKind::Checkpoint, "m1", 0}); turns.commit();
+		Writer writer{turns};
+		writer.open = j::TurnRecord{7, 2, j::TurnRecordKind::Batch, "t1", 0};
+		turns.seal(7, writer.sealer(), &writer);
+		turns.wake();
+		task::inline_scheduler loop;
+		task::spawn(task::scheduler_ref::of(loop), writer.wait(2, "t1")); loop.run();
+		check(writer.acknowledged.empty() && writer.errors.empty(), "the writer waits for its open record (sequence 2)");
+		host.close_group(7, turns.sequence(7), "m1"); loop.run();
+		check(writer.closed == std::vector<std::string>{"t1"} && writer.errors == std::vector<std::string>{"the group closed before record 2 was durable"},
+			"the close fails the writer's wait with group_closed");
+		check(writer.acknowledged.empty() && turns.retired(7) == 2, "the close acknowledges nothing and retires sequence 2");
+		host.reopen_group(7);
+		bool reused = false;
+		try { turns.stage({7, 2, j::TurnRecordKind::Checkpoint, "m1", 1}); } catch (const std::logic_error&) { reused = true; }
+		check(reused, "a record at the retired sequence 2 is refused");
+		if (reused) { restage(host, 7, "m1"); }
+		turns.commit(); loop.run();
+		check(writer.acknowledged.empty(), "the reopen checkpoint does not acknowledge the dropped open record");
+		task::spawn(task::scheduler_ref::of(loop), writer.wait(2, "late")); loop.run();
+		check(writer.acknowledged.empty() && writer.closed == std::vector<std::string>{"t1", "late"}, "a later wait for sequence 2 fails with group_closed");
+	}
+	Node node(disk);
+	const auto& records = node.turns(7).records(7);
+	check(records.size() == 1 && records[0].sequence == 3 && records[0].payload == "m1", "recovery holds the reopen checkpoint record, after the retired sequence");
+	for (const auto& record : records) { check(record.payload != "t1", "the dropped open record is nowhere"); }
+}
+
+// The comma-joined batches a test checkpoint names, and back.
+std::string join(const std::vector<std::string>& batches) {
+	std::string text;
+	for (const auto& batch : batches) { text += (text.empty() ? "" : ",") + batch; }
+	return text;
+}
+std::vector<std::string> split(std::string_view text) {
+	std::vector<std::string> batches;
+	while (!text.empty()) { const auto comma = text.find(','); batches.emplace_back(text.substr(0, comma)); text.remove_prefix(comma == text.npos ? text.size() : comma + 1); }
+	return batches;
+}
+bool prefix(const std::vector<std::string>& shorter, const std::vector<std::string>& longer) {
+	return shorter.size() <= longer.size() && std::equal(shorter.begin(), shorter.end(), longer.begin());
+}
+// F1 under power loss: group 7's writer appends a batch to the sealed open record and waits; each
+// round either commits it or closes the group at its durable sequence with the open record in
+// flight, then reopens it from the table. Power is cut at every I/O operation: recovery holds
+// every acknowledged batch, at most the one in flight besides, and never a closed one.
+bool sealer_close_run(std::uint64_t cut) {
+	jt::Disk disk;
+	task::inline_scheduler loop;
+	std::optional<Node> node;
+	std::optional<Writer> writer;
+	std::string flight;
+	bool reached = false;
+	const auto at = "cut " + std::to_string(cut);
+	try {
+		disk.cut = cut;
+		node.emplace(disk);
+		auto& host = *node->host;
+		auto& turns = node->turns(7);
+		writer.emplace(Writer{turns});
+		host.create_group(7);
+		turns.stage({7, 1, j::TurnRecordKind::Checkpoint, "", 0}); turns.commit();
+		auto staged = turns.seal(7, writer->sealer(), &*writer);
+		for (unsigned round = 0; round < 9; ++round) {
+			const auto batch = "b" + std::to_string(round);
+			writer->open = j::TurnRecord{7, staged + 1, j::TurnRecordKind::Batch, batch, 0}; turns.wake();
+			task::spawn(task::scheduler_ref::of(loop), writer->wait(staged + 1, batch)); loop.run();
+			if (round % 3 == 1) {
+				host.close_group(7, turns.sequence(7), join(writer->acknowledged)); loop.run();
+				check(writer->closed.size() == round / 3 + 1 && writer->closed.back() == batch, "the close fails the open record's wait: " + at);
+				writer->open.reset();
+				host.reopen_group(7); restage(host, 7, host.entry(7)->manifest); turns.commit(); loop.run();
+				staged = turns.seal(7, writer->sealer(), &*writer);
+			} else {
+				flight = batch; turns.commit(); loop.run(); flight.clear();
+				check(!writer->acknowledged.empty() && writer->acknowledged.back() == batch, "the committed open record is acknowledged: " + at);
+				staged = turns.sequence(7);
+			}
+		}
+		reached = true;
+	} catch (const jt::PowerLoss&) {
+	} catch (const std::exception& error) { check(false, "the run threw " + std::string(error.what()) + ": " + at); }
+	if (node) { node->turns(7).failed(std::make_exception_ptr(std::runtime_error("power lost"))); }
+	loop.run();
+	const auto acknowledged = writer ? writer->acknowledged : std::vector<std::string>{};
+	const auto closed = writer ? writer->closed : std::vector<std::string>{};
+	auto possible = acknowledged; if (!flight.empty()) { possible.push_back(flight); }
+	writer.reset(); node.reset();
+	disk.power_loss();
+	try {
+		Node again(disk);
+		std::vector<std::string> state;
+		if (again.host->status(7) != j::GroupStatus::none) {
+			auto& turns = again.turns(7);
+			if (!turns.has_group(7)) { state = split(again.host->entry(7)->manifest); }
+			else {
+				const auto& records = turns.records(7);
+				check(!records.empty() && records.front().kind == j::TurnRecordKind::Checkpoint, "the group's records start at its checkpoint: " + at);
+				state = split(records.front().payload);
+				for (std::size_t i = 1; i < records.size(); ++i) { state.push_back(records[i].payload); }
+			}
+		}
+		check(prefix(acknowledged, state) && prefix(state, possible), "recovery keeps every acknowledged batch and at most the one in flight: " + at + ", recovered [" + join(state) + "], acknowledged [" + join(acknowledged) + "]");
+		for (const auto& batch : closed) { check(std::find(state.begin(), state.end(), batch) == state.end(), "a batch whose wait the close failed is never recovered: " + at); }
+	} catch (const std::exception& error) { check(false, "recovery threw " + std::string(error.what()) + ": " + at); }
+	return reached;
+}
+void sealer_close_crash() {
+	std::uint64_t cut = 1;
+	while (!sealer_close_run(cut)) { ++cut; }
+	std::cout << "sealer_close_crash: " << cut << " cuts\n";
+}
+
 // A group closed, reopened from the table, then recovered by a second Store of the same host:
 // its state is in the log, not the table, so the recovery is refused; its loop keeps running,
 // and the reopened host recovers the group's latest state.
@@ -397,7 +548,8 @@ int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
-		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"close_behind", close_behind}, {"second_recovery", second_recovery}, {"lock", lock}};
+		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"close_behind", close_behind},
+		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

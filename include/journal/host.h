@@ -319,7 +319,8 @@ public:
 	// The table takes the group's last record, a checkpoint covering every batch; once that is
 	// durable the log forgets the group, so retention reclaims its records. As TurnLog's
 	// checkpoint guard does, it refuses a sequence below the group's last acknowledged record,
-	// in the log or the table, whose records the forget would drop.
+	// in the log or the table, whose records the forget would drop. The forget fails the
+	// group's durable() waiters with group_closed (TurnDriver::forget).
 	void close_group(std::uint64_t group, std::uint64_t sequence, std::string manifest) {
 		const auto base = held(group, GroupState::open).base;
 		auto& turns = driver_of(group);

@@ -55,9 +55,13 @@ it; a failed write restores the entry in memory, so the table there never runs a
   with its records live. `Host::close_group` refuses a `base` below the group's last
   acknowledged record, the log's durable sequence or the table's earlier `base`, since the
   forget would drop the records after it: the rule TurnLog's checkpoint guard applies to a
-  checkpoint's `covers`. Nothing is written, and the group stays open.
+  checkpoint's `covers`. Nothing is written, and the group stays open. The forget fails every
+  `durable()` waiter of the group with `group_closed`, since a record not yet durable, such as a
+  sealer's open record, is never written, and retires the sequences such a waiter could hold
+  (`TurnDriver::retired`): through the durable sequence + 1 and every waited one.
 - **Reopen.** The table flips the entry to open, then the journal restores the frontier from
-  the table's record and stages it again as the group's record `base + 1`. No turn log is read.
+  the table's record and stages it again as the group's record `max(base, retired) + 1`, so no
+  sequence of the closed incarnation is reused in this process. No turn log is read.
   `TurnLog` ignores a group's records through its `base` (`TurnLogGroups::base`), so a log that
   still holds records from before the close never costs the group, and a crash between the flip
   and that record's barrier leaves the table's record authoritative. The table's record serves

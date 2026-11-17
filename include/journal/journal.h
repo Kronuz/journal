@@ -593,7 +593,8 @@ private:
 				const auto* entry = host_->entry(group_);
 				owner_->lock = io_.acquire_owner(false);
 				restore_checkpoint(entry->manifest, restore);
-				record_sequence_ = entry->base;  // the table's record covers through its base
+				// The table's record covers through its base; it follows what the closed incarnation retired.
+				record_sequence_ = std::max(entry->base, turns_->retired(group_));
 				turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
 				host_->attach(group_); ready_ = true;
 				return frontier_;

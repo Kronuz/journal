@@ -34,6 +34,7 @@
 #include <deque>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <random>
 
 namespace j = kronuz::journal;
@@ -67,6 +68,8 @@ std::vector<std::string> decode(std::string_view bytes) {
 struct Group {
 	std::unique_ptr<j::Store> store;
 	std::vector<std::string> attempted, acknowledged;  // every batch staged; those completed
+	// The record a reopen staged, its sequence and manifest, while no publication followed it.
+	std::optional<std::pair<std::uint64_t, std::string>> restaged;
 };
 
 bool tasks = false;  // drive the rounds through the coroutine drivers
@@ -122,14 +125,28 @@ struct Node {
 	}
 
 	// A group whose checkpoint covers every batch closes into the host's table and reopens from
-	// it, staging that record again as its first. A close below that record is refused first,
-	// writing nothing, so every crash point also follows a refused close.
+	// it, staging that record again as its first.
 	void cycle(std::uint64_t g) {
+		groups[g].store->close();
+		reopen(g);
+	}
+	// A close at a reopened group's record, with batches acknowledged after it, is refused and
+	// writes nothing, so every crash point also follows a refused close. One taken instead
+	// reopens the group from that record, without those batches.
+	void stale_close(std::uint64_t g) {
 		auto& group = groups[g];
+		if (!group.restaged || driver->sequence(g) <= group.restaged->first) { return; }
 		bool refused = false;
-		try { host->close_group(g, driver->sequence(g) - 1, "stale"); } catch (const std::logic_error&) { refused = true; }
-		check(refused, "a close behind the group's last acknowledged record is refused");
-		group.store->close();
+		try { host->close_group(g, group.restaged->first, group.restaged->second); } catch (const std::logic_error&) { refused = true; }
+		check(refused, "a close behind the group's acknowledged batches is refused");
+		if (refused) { return; }
+		group.store.reset();
+		const auto recovered = reopen(g);
+		group.acknowledged = recovered; group.attempted = recovered;
+	}
+	// Recovers the closed group from the table into a new Store: what it holds.
+	std::vector<std::string> reopen(std::uint64_t g) {
+		auto& group = groups[g];
 		group.store = std::make_unique<j::Store>(*host, g, limits);
 		std::vector<std::string> recovered;
 		group.store->recover([&](std::uint64_t, std::string_view) { check(false, "a closed group replays no batch"); },
@@ -142,6 +159,8 @@ struct Node {
 		while (!driver->idle()) { driver->commit(); }
 		while (!group.store->inventory_step(64).complete) {}
 		++reopened;
+		group.restaged.emplace(driver->sequence(g), host->entry(g)->manifest);
+		return recovered;
 	}
 	// Every append that reported success is acknowledged, whenever power is lost after.
 	void collect() {
@@ -190,8 +209,9 @@ struct Node {
 		collect();
 		for (auto& [g, publication] : publications) {
 			check(publication->done(), "a publication completes at its turn's barrier");
-			publication->result(); ++published;
+			publication->result(); ++published; groups[g].restaged.reset();
 		}
+		for (auto& [g, group] : groups) { stale_close(g); }
 		for (auto& [g, publication] : publications) { if (random() % 2 == 0) { cycle(g); } }
 		for (auto& [g, group] : groups) { if (random() % 4 == 0) { reclaimed += group.store->reclaim_step(16).removed; } }
 	}
@@ -243,9 +263,10 @@ struct Node {
 		for (auto& call : publications) {
 			check(call.done, "a publication completes at its turn's barrier");
 			if (call.error) { fail(call.error); }
-			++published;
+			++published; groups[call.group].restaged.reset();
 		}
 		collect();
+		for (auto& [g, group] : groups) { stale_close(g); }
 		for (auto& call : publications) { if (random() % 2 == 0) { cycle(call.group); } }
 		for (auto& [g, group] : groups) {
 			if (random() % 4 != 0) { continue; }

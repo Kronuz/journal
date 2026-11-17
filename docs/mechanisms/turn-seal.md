@@ -1,4 +1,4 @@
-> Status: CURRENT (2026-11-16) how `TurnDriver::seal` in `include/journal/turn_driver.h` works.
+> Status: CURRENT (2026-11-17) how `TurnDriver::seal` in `include/journal/turn_driver.h` works.
 > Consumer: strata `docs/design/standalone-turn-log.md` revision 1 (D3, D4, D5; review R3), at
 > strata:8e919415, and the shim it replaces, strata:efe25bcd `include/strata/core/turn_seal.hh`.
 > Format: `RFTW0001`, unchanged.
@@ -60,6 +60,13 @@ void TurnDriver::wake() noexcept;  // any thread
   sealed when another sealer forgets the group. A sealer that forgets its own group finishes its
   call, because the driver holds its function for the call. `forget` still refuses a group with a
   record pending or in flight, and the sealer stays registered then.
+- **Closing drops the open record.** `forget` (a group's close) drops its open record unwritten,
+  so it fails every `durable()` waiter of the group with `group_closed`, never as acknowledged.
+  It retires the sequences such a waiter could hold, the durable sequence + 1 and every waited
+  one (`retired(group)`): a later `durable()` at or below them fails with `group_closed`, `stage()`
+  refuses a record there, `seal()` returns at least them, and `Journal` stages a reopened group's
+  record after them. A writer that took the open record's sequence before the close and waits
+  after it, or after the reopen, is refused, never answered by the reopened group's records.
 
 ## The checkpoint guard
 
@@ -156,6 +163,8 @@ new call: its watcher awaits `durable` for the open record.
 | `lock_order` | A sealer holding its record mutex calls `wake()`, which asks for exactly one more turn |
 | `wake_threads` | Under TSan: a writer thread calls `wake()` under its record mutex at each record's first transaction; `run()` on another thread's loop makes every record durable with no waiter or staged record |
 | `wake_refused` | `run()` on a scheduler that declares no `post_call` throws before it holds the driver; the wake it could not carry stays asked for, and `run()` on a loop with `post_call` seals it |
+| host_test `sealer_close` | The durability review's F1 probe: a close at the durable sequence with a sealed open record and its waiter fails the wait with `group_closed`; a record at the retired sequence is refused; neither the reopen checkpoint nor a later wait for that sequence acknowledges it; recovery has no trace of it |
+| host_test `sealer_close_crash` | Power cut at every I/O operation of rounds that commit the open record or close the group with it in flight and reopen: recovery keeps every acknowledged batch, at most the one in flight, and never a closed one |
 | `wake_after_run` | Under ASan: a wake still queued when `run()` returns reaches nothing once the owner destroys the driver on the loop |
 | `unseal_threads` | Under TSan: `unseal` from another thread while a turn calls the sealer returns only after the call; its record is durable; across 200 racing rounds no call starts after `unseal` returns; after the sealer forgets its group or re-seals it for another owner, the original owner's `unseal` still waits for the call |
 | `trigger` | A waiter makes `run()` seal; a quiet sealer sleeps; a new waiter asks again; the entry reports a lost wake |

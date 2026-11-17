@@ -46,6 +46,14 @@ namespace kronuz::journal {
 
 class TurnDriver;
 
+// A durable() wait whose group closed (TurnDriver::forget) before its record was durable: the
+// record is never written, so it is never acknowledged.
+struct group_closed : std::runtime_error {
+	group_closed(std::uint64_t closed, std::uint64_t record)
+		: std::runtime_error("the group closed before record " + std::to_string(record) + " was durable"), group(closed), sequence(record) {}
+	std::uint64_t group, sequence;
+};
+
 // A turn's write and data barrier as one operation, for a completion driver: Write, then
 // SyncData, on the Turn lane. The file belongs to the log, which keeps it while the turn is in flight.
 class TurnBarrier final : public IOOperation {
@@ -94,7 +102,7 @@ namespace detail {
 // callback, on any thread, claims it and hops to the loop (post_call), which unlinks it before
 // the resume. Only the claim's winner resumes the caller.
 struct TurnWaiter {
-	enum : int { linked = 0, completed = 1, cancelled = 2 };
+	enum : int { linked = 0, completed = 1, cancelled = 2, closed = 3 };
 	bool claim(int outcome) noexcept { int expected = linked; return state.compare_exchange_strong(expected, outcome, std::memory_order_acq_rel); }
 	std::atomic<int> state{linked};
 	std::coroutine_handle<> handle;
@@ -126,9 +134,14 @@ public:
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
 	// A closed group leaves the log (TurnLog::forget) and its sealer is unregistered: no
-	// sealer of it runs once this returns. Nothing of it may be staged.
+	// sealer of it runs once this returns. Nothing of it may be staged. Every durable() waiter
+	// of the group fails with group_closed, and the sequences it could hold are retired.
 	void forget(std::uint64_t group) {
 		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
+		auto& floor = retired_[group];
+		floor = std::max(floor, log_.sequence(group) + 1);  // the open record a writer may hold
+		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { floor = std::max(floor, waiter->sequence); } }
+		resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);
 		{
 			std::lock_guard hold(sealers_mutex_);
 			if (auto found = sealers_.find(group); found != sealers_.end()) {
@@ -198,6 +211,9 @@ public:
 	bool holds(std::uint64_t group) const { return log_.sequence(group) || staged(group); }
 	// The group's last durable record sequence, 0 for none.
 	std::uint64_t sequence(std::uint64_t group) const { return log_.sequence(group); }
+	// The last sequence an earlier incarnation of the group could hand out, 0 for none: a
+	// reopened group's records follow it, and a durable() at or below it fails with group_closed.
+	std::uint64_t retired(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
 	bool failed() const noexcept { return log_failed_; }
 
 	// Stages a record for the next turn; its operation, if any, completes at that turn's
@@ -207,6 +223,7 @@ public:
 		if (log_failed_) { throw std::logic_error("turn driver failed"); }
 		if (sealing_) { throw std::logic_error("a sealer cannot stage records"); }
 		const auto group = record.group, sequence = record.sequence;
+		if (sequence <= retired(group)) { throw std::logic_error("a record reuses a sequence its group's closed incarnation retired"); }
 		pending_.push_back({std::move(record), std::move(operation), token});
 		{
 			std::lock_guard hold(sealers_mutex_);
@@ -300,8 +317,9 @@ public:
 		}
 	}
 	// Resumes once the group's records through `sequence` are durable. Throws the turn
-	// driver's failure, or task::cancelled when `token` is requested first; a cancelled wait
-	// leaves its record staged, written with its turn.
+	// driver's failure, group_closed when the group closes first or `sequence` is retired, or
+	// task::cancelled when `token` is requested first; a cancelled wait leaves its record
+	// staged, written with its turn.
 	task::task<void> durable(std::uint64_t group, std::uint64_t sequence, task::cancel_token token = {}) {
 		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
 		co_await Wait(*this, group, sequence, token);
@@ -343,7 +361,10 @@ private:
 			callback.reset();  // waits for a callback running on another thread
 			if (waiter.owner) { waiter.owner->unlink(waiter); }
 		}
-		bool await_ready() const noexcept { return token.requested() || turns.satisfied(waiter); }
+		bool await_ready() noexcept {
+			if (waiter.group && waiter.sequence <= turns.retired(waiter.group)) { waiter.state.store(detail::TurnWaiter::closed, std::memory_order_relaxed); return true; }
+			return token.requested() || turns.satisfied(waiter);
+		}
 		void await_suspend(std::coroutine_handle<> handle) {
 			waiter.handle = handle; waiter.home = task::current();
 			if (!waiter.home) { throw std::logic_error("waiting on a turn driver needs a running scheduler"); }
@@ -351,7 +372,9 @@ private:
 			callback.emplace(token, Cancel{&waiter});
 		}
 		void await_resume() {
-			if (waiter.state.load(std::memory_order_acquire) == detail::TurnWaiter::cancelled || (token.requested() && !turns.satisfied(waiter))) { throw task::cancelled{}; }
+			const auto state = waiter.state.load(std::memory_order_acquire);
+			if (state == detail::TurnWaiter::closed) { throw group_closed(waiter.group, waiter.sequence); }
+			if (state == detail::TurnWaiter::cancelled || (token.requested() && !turns.satisfied(waiter))) { throw task::cancelled{}; }
 			if (waiter.group && turns.log_failed_) { std::rethrow_exception(turns.failure_); }
 		}
 		struct Cancel {
@@ -397,13 +420,13 @@ private:
 		if (waiter.next) { waiter.next->prev = waiter.prev; }
 		waiter.owner = nullptr; waiter.prev = waiter.next = nullptr;
 	}
-	// Unlinks every waiter `ready` accepts, then resumes those whose claim it wins.
-	template <class Ready> void resume(Ready ready) noexcept {
+	// Unlinks every waiter `ready` accepts, then resumes those whose claim of `outcome` wins.
+	template <class Ready> void resume(Ready ready, int outcome = detail::TurnWaiter::completed) noexcept {
 		for (auto* waiter = waiters_; waiter;) {
 			auto* next = waiter->next;
 			if (ready(*waiter)) {
 				unlink(*waiter);
-				if (waiter->claim(detail::TurnWaiter::completed)) { waiter->home.post(waiter->handle); }
+				if (waiter->claim(outcome)) { waiter->home.post(waiter->handle); }
 			}
 			waiter = next;
 		}
@@ -487,7 +510,7 @@ private:
 		auto of = [group](const auto& item) { return item.record.group == group; };
 		if (auto found = std::find_if(pending_.rbegin(), pending_.rend(), of); found != pending_.rend()) { return found->record.sequence; }
 		if (auto found = std::find_if(flight_.rbegin(), flight_.rend(), of); found != flight_.rend()) { return found->record.sequence; }
-		return log_.sequence(group);
+		return std::max(log_.sequence(group), retired(group));
 	}
 	// A sealer owes a turn while a waiter wants a sequence past its staged one and it has not
 	// answered nothing to the whole budget since that waiter linked.
@@ -543,6 +566,7 @@ private:
 	mutable std::mutex sealers_mutex_;  // the sealer table and running_; never held while a sealer runs
 	std::condition_variable sealer_done_;  // a sealer call finished
 	std::map<std::uint64_t, Sealing> sealers_;
+	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten: retired()
 	std::shared_ptr<Sealer> running_;  // the sealer being called, on running_thread_
 	std::uint64_t running_group_ = 0;  // and the group and owner it was called for
 	const void* running_owner_ = nullptr;
