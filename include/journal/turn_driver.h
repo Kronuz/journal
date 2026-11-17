@@ -32,7 +32,10 @@
 #include "completion/seam.h"
 #include <algorithm>
 #include <atomic>
+#include <functional>
+#include <map>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace kronuz::journal {
@@ -118,11 +121,30 @@ public:
 		auto found = recovered_.groups.find(group); return found == recovered_.groups.end() ? none : found->second;
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
-	// A closed group leaves the log (TurnLog::forget); nothing of it may be staged.
+	// A closed group leaves the log (TurnLog::forget) and its sealer is unregistered: no
+	// sealer of it runs once this returns. Nothing of it may be staged.
 	void forget(std::uint64_t group) {
 		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
+		if (auto found = sealers_.find(group); found != sealers_.end()) { if (found->second.owed) { --owed_; } sealers_.erase(found); }
 		log_.forget(group); recovered_.groups.erase(group);
 	}
+	// A group's sealer (docs/mechanisms/turn-seal.md). Each turn calls it once, on the loop,
+	// after the turn's pending records and before encoding, with the payload bytes its record
+	// may carry; it returns the group's open record, at the group's last staged sequence + 1,
+	// or nothing. A record that breaks that fails the turn, as a refused stage does. A durable()
+	// waiter on the group above its staged sequence asks for a turn.
+	using Sealer = std::function<std::optional<TurnRecord>(std::uint64_t budget)>;
+	void seal(std::uint64_t group, Sealer fn) {
+		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
+		if (!fn) { throw std::invalid_argument("a sealer needs a function"); }
+		if (sealers_.contains(group)) { throw std::logic_error("the group already has a sealer"); }
+		auto& sealing = sealers_[group];
+		sealing.fn = std::make_shared<Sealer>(std::move(fn)); sealing.staged = last_staged(group);
+		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { sealing.wanted = std::max(sealing.wanted, waiter->sequence); } }
+		mark(sealing);
+		if (owed_) { wake([](const detail::TurnWaiter& waiter) { return waiter.group == 0; }); }
+	}
+	bool sealed(std::uint64_t group) const { return sealers_.contains(group); }
 	// Records of the group wait for a turn or are in the one in flight.
 	bool staged(std::uint64_t group) const {
 		auto of = [group](const auto& item) { return item.record.group == group; };
@@ -139,19 +161,24 @@ public:
 	// Returns the record's sequence.
 	std::uint64_t stage(TurnRecord record, std::shared_ptr<IOOperation> operation = {}, MutationToken token = {}) {
 		if (log_failed_) { throw std::logic_error("turn driver failed"); }
-		const auto sequence = record.sequence;
+		if (sealing_) { throw std::logic_error("a sealer cannot stage records"); }
+		const auto group = record.group, sequence = record.sequence;
 		pending_.push_back({std::move(record), std::move(operation), token});
+		if (auto found = sealers_.find(group); found != sealers_.end()) { found->second.staged = sequence; mark(found->second); }
 		wake([](const detail::TurnWaiter& waiter) { return waiter.group == 0; });
 		return sequence;
 	}
-	bool idle() const noexcept { return pending_.empty(); }
+	// Nothing waits for a turn: no record is pending and no sealer owes a waited-for record.
+	bool idle() const noexcept { return pending_.empty() && !owed_; }
 	bool in_flight() const noexcept { return write_.has_value(); }
 
 	// Stages the pending records as one turn and submits their operations; the host writes
 	// write().bytes at write().offset, calls File::sync_data, then completed() or failed().
 	const TurnLog::TurnWrite& begin() {
 		if (holder_ == Holder::driver) { throw std::logic_error("run() holds the turn driver"); }
-		return start();
+		auto* write = start();
+		if (!write) { throw std::logic_error("no records to write"); }
+		return *write;
 	}
 	const TurnLog::TurnWrite& write() const { if (!write_) { throw std::logic_error("no turn in flight"); } return *write_; }
 	void completed() {
@@ -168,9 +195,14 @@ public:
 	// staged with it or after it.
 	void failed(std::exception_ptr error) noexcept { log_.failed(); write_.reset(); fail(error); }
 
-	// Writes and syncs the pending turn synchronously.
+	// Writes and syncs the pending and sealed records as one turn; when there are none, writes
+	// nothing if a waiter asked the sealers, and throws otherwise.
 	void commit() {
-		const auto& write = begin();
+		if (holder_ == Holder::driver) { throw std::logic_error("run() holds the turn driver"); }
+		const bool asked = !idle();
+		const auto* staged = start();
+		if (!staged) { if (!asked) { throw std::logic_error("no records to write"); } return; }
+		const auto& write = *staged;
 		try {
 			if (write.file->write_at(write.offset, write.bytes) != write.bytes.size()) { throw std::runtime_error("short turn write"); }
 			write.file->sync_data();
@@ -185,12 +217,14 @@ public:
 		Hold hold(*this, Holder::driver);
 		for (;;) {
 			if (log_failed_) { std::rethrow_exception(failure_); }
-			if (pending_.empty()) {
+			if (idle()) {
 				if (stop.requested()) { co_return; }
 				try { co_await Wait(*this, 0, 0, stop); } catch (const task::cancelled&) {}
 				continue;
 			}
-			const auto& write = start();
+			const auto* staged = start();
+			if (!staged) { continue; }
+			const auto& write = *staged;
 			auto barrier = std::make_shared<TurnBarrier>(io_, write, identity_);
 			std::exception_ptr error;
 			try { co_await io.run(barrier); } catch (...) { error = std::current_exception(); }
@@ -273,13 +307,20 @@ private:
 		std::optional<task::cancel_callback<Cancel>> callback;
 	};
 	bool satisfied(const detail::TurnWaiter& waiter) const {
-		if (!waiter.group) { return !pending_.empty(); }
+		if (!waiter.group) { return !idle(); }
 		return log_failed_ || log_.sequence(waiter.group) >= waiter.sequence;
 	}
+	// A group's waiter asks its sealer, if any, for a turn.
 	void link(detail::TurnWaiter& waiter) noexcept {
 		waiter.owner = this; waiter.prev = nullptr; waiter.next = waiters_;
 		if (waiters_) { waiters_->prev = &waiter; }
 		waiters_ = &waiter;
+		if (!waiter.group) { return; }
+		auto found = sealers_.find(waiter.group);
+		if (found == sealers_.end()) { return; }
+		found->second.quiet = false; found->second.wanted = std::max(found->second.wanted, waiter.sequence);
+		mark(found->second);
+		if (found->second.owed) { wake([](const detail::TurnWaiter& other) { return other.group == 0; }); }
 	}
 	void unlink(detail::TurnWaiter& waiter) noexcept {
 		(waiter.prev ? waiter.prev->next : waiters_) = waiter.next;
@@ -297,16 +338,73 @@ private:
 			waiter = next;
 		}
 	}
-	const TurnLog::TurnWrite& start() {
+	// Seals, then stages the pending records as one turn; nullptr when there are none.
+	const TurnLog::TurnWrite* start() {
 		if (write_) { throw std::logic_error("a turn is already in flight"); }
-		if (pending_.empty()) { throw std::logic_error("no records to write"); }
+		try { seal_turn(); } catch (...) { fail(std::current_exception()); throw; }
+		if (pending_.empty()) { return nullptr; }
 		std::vector<TurnRecord> records; records.reserve(pending_.size());
 		for (auto& item : pending_) { records.push_back(std::move(item.record)); }
 		flight_ = std::move(pending_); pending_.clear();
 		try { write_ = log_.stage(records); }
 		catch (...) { fail(std::current_exception()); throw; }
 		for (auto& item : flight_) { if (item.operation) { item.operation->submitted(); item.submitted = true; } }
-		return *write_;
+		return &*write_;
+	}
+	// Calls each sealer once, from the first one the last turn left waiting. The first sealed
+	// record may fill an empty segment (so a full-size record seals); later ones share
+	// segment_bytes / 2, and once that is spent the rest wait for the next turn.
+	void seal_turn() {
+		if (sealers_.empty()) { return; }
+		const auto& options = log_.options();
+		const auto whole = turn_log_detail::turn_room(options.segment_bytes, options.block_bytes);
+		const auto half = turn_log_detail::turn_room(options.segment_bytes / 2, options.block_bytes);
+		std::uint64_t used = 0;
+		for (const auto& item : pending_) { used += turn_log_detail::record_cost(item.record.payload.size()); }
+		std::vector<std::uint64_t> order; order.reserve(sealers_.size());
+		for (auto it = sealers_.lower_bound(next_seal_); it != sealers_.end(); ++it) { order.push_back(it->first); }
+		for (auto it = sealers_.begin(); it != sealers_.end() && it->first < next_seal_; ++it) { order.push_back(it->first); }
+		struct Guard { bool& flag; explicit Guard(bool& value) : flag(value) { flag = true; } ~Guard() { flag = false; } } guard(sealing_);
+		std::optional<std::uint64_t> resume;
+		bool first = true;
+		for (const auto group : order) {
+			auto found = sealers_.find(group);
+			if (found == sealers_.end()) { continue; }  // forgotten by an earlier sealer
+			const auto room = first ? whole : half;
+			const auto budget = room > used + turn_log_detail::record_cost(0) ? room - used - turn_log_detail::record_cost(0) : 0;
+			if (!budget) { resume = group; break; }
+			const auto fn = found->second.fn;  // alive while it runs, even if it forgets its group
+			auto record = (*fn)(budget);
+			found = sealers_.find(group);
+			if (!record) {
+				if (found == sealers_.end()) { continue; }
+				// Nothing under the whole budget: quiet until a waiter asks again. Nothing under a
+				// share of it: called first next turn, when it may fill the segment.
+				if (first) { found->second.quiet = true; mark(found->second); } else if (!resume) { resume = group; }
+				continue;
+			}
+			if (found == sealers_.end()) { throw std::logic_error("a sealer returned a record for the group it forgot"); }
+			if (record->group != group) { throw std::invalid_argument("a sealer returned another group's record"); }
+			if (record->sequence != found->second.staged + 1) { throw std::invalid_argument("sealed record out of its group's sequence"); }
+			if (record->payload.size() > budget) { throw std::invalid_argument("sealed record past its budget"); }
+			used += turn_log_detail::record_cost(record->payload.size()); first = false;
+			found->second.staged = record->sequence; mark(found->second);
+			pending_.push_back({std::move(*record), {}, {}});
+		}
+		if (resume) { next_seal_ = *resume; }
+	}
+	std::uint64_t last_staged(std::uint64_t group) const {
+		auto of = [group](const auto& item) { return item.record.group == group; };
+		if (auto found = std::find_if(pending_.rbegin(), pending_.rend(), of); found != pending_.rend()) { return found->record.sequence; }
+		if (auto found = std::find_if(flight_.rbegin(), flight_.rend(), of); found != flight_.rend()) { return found->record.sequence; }
+		return log_.sequence(group);
+	}
+	// A sealer owes a turn while a waiter wants a sequence past its staged one and it has not
+	// answered nothing to the whole budget since that waiter linked.
+	struct Sealing { std::shared_ptr<Sealer> fn; std::uint64_t staged = 0, wanted = 0; bool quiet = false, owed = false; };
+	void mark(Sealing& sealing) noexcept {
+		const bool owed = !sealing.quiet && sealing.wanted > sealing.staged;
+		if (owed != sealing.owed) { sealing.owed = owed; owed ? ++owed_ : --owed_; }
 	}
 
 	struct Pending { TurnRecord record; std::shared_ptr<IOOperation> operation; MutationToken token; bool submitted = false; };
@@ -334,6 +432,10 @@ private:
 	TurnRecovery recovered_;
 	TurnLog log_;
 	std::vector<Pending> pending_, flight_;
+	std::map<std::uint64_t, Sealing> sealers_;
+	std::size_t owed_ = 0;
+	std::uint64_t next_seal_ = 0;
+	bool sealing_ = false;
 	std::optional<TurnLog::TurnWrite> write_;
 	detail::TurnWaiter* waiters_ = nullptr;
 	std::exception_ptr failure_;

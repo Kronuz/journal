@@ -97,6 +97,22 @@ inline std::string logical(std::uint8_t kind, std::uint64_t turn, std::uint64_t 
 	bytes.push_back(static_cast<char>(kind)); put64(bytes, turn); put64(bytes, group); put64(bytes, sequence); bytes.append(payload);
 	return bytes;
 }
+// A bound on a turn's bytes in an empty segment, whatever its manifests: each record costs its
+// payload, its header and 40 bytes (a fragment header, a manifest entry); the end-of-turn record
+// is one more; each block adds at most 126 and the first block's manifest half a block.
+// docs/mechanisms/turn-seal.md derives it.
+inline constexpr std::uint64_t record_cost(std::uint64_t payload) { return payload + record_header + 40; }
+inline constexpr std::uint64_t block_cost = 126;
+inline std::uint64_t turn_bound(std::uint64_t cost, std::uint32_t block_bytes) {
+	const std::uint64_t b = block_bytes, fixed = cost + record_cost(4) + block_cost + b / 2;
+	return fixed + (fixed * block_cost + (b - block_cost) - 1) / (b - block_cost);
+}
+// The record cost a turn may carry and still encode within `limit` bytes of an empty segment.
+inline std::uint64_t turn_room(std::uint64_t limit, std::uint32_t block_bytes) {
+	const std::uint64_t b = block_bytes, scaled = limit / b * (b - block_cost) + limit % b * (b - block_cost) / b;
+	const std::uint64_t fixed = record_cost(4) + block_cost + b / 2;
+	return scaled > fixed ? scaled - fixed : 0;
+}
 
 inline std::string segment_name(std::uint64_t number) {
 	char name[32]; std::snprintf(name, sizeof name, "turns-%016llx", static_cast<unsigned long long>(number)); return name;
@@ -275,6 +291,7 @@ public:
 	std::uint64_t position() const noexcept { return offset_; }  // in the current segment
 	std::uint64_t sequence(std::uint64_t group) const { auto found = sequences_.find(group); return found == sequences_.end() ? 0 : found->second; }
 	const TurnLogStats& stats() const noexcept { return stats_; }
+	const TurnLogOptions& options() const noexcept { return options_; }
 	// Segments holding records, the current one included; the oldest goes first.
 	const std::set<std::uint64_t>& data_segments() const noexcept { return data_segments_; }
 
