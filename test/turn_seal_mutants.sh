@@ -5,7 +5,7 @@
 #   covers    TurnLog drops the checkpoint guard (A7)
 set -eu
 case "$1" in
-	sequence) file=include/journal/turn_driver.h; old='if (record->sequence != found->second.staged + 1) {' ;;
+	sequence) file=include/journal/turn_driver.h; old='if (record->sequence != staged + 1) {' ;;
 	covers) file=include/journal/turn_log.h; old='if (record.kind == TurnRecordKind::Checkpoint && record.covers < last) {' ;;
 	*) echo "unknown mutant: $1" >&2; exit 2 ;;
 esac
