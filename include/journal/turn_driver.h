@@ -138,10 +138,11 @@ public:
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
 	// A group no Store holds leaves memory but not the log (TurnLog::park); live() reads its
-	// records back for the next Store. Nothing of it may be staged.
+	// records back for the next Store. Nothing of it may be staged. Its refusal goes too: the
+	// refused records never reached the log, and no waiter of the old holder remains.
 	void park(std::uint64_t group) {
 		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
-		log_.park(group); recovered_.groups.erase(group);
+		log_.park(group); recovered_.groups.erase(group); refused_.erase(group);
 	}
 	bool parked(std::uint64_t group) const { return log_.parked(group); }
 	std::vector<TurnRecord> live(std::uint64_t group) { return log_.live(group); }
@@ -238,7 +239,7 @@ public:
 	// Stages a record for the next turn that has room for it; its operation, if any, completes
 	// at that turn's barrier with the token it was staged with. A record no segment holds is
 	// refused at the next turn: its operation, and those of its group's later records, fail with
-	// std::length_error, and so do durable() waits on them, until the group is forgotten.
+	// std::length_error, and so do durable() waits on them, until the group is forgotten or parked.
 	// Returns the record's sequence.
 	std::uint64_t stage(TurnRecord record, std::shared_ptr<IOOperation> operation = {}, MutationToken token = {}) {
 		if (log_failed_) { throw std::logic_error("turn driver failed"); }
@@ -501,7 +502,7 @@ private:
 	// Takes out of pending_ each record that does not encode alone in an empty segment, as encode()
 	// refuses it, and every later record of its group, and fails their operations and the durable()
 	// waits on them; the rest keep their order. A refused group seals nothing more, and its sealer
-	// owes nothing, until it is forgotten.
+	// owes nothing, until it is forgotten or parked.
 	void refuse() {
 		const auto room = whole_room();
 		std::vector<Pending> refused;
@@ -674,7 +675,7 @@ private:
 	std::uint64_t kept(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
 	// A group whose record at `hole` no segment holds: its records from there through `last` failed.
 	struct Refusal { std::uint64_t hole = 0, last = 0; std::exception_ptr error; };
-	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten
+	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten or parked
 	std::shared_ptr<Sealer> running_;  // the sealer being called, on running_thread_
 	std::uint64_t running_group_ = 0;  // and the group and owner it was called for
 	const void* running_owner_ = nullptr;

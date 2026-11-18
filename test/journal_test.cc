@@ -37,13 +37,32 @@
 #include <thread>
 
 // Live heap bytes, less those a Metered IO or file call makes for the memory disk (reopen_*):
-// a difference of two readings is the host's state alone.
+// a difference of two readings is the host's state alone. TSan's runtime defines operator new,
+// so under TSan nothing is counted and the heap cases skip their heap checks, saying so.
+#if defined(__SANITIZE_THREAD__)
+#define JOURNAL_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define JOURNAL_TEST_TSAN 1
+#endif
+#endif
 namespace heap {
+#ifdef JOURNAL_TEST_TSAN
+constexpr bool counted = false;
+#else
+constexpr bool counted = true;
+#endif
 struct alignas(16) Header { std::size_t size; bool metered; };
 std::atomic<std::int64_t> bytes{0};
 thread_local int off = 0;
 struct Off { Off() { ++off; } ~Off() { --off; } };
+// Whether the case's heap check runs; under TSan it prints why not.
+bool checked(std::string_view name) {
+	if (!counted) { std::cout << name << ": heap check skipped: TSan's runtime defines operator new, so the heap is not counted\n"; }
+	return counted;
+}
 }  // namespace heap
+#ifndef JOURNAL_TEST_TSAN
 void* operator new(std::size_t size) {
 	auto* header = static_cast<heap::Header*>(std::malloc(size + sizeof(heap::Header)));
 	if (!header) { throw std::bad_alloc(); }
@@ -58,6 +77,7 @@ void operator delete(void* pointer) noexcept {
 	std::free(header);
 }
 void operator delete(void* pointer, std::size_t) noexcept { operator delete(pointer); }
+#endif
 
 using namespace kronuz::journal;
 namespace {
@@ -1949,6 +1969,26 @@ void reopen_released(bool fenced) {
 	check(state == expected, "the reopened host recovers the same state: " + kind + " " + text(state));
 }
 
+// A Store whose append was refused (a record no segment holds) ends; the next Store recovers
+// the group in the live host and appends, and the reopened host recovers what it appended.
+void reopen_refused() {
+	jt::Disk disk;
+	std::vector<std::string> state;
+	{
+		Shared node(disk);
+		auto a = node.open(7);
+		node.append(*a, "a1"); node.checkpoint(*a, {"a1"});
+		check(throws([&] { node.append(*a, std::string(20000, 'x')); }), "a record no segment holds is refused");
+		a.reset();
+		auto b = node.open(7, &state);
+		check(state == std::vector<std::string>{"a1"}, "the refused Store's group recovers in the live host: " + text(state));
+		check(!throws([&] { node.append(*b, "b1"); }), "the next Store appends after the refused one");
+	}
+	Shared again(disk);
+	again.open(7, &state);
+	check(state == std::vector<std::string>{"a1", "b1"}, "the reopened host recovers the next Store's append: " + text(state));
+}
+
 // A2: a live Store's group is busy to a recover and a create, and so is a group whose first record
 // its ended Store left staged; the holder carries on unharmed.
 void reopen_two_stores() {
@@ -2085,7 +2125,7 @@ void reopen_churn() {
 	const auto last = heap::bytes.load();
 	check(wrong == 0, "every recover holds its group's batches: " + std::to_string(wrong) + " wrong");
 	std::cout << "reopen_churn: " << cycles << " cycles of " << ids << " ids, host heap " << warm << " B after the first pass, " << last << " B after the last (" << (last - warm) << " B)\n";
-	check(last - warm <= std::int64_t(ids) * 64, "the host's heap stays flat across the churn");
+	if (heap::checked("reopen_churn")) { check(last - warm <= std::int64_t(ids) * 64, "the host's heap stays flat across the churn"); }
 }
 
 // A8: 10,000 distinct groups, each created, written, checkpointed and closed once in one host:
@@ -2108,7 +2148,7 @@ void reopen_distinct() {
 	const double slope = double(last - first) / double(ids - early);
 	std::cout << "reopen_distinct: host heap " << first << " B after " << early << " closed groups, " << half << " B after " << middle << ", " << last << " B after " << ids
 		<< "; slope " << slope << " B per group\n";
-	check(slope < 1, "closing distinct groups leaves the host's heap flat: " + std::to_string(slope) + " B per group");
+	if (heap::checked("reopen_distinct")) { check(slope < 1, "closing distinct groups leaves the host's heap flat: " + std::to_string(slope) + " B per group"); }
 	std::vector<std::string> state;
 	for (std::uint64_t group : {std::uint64_t{1}, ids}) {
 		auto store = node.open(group, &state);
@@ -2136,7 +2176,7 @@ void reopen_heap() {
 	check(all, "settle parks every released group");
 	const double before = double(held - empty) / ids, after = double(settled - empty) / ids;
 	std::cout << "reopen_heap: " << ids << " released groups, " << before << " B per group before settle, " << after << " B after\n";
-	check(after < before && after < 400, "a released group keeps little of the host's heap");
+	if (heap::checked("reopen_heap")) { check(after < before && after < 400, "a released group keeps little of the host's heap"); }
 	std::vector<std::string> state;
 	for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {
 		auto store = node.open(group, &state);
@@ -2172,7 +2212,7 @@ void reclaim_syncs() {
 int main(int argc, char** argv) {
 	const std::map<std::string_view, std::function<void()>> cases{
 		{"reopen_clean_close", reopen_clean_close}, {"reopen_released", [] { reopen_released(false); reopen_released(true); }},
-		{"reopen_two_stores", reopen_two_stores}, {"reopen_race", reopen_race}, {"reopen_crash", reopen_crash},
+		{"reopen_two_stores", reopen_two_stores}, {"reopen_refused", reopen_refused}, {"reopen_race", reopen_race}, {"reopen_crash", reopen_crash},
 		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}, {"reopen_distinct", reopen_distinct}, {"reclaim_syncs", reclaim_syncs}};
 	if (argc > 1) {
 		const auto found = cases.find(argv[1]);
@@ -2182,7 +2222,7 @@ int main(int argc, char** argv) {
 		std::cout << checks << " journal checks, " << failures << " failures\n";
 		return failures ? 1 : 0;
 	}
-	try { reopen_clean_close(); reopen_released(false); reopen_released(true); reopen_two_stores(); reopen_race(); basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); store_artifact_completions(true); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_replacement_growth(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { reopen_clean_close(); reopen_released(false); reopen_released(true); reopen_two_stores(); reopen_refused(); reopen_race(); basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); store_artifact_completions(true); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_replacement_growth(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

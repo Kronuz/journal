@@ -386,7 +386,6 @@ public:
 		update(group, [&](GroupEntry& entry) {
 			settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
 		});
-		shards_[host_detail::slot(group)].erase(group);
 		turns.forget(group, sequence + 1);
 	}
 	// The group's next artifact identity; a used-up block reserves the next one in the table.
@@ -451,6 +450,8 @@ private:
 	}
 	// Changes the group's entry and commits its shard. A failed write restores the entry, so
 	// the table in memory never runs ahead of the disk and nothing acts on an undurable change.
+	// A restored closed entry stays in memory, since the file may hold it open, until a commit
+	// of its slot writes it; a committed slot keeps no closed entry in memory.
 	template <class Change> void update(std::uint64_t group, Change&& change) {
 		auto& shard = shards_[host_detail::slot(group)];
 		std::optional<GroupEntry> before;
@@ -458,9 +459,10 @@ private:
 		auto& entry = shard[group];
 		try { change(entry); commit({host_detail::slot(group)}); }
 		catch (...) {
-			if (before && before->state != GroupState::closed) { entry = std::move(*before); } else { shard.erase(group); }
+			if (before) { entry = std::move(*before); } else { shard.erase(group); }
 			throw;
 		}
+		std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; });
 	}
 	// Replaces the shards, then syncs the directory once; the groups' views see their ranges.
 	// A shard holds the slot's entries in memory and the closed ones only its file holds.
@@ -625,8 +627,8 @@ private:
 	std::unique_ptr<OwnerLock> lock_;  // released after the drivers' files close
 	std::uint32_t loops_ = 0;
 	std::uint64_t generation_ = 0;
-	std::vector<std::map<std::uint64_t, GroupEntry>> shards_ = std::vector<std::map<std::uint64_t, GroupEntry>>(host_detail::slots);  // open and lost entries
-	std::vector<bool> stored_ = std::vector<bool>(host_detail::slots);  // slots with a shard file
+	std::vector<std::map<std::uint64_t, GroupEntry>> shards_ = std::vector<std::map<std::uint64_t, GroupEntry>>(host_detail::slots);  // open and lost entries, and closed ones a failed commit restored
+	std::vector<char> stored_ = std::vector<char>(host_detail::slots);  // slots with a shard file; a byte each, as loops commit their slots concurrently
 	std::map<std::pair<std::uint64_t, std::uint32_t>, std::vector<std::string>> logs_;
 	std::vector<std::shared_ptr<IO>> loop_views_;
 	std::vector<std::set<std::uint64_t>> opened_;  // per loop: groups a Store created or recovered, until released

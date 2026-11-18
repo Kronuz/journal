@@ -40,7 +40,9 @@ each queued group whose records settled and parks it (`TurnDriver::park`, `TurnL
 
 - the turn log drops the group's sequence entry and its index map, and keeps one compact entry:
   its first live sequence and each live record's position (segment, epoch, offset, kind);
-- the driver drops any records the Host's open still kept for it;
+- the driver drops any records the Host's open still kept for it, and its refusal of the group:
+  refused records never reached the log, and no waiter of the old holder remains, so the next
+  holder appends from the last durable record;
 - the Host drops the group from its per-loop set of created or recovered groups.
 
 The records stay live for retention: the per-segment live counts do not change, and
@@ -56,7 +58,10 @@ range its views scan read it there.
 Nothing. `close_group` commits the entry closed, with its checkpoint record, then drops it from
 memory; `Host::entry` and `status` read a closed entry back from its slot's shard file, and
 `reopen_group` loads it again. `commit` writes a slot's shard as the entries in memory plus the
-closed ones only the file holds, so an entry out of memory is never dropped from disk. The open
+closed ones only the file holds, so an entry out of memory is never dropped from disk. A commit
+that fails restores the entry it changed in memory, a closed one too: the file may already hold
+the reopened entry open, and only memory wins over the file, so the next commit of the slot
+writes it closed again. A slot whose commit succeeds keeps no closed entry in memory. The open
 loads every shard (the logs' recovery needs each closed group's base) and then drops the closed
 entries. Open and lost entries stay in memory.
 
@@ -81,6 +86,7 @@ Store while the first was live. The hold answers the second; `TurnLog::live` ans
 `journal_test reopen_heap` releases 10,000 groups, each with its first checkpoint record and one
 batch, and reports the host's heap per group before and after `settle()`; `reopen_churn` runs
 10,000 close-and-recover cycles over 1,000 groups and reports the host's heap after the first pass
-and after the last; `reopen_distinct` closes 100,000 distinct groups once each and reports the
-host's heap after 1,000 and after 100,000. All three read a heap counter that leaves out the memory
-disk's own allocations.
+and after the last; `reopen_distinct` closes 10,000 distinct groups once each and reports the
+host's heap after 1,000, 5,000 and 10,000. All three read a heap counter that leaves out the memory
+disk's own allocations. Under TSan, whose runtime defines `operator new`, nothing is counted and the
+three say they skip their heap checks.
