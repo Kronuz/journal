@@ -376,7 +376,7 @@ private:
 			auto count = std::min<std::uint64_t>(zeros.size(), options_.segment_bytes - offset);
 			if (file->write_at(offset, std::string_view(zeros).substr(0, count)) != count) { throw std::runtime_error("short turn log preallocation"); }
 		}
-		file->sync(); io_.sync_directory(); ++stats_.segments_prepared;
+		detail::sync_file(io_, *file); io_.sync_directory(); ++stats_.segments_prepared;
 		return file;
 	}
 	void begin_segment() {

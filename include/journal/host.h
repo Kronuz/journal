@@ -142,7 +142,7 @@ inline void replace_file(IO& io, const std::string& name, std::string_view bytes
 	const auto pending = name + ".pending";
 	io.remove(pending);
 	auto file = io.create_exclusive(pending);
-	detail::write_all(*file, 0, bytes); file->sync(); file.reset();
+	detail::write_all(*file, 0, bytes); detail::sync_file(io, *file); file.reset();
 	io.replace(pending, name);
 }
 

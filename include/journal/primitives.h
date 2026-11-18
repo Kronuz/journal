@@ -48,6 +48,8 @@ inline std::string generation_name(std::uint64_t generation) {
 	for (int shift = 60; shift >= 0; shift -= 4) { result.push_back(digits[(generation >> shift) & 15]); }
 	return result;
 }
+// Makes one file durable through the IO seam, so a host that counts or skips syncs sees it.
+inline void sync_file(IO& io, File& file) { File* files[1]{&file}; io.sync_files(files); }
 inline void read_all(File& file, std::uint64_t offset, std::span<char> bytes) {
 	while (!bytes.empty()) {
 		auto count = file.read_at(offset, bytes);

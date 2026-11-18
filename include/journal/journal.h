@@ -233,7 +233,7 @@ public:
 			data_ = io_.create_exclusive(data_name(frontier_));
 			auto header = file_header(frontier_);
 			write_all(*data_, 0, header);
-			data_->sync();
+			detail::sync_file(io_, *data_);
 			// Establish the generation and stable lock before referencing them.
 			io_.sync_directory();
 			publish(frontier_);
@@ -312,7 +312,7 @@ public:
 			if (size > frontier_.offset) {
 				// Only bytes outside a fully verified frontier are disposable.
 				data_->truncate(frontier_.offset);
-				data_->sync();
+				detail::sync_file(io_, *data_);
 			}
 			// A process restart can observe a replaced manifest whose directory
 			// barrier never ran. Seal that selected namespace before using it.
