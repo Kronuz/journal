@@ -80,6 +80,7 @@ struct Workload {
 	}
 };
 const j::TurnLogOptions options{8 * 512, 512, 1, 3, 600};
+std::string listing(const fl::filesystem& disk) { std::string names; for (const auto& name : disk.list()) { names += ' ' + name; } return names; }
 
 // Runs `turns` turns, cutting power at mutation `cut` (and at `second` during the recovery
 // that follows), then reopens and continues for `after` more turns. Only the power cut fails a
@@ -97,16 +98,21 @@ void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned t
 			log.prepare();
 		}
 	} catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails the run: " + at + ": " + error.what()); }
+	// The namespace at each crash, so a failure names the segments it left.
+	auto names = "; before crash" + listing(disk);
 	disk.crash(seed * 7919 + cut, sector_cut);
+	names += "; after" + listing(disk);
 	if (second) {
 		disk.power_off_after(second - 1);
 		try { j::TurnLog log(io, identity, recovered, options); }
 		catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails recovery: " + at + ": " + error.what()); }
+		names += "; before second crash" + listing(disk);
 		disk.crash(seed * 7919 + cut + (second << 32), sector_cut);
+		names += "; after" + listing(disk);
 	}
 	try {
 		j::TurnLog log(io, identity, recovered, options);
-		check(!recovered.damaged && recovered.lost.empty(), "power loss alone damages nothing and loses no group: " + at);
+		check(!recovered.damaged && recovered.lost.empty(), "power loss alone damages nothing and loses no group: " + at + names);
 		check(work.matches(recovered), "every acknowledged record survives, and the in-flight turn whole or not at all: " + at);
 		work.in_flight.clear();
 		for (unsigned t = 0; t < after; ++t) { auto batch = work.turn(log); log.append(batch); work.acknowledge(batch); }
