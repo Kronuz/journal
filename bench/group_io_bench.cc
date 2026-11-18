@@ -20,10 +20,10 @@
  * THE SOFTWARE.
  */
 
-// Cost of one Host::group_io call by the number of live ids (goal5 O4): group_io erases the
-// expired entries of its range table on every call, a sweep of every live id's entry. Builds a
-// Host over MemoryIO (a few files, so its directory sync costs nothing), holds N live ranges
-// (what N open group views keep), then times calls on fresh ids: ns per call, median of 5 runs.
+// Cost of one Host::group_io call by the number of live ids (goal5 O4). Builds a Host over
+// MemoryIO (a few files, so its directory sync costs nothing), holds N live ranges (what N open
+// group views keep), then times calls on fresh ids: ns per call, median of 5 runs. A run spans at
+// least 2N calls when that fits in 10 s, so a table sweep amortized over N calls lands in every run.
 // `journal_group_io_bench [N...]` (default 1000 10000 100000 1000000; 0 is the empty baseline).
 #include "journal/host.h"
 #include "journal/memory_io.h"
@@ -34,7 +34,6 @@
 #include <string>
 
 namespace j = kronuz::journal;
-using Ranges = std::multimap<std::uint64_t, std::weak_ptr<j::host_detail::Range>>;
 
 // Reaches Host::ranges_ with no change to Host: explicit instantiation ignores access.
 template <class Tag, auto Member> struct Steal { friend constexpr auto steal(Tag) { return Member; } };
@@ -64,13 +63,15 @@ std::vector<std::shared_ptr<j::host_detail::Range>> inject(j::Host& host, std::u
 }
 
 struct Result { double median, low, high; std::uint64_t calls; };
-// Time group_io on fresh ids (or one resident id): 5 runs, each sized to about 0.3 s.
-Result time_calls(j::Host& host, std::uint64_t resident) {
+// Time group_io on fresh ids (or one resident id): 5 runs, each about 0.3 s, or 2N calls when
+// those fit in 10 s.
+Result time_calls(j::Host& host, std::uint64_t resident, std::uint64_t count) {
 	std::uint64_t next = std::uint64_t{1} << 62;
 	auto call = [&] { auto io = host.group_io(resident ? resident : next++); asm volatile("" : : "r"(io.get()) : "memory"); };
 	call();
 	auto start = Clock::now(); call(); const double once = seconds_since(start);
-	const std::uint64_t calls = std::clamp<std::uint64_t>(static_cast<std::uint64_t>(0.3 / std::max(once, 1e-9)), 3, 2000000);
+	std::uint64_t calls = std::clamp<std::uint64_t>(static_cast<std::uint64_t>(0.3 / std::max(once, 1e-9)), 3, 2000000);
+	if (static_cast<double>(2 * count) * once <= 10.0) { calls = std::max(calls, 2 * count); }
 	std::vector<double> runs;
 	for (int run = 0; run < 5; ++run) {
 		start = Clock::now();
@@ -94,7 +95,7 @@ int main(int argc, char** argv) {
 		struct Case { const char* name; bool shuffled; bool resident; bool built; };
 		for (auto [name, shuffled, resident, built] : {Case{"random ids", true, false, false}, Case{"ascending ids", false, false, false},
 		                                                Case{"random, resident", true, true, false}, Case{"built by group_io", true, false, true}}) {
-			if (built && count > 10000) { continue; }  // group_io's own sweep makes building quadratic
+			if (built && count > 10000) { continue; }  // a per-call sweep makes building quadratic
 			j::testing::Disk disk;
 			j::Host host(std::make_shared<j::testing::MemoryIO>(disk), {'G', 'I', 'O', 'C'}, j::HostOptions{1, {}});
 			if (resident) { host.create_group(resident_id); }
@@ -102,7 +103,7 @@ int main(int argc, char** argv) {
 			std::vector<std::shared_ptr<j::IO>> views;
 			if (built) { std::uint64_t state = 1; for (std::uint64_t i = 0; i < count; ++i) { views.push_back(host.group_io(mix(state) >> 1 | 1)); } }
 			else { held = inject(host, count, shuffled); }
-			const auto result = time_calls(host, resident ? resident_id : 0);
+			const auto result = time_calls(host, resident ? resident_id : 0, count);
 			std::printf("%9llu  %-16s %14.0f %14.0f %14.0f %9llu %10.3f\n", static_cast<unsigned long long>(count), name, result.median, result.low, result.high,
 			            static_cast<unsigned long long>(result.calls), count ? result.median / static_cast<double>(count) : 0.0);
 			std::fflush(stdout);
