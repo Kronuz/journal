@@ -298,7 +298,7 @@ void bound() {
 	auto past = drive({record(1, 1, single + 1, j::TurnRecordKind::Checkpoint), record(2, 1, 10, j::TurnRecordKind::Checkpoint)});
 	check(!past.failed && is<std::length_error>(past.errors[0]) && !past.errors[1], "one byte more is refused alone: " + what(past.errors[0]) + what(past.errors[1]));
 	for (const std::size_t payload : {10, 100, 1000}) {
-		const auto most = main_count(payload), cost = most * d::record_cost(payload);
+		const std::uint64_t most = main_count(payload), cost = most * d::record_cost(payload);
 		const auto load = "payload " + std::to_string(payload) + ", " + std::to_string(most) + " records";
 		check(cost > room, "main takes more than the room in one turn: " + std::to_string(cost) + " of " + std::to_string(room) + ": " + load);
 		std::vector<j::TurnRecord> records;
