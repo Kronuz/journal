@@ -29,7 +29,7 @@
 // under power loss too; a second recovery on one host refused; and one owner lock, the
 // directory's own.
 // `host_test [case]` runs one case.
-#include "faultlab/faultfs.h"
+#include "journal/memory_io.h"
 #include "journal/store.h"
 #include <cerrno>
 #include <algorithm>
@@ -37,7 +37,7 @@
 #include <set>
 
 namespace j = kronuz::journal;
-namespace fl = kronuz::faultlab;
+namespace jt = kronuz::journal::testing;
 namespace hd = kronuz::journal::host_detail;
 
 namespace {
@@ -81,15 +81,6 @@ private:
 	std::shared_ptr<j::IO> io_;
 };
 
-// The host's directory on `disk`, made on first use.
-std::shared_ptr<j::IO> host_io(fl::filesystem& disk) {
-	const auto names = disk.list();
-	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
-	return std::make_shared<fl::io>(disk, "host");
-}
-// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
-const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
-
 std::set<std::string> listing(j::IO& io) {
 	std::set<std::string> names; auto cursor = io.scan_directory();
 	while (auto name = cursor->next()) { names.insert(*name); }
@@ -104,12 +95,12 @@ std::string read(j::ArtifactReader& reader) {
 struct State { std::string bundle; std::vector<std::string> batches; };
 
 struct Node {
-	fl::filesystem& disk;
+	jt::Disk& disk;
 	std::shared_ptr<RecordingIO> io;
 	std::unique_ptr<j::Host> host;
 	std::map<std::uint64_t, std::unique_ptr<j::Store>> stores;
 	std::map<std::uint64_t, State> recovered;
-	Node(fl::filesystem& d, std::uint32_t loops = 1) : disk(d), io(std::make_shared<RecordingIO>(host_io(d))) {
+	Node(jt::Disk& d, std::uint32_t loops = 1) : disk(d), io(std::make_shared<RecordingIO>(std::make_shared<jt::MemoryIO>(d, "host/"))) {
 		host = std::make_unique<j::Host>(io, host_identity, j::HostOptions{loops, turn_options});
 	}
 	~Node() { stores.clear(); host.reset(); }
@@ -159,7 +150,7 @@ struct Node {
 // named by its own group's fixed-width id, incarnation and serial, and nothing else is in the
 // directory but the layout, the table and the logs.
 void names() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	const std::vector<std::uint64_t> groups{1, 0x10, 0x100};
 	{
 		Node node(disk, 2);
@@ -191,7 +182,7 @@ void names() {
 // Reclaiming one group names only its own files, never lists the directory, and leaves the
 // other's artifacts as they were.
 void reclaim_isolation() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	Node node(disk);
 	for (int round = 0; round < 3; ++round) { node.checkpoint(1, "a" + std::to_string(round)); node.checkpoint(0x10, "b" + std::to_string(round)); }
 	check(node.artifacts(1).size() == 6 && node.artifacts(0x10).size() == 6, "three checkpoints leave six artifacts each");
@@ -209,7 +200,7 @@ void reclaim_isolation() {
 
 // The admission census counts a group's artifacts by name, with no directory scan.
 void census() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	{ Node node(disk); node.checkpoint(3, std::string(5000, 'c')); node.checkpoint(3, std::string(7000, 'd')); }
 	Node node(disk);
 	node.io->scans = 0;
@@ -226,7 +217,7 @@ void census() {
 // A closed group lives in the table alone: once retention recycled every segment that held its
 // records, the reopened host recovers it from the table without reading a turn log.
 void closed_reopen() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	{
 		Node node(disk);
 		node.checkpoint(7, "state"); node.append(7, "pending");
@@ -266,7 +257,7 @@ void closed_reopen() {
 // A group whose first turn never became durable is created again as its next incarnation; the
 // first one's artifacts go.
 void recreate() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	std::string first;
 	{
 		Node node(disk);
@@ -280,7 +271,7 @@ void recreate() {
 		store->cancel_replacement(*id); store.reset();
 		node.host->driver(0).failed(std::make_exception_ptr(std::runtime_error("power lost")));
 	}
-	disk.crash(0, sector_cut);
+	disk.power_loss();
 	Node node(disk);
 	check(node.host->status(5) == j::GroupStatus::none, "a group whose first turn was lost is created again");
 	node.checkpoint(5, "second");
@@ -292,7 +283,7 @@ void recreate() {
 // A close whose table write fails (a full disk) leaves the group open and its records live in
 // the log: retention keeps them, and after a restart the group recovers, never offered for create.
 void failed_close() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	{
 		Node node(disk);
 		node.checkpoint(7, "state");
@@ -317,7 +308,7 @@ void failed_close() {
 // keeps the batches, and recovery returns them. A reopened group's close below the table's
 // earlier base is refused the same way.
 void close_behind() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	{ Node node(disk); node.checkpoint(7, "state"); }
 	std::uint64_t last = 0;
 	{
@@ -386,7 +377,7 @@ void restage(j::Host& host, std::uint64_t group, const std::string& manifest) {
 // neither its checkpoint record nor a later wait for 2 acknowledges the dropped record, and
 // recovery has no trace of it.
 void sealer_close() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	{
 		Node node(disk);
 		auto& host = *node.host;
@@ -439,7 +430,7 @@ bool prefix(const std::vector<std::string>& shorter, const std::vector<std::stri
 // flight, then reopens it from the table. Power is cut at every I/O operation: recovery holds
 // every acknowledged batch, at most the one in flight besides, and never a closed one.
 bool sealer_close_run(std::uint64_t cut) {
-	fl::filesystem disk;
+	jt::Disk disk;
 	task::inline_scheduler loop;
 	std::optional<Node> node;
 	std::optional<Writer> writer;
@@ -447,8 +438,7 @@ bool sealer_close_run(std::uint64_t cut) {
 	bool reached = false;
 	const auto at = "cut " + std::to_string(cut);
 	try {
-		host_io(disk);
-		disk.power_off_after(cut - 1);
+		disk.cut = cut;
 		node.emplace(disk);
 		auto& host = *node->host;
 		auto& turns = node->turns(7);
@@ -473,14 +463,15 @@ bool sealer_close_run(std::uint64_t cut) {
 			}
 		}
 		reached = true;
-	} catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails the run, which threw " + std::string(error.what()) + ": " + at); }
+	} catch (const jt::PowerLoss&) {
+	} catch (const std::exception& error) { check(false, "the run threw " + std::string(error.what()) + ": " + at); }
 	if (node) { node->turns(7).failed(std::make_exception_ptr(std::runtime_error("power lost"))); }
 	loop.run();
 	const auto acknowledged = writer ? writer->acknowledged : std::vector<std::string>{};
 	const auto closed = writer ? writer->closed : std::vector<std::string>{};
 	auto possible = acknowledged; if (!flight.empty()) { possible.push_back(flight); }
 	writer.reset(); node.reset();
-	disk.crash(cut, sector_cut);
+	disk.power_loss();
 	try {
 		Node again(disk);
 		std::vector<std::string> state;
@@ -509,7 +500,7 @@ void sealer_close_crash() {
 // its state is in the log, not the table, so the recovery is refused; its loop keeps running,
 // and the reopened host recovers the group's latest state.
 void second_recovery() {
-	fl::filesystem disk;
+	jt::Disk disk;
 	{
 		Node node(disk);
 		node.checkpoint(7, "old");
@@ -538,17 +529,17 @@ void second_recovery() {
 // One owner lock, the directory's own (what strata's cold tier takes): a second host on the
 // directory is refused while the first holds it.
 void lock() {
-	fl::filesystem disk;
-	auto io = std::make_shared<RecordingIO>(host_io(disk));
+	jt::Disk disk;
+	auto io = std::make_shared<RecordingIO>(std::make_shared<jt::MemoryIO>(disk, "host/"));
 	{
 		j::Host host(io, host_identity, j::HostOptions{1, turn_options});
 		check(io->lock_mode == j::OwnerLockMode::directory, "the host takes the directory's lock");
 		bool busy = false;
-		try { j::Host other(host_io(disk), host_identity, j::HostOptions{1, turn_options}); }
+		try { j::Host other(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options}); }
 		catch (const std::system_error&) { busy = true; }
 		check(busy, "a second host on the directory is refused");
 	}
-	j::Host again(host_io(disk), host_identity, j::HostOptions{1, turn_options});
+	j::Host again(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{1, turn_options});
 	check(again.loops() == 1, "the lock is released with the host");
 }
 }  // namespace
