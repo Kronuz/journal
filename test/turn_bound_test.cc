@@ -26,6 +26,7 @@
 // `turn_bound_test [case]`, every case by default.
 #include "journal/blocking.h"
 #include "journal/memory_io.h"
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -67,6 +68,32 @@ std::string what(const std::exception_ptr& error) {
 template <class E> bool is(const std::exception_ptr& error) {
 	if (!error) { return false; }
 	try { std::rethrow_exception(error); } catch (const E&) { return true; } catch (...) { return false; }
+}
+// Main's one-turn limit: TurnLog::append encodes one turn in a new log, as main's driver did with
+// every pending record, and throws "turn exceeds a segment" past it.
+bool main_encodes(std::size_t count, std::size_t payload) {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	std::vector<j::TurnRecord> records;
+	for (std::size_t i = 0; i < count; ++i) { records.push_back(record(i + 1, 1, payload, j::TurnRecordKind::Checkpoint)); }
+	try { driver.log().append(records); return true; } catch (const std::length_error&) { return false; }
+}
+// The largest payload main takes as one record alone.
+std::size_t main_single() {
+	static const std::size_t largest = [] {
+		std::size_t low = 0, high = options.segment_bytes;  // low encodes, high does not
+		while (high - low > 1) { const auto mid = low + (high - low) / 2; (main_encodes(1, mid) ? low : high) = mid; }
+		return low;
+	}();
+	return largest;
+}
+// One byte more than main takes: a record no segment holds.
+std::size_t over() { return main_single() + 1; }
+// The most records of `payload` bytes main takes in one turn.
+std::size_t main_count(std::size_t payload) {
+	std::size_t low = 0, high = options.segment_bytes / payload + 1;
+	while (high - low > 1) { const auto mid = low + (high - low) / 2; (main_encodes(mid, payload) ? low : high) = mid; }
+	return low;
 }
 
 // A staged record's operation: records whether the disk had power when its turn submitted it,
@@ -135,18 +162,15 @@ void wave() {
 				}
 			} catch (const std::exception& e) { error = e.what(); }
 			check(error.empty(), "the wave commits: " + error + ": " + at);
-			check(!driver.failed() && commits >= 3 && driver.log().stats().turns - turns == commits, "the wave takes several turns and the driver stays healthy: " + at);
+			check(!driver.failed() && commits >= 2 && driver.log().stats().turns - turns == commits, "the wave takes several turns and the driver stays healthy: " + at);
 			unsigned last = 1, unacknowledged = 0;
 			bool ordered = true;
-			std::map<unsigned, std::uint64_t> per_turn;
 			for (const auto& s : staged) {
 				if (!s.op->acknowledged()) { ++unacknowledged; continue; }
 				ordered = ordered && s.op->turn >= last; last = s.op->turn;
-				per_turn[s.op->turn] += d::record_cost(s.record.payload.size());
 			}
 			check(!unacknowledged, std::to_string(unacknowledged) + " operations unacknowledged: " + at);
 			check(ordered, "each turn takes the oldest records left: " + at);
-			for (const auto& [turn, used] : per_turn) { check(used <= room, "turn " + std::to_string(turn) + " carries " + std::to_string(used) + " of " + std::to_string(room) + ": " + at); }
 			for (std::uint64_t g = 1; g <= 64; ++g) { check(driver.sequence(g) == 2, "group " + std::to_string(g) + " is durable through 2: " + at); }
 			check(driver.sequence(65) == 2 && driver.sequence(66) == 1, "the full-size record commits between two small ones: " + at);
 		}
@@ -206,7 +230,7 @@ void oversize() {
 		unsigned sealer_calls = 0;
 		driver.seal(2, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> { ++sealer_calls; return std::nullopt; });
 		auto before = stage(record(1, 2, 10), true);
-		auto big = stage(record(2, 2, room - d::record_cost(0) + 1), false);  // one byte past a turn's room
+		auto big = stage(record(2, 2, over()), false);  // one byte past what a segment holds
 		auto later = stage(record(2, 3, 10), false);
 		auto other = stage(record(3, 1, 10, j::TurnRecordKind::Checkpoint), true);
 		std::exception_ptr linked;
@@ -246,6 +270,49 @@ void oversize() {
 	check(groups == model, "recovery holds every record the driver acknowledged");
 }
 
+// A1 and A2 at main's limit, in a new log as main_encodes measures it. One record of the largest
+// payload main takes commits and one byte more is refused; the most records main takes in one
+// turn commit in one, and one more record takes a second turn. Both limits lie above the room.
+void bound() {
+	struct Run { unsigned commits = 0; std::vector<unsigned> turn; std::vector<std::exception_ptr> errors; bool failed = false; };
+	auto drive = [](const std::vector<j::TurnRecord>& records) {
+		jt::Disk disk; jt::MemoryIO io(disk);
+		j::TurnDriver driver(io, identity, options);
+		std::vector<std::shared_ptr<Op>> ops;
+		for (const auto& r : records) { ops.push_back(std::make_shared<Op>(io, disk)); driver.stage(r, ops.back()); }
+		Run run;
+		try {
+			while (!driver.idle() && run.commits < 8) {
+				driver.commit(); ++run.commits;
+				for (auto& op : ops) { if (op->acknowledged() && !op->turn) { op->turn = run.commits; } }
+			}
+		} catch (...) { run.failed = true; }
+		run.failed = run.failed || driver.failed();
+		for (auto& op : ops) { run.turn.push_back(op->turn); run.errors.push_back(op->done() ? op->error : std::make_exception_ptr(std::logic_error("not done"))); }
+		return run;
+	};
+	const auto single = main_single();
+	check(d::record_cost(single) > room, "main takes a single record above the room: cost " + std::to_string(d::record_cost(single)) + " of " + std::to_string(room));
+	auto at = drive({record(1, 1, single, j::TurnRecordKind::Checkpoint), record(2, 1, 10, j::TurnRecordKind::Checkpoint)});
+	check(!at.failed && !at.errors[0] && !at.errors[1] && at.turn[0] == 1, "a record of main's largest payload commits in the first turn: " + what(at.errors[0]));
+	auto past = drive({record(1, 1, single + 1, j::TurnRecordKind::Checkpoint), record(2, 1, 10, j::TurnRecordKind::Checkpoint)});
+	check(!past.failed && is<std::length_error>(past.errors[0]) && !past.errors[1], "one byte more is refused alone: " + what(past.errors[0]) + what(past.errors[1]));
+	for (const std::size_t payload : {10, 100, 1000}) {
+		const auto most = main_count(payload), cost = most * d::record_cost(payload);
+		const auto load = "payload " + std::to_string(payload) + ", " + std::to_string(most) + " records";
+		check(cost > room, "main takes more than the room in one turn: " + std::to_string(cost) + " of " + std::to_string(room) + ": " + load);
+		std::vector<j::TurnRecord> records;
+		for (std::size_t i = 0; i <= most; ++i) { records.push_back(record(i + 1, 1, payload, j::TurnRecordKind::Checkpoint)); }
+		auto last = records.back(); records.pop_back();
+		auto full = drive(records);
+		check(!full.failed && full.commits == 1 && std::all_of(full.errors.begin(), full.errors.end(), [](const auto& e) { return !e; }), "main's most records commit in one turn: " + std::to_string(full.commits) + " turns: " + load);
+		records.push_back(last);
+		auto more = drive(records);
+		const auto first = static_cast<std::size_t>(std::count(more.turn.begin(), more.turn.end(), 1u));
+		check(!more.failed && more.commits == 2 && first == most && more.turn.back() == 2, "one record more takes a second turn after the first takes main's most: " + std::to_string(first) + " in the first of " + std::to_string(more.commits) + ": " + load);
+	}
+}
+
 // A2, a sealed group. Its sealer owes a turn to a waiter on the open record (staged + 1) when
 // its staged record is refused; after the refusal the sealer owes nothing, through a waiter
 // linked below the hole or a new registration, so the driver goes idle and run() and the
@@ -266,7 +333,7 @@ void owed() {
 	while (!driver.idle()) { driver.commit(); }
 	driver.seal(1, nothing); driver.seal(2, nothing);
 	// Group 1, through commit(): the open-record waiter fails with the refusal.
-	driver.stage(record(1, 2, room - d::record_cost(0) + 1));
+	driver.stage(record(1, 2, over()));
 	Outcome open1; task::spawn(ref, wait(open1, 1, 3)); loop.run();
 	driver.commit(); loop.run();
 	check(open1.done && is<std::length_error>(open1.error), "the open-record waiter fails with the refusal: " + what(open1.error));
@@ -274,7 +341,7 @@ void owed() {
 	// Group 2, by hand: its record 2 is in the turn the refusal of 3 leaves, and a waiter on 2
 	// links while that turn is in flight.
 	driver.stage(record(2, 2, 10));
-	driver.stage(record(2, 3, room - d::record_cost(0) + 1));
+	driver.stage(record(2, 3, over()));
 	Outcome open2, below; task::spawn(ref, wait(open2, 2, 4)); loop.run();
 	const auto& write = driver.begin(); loop.run();
 	task::spawn(ref, wait(below, 2, 2)); loop.run();
@@ -308,7 +375,7 @@ void forget() {
 	driver.stage(record(1, 1, 10, j::TurnRecordKind::Checkpoint));
 	driver.stage(record(3, 1, 10, j::TurnRecordKind::Checkpoint));
 	while (!driver.idle()) { driver.commit(); }
-	driver.stage(record(1, 2, room - d::record_cost(0) + 1));
+	driver.stage(record(1, 2, over()));
 	while (!driver.idle()) { driver.commit(); }
 	driver.forget(1); driver.forget(3);
 	check(driver.retired(1) == 3 && driver.retired(3) == 2, "retired: the refused group through 3, the plain one through 2: " + std::to_string(driver.retired(1)) + ", " + std::to_string(driver.retired(3)));
@@ -404,7 +471,7 @@ void crash() {
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
-		{"wave", wave}, {"wave_run", wave_run}, {"oversize", oversize}, {"owed", owed}, {"forget", forget}, {"crash", crash},
+		{"wave", wave}, {"wave_run", wave_run}, {"bound", bound}, {"oversize", oversize}, {"owed", owed}, {"forget", forget}, {"crash", crash},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {

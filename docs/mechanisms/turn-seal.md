@@ -155,23 +155,28 @@ For 32 KiB blocks the overhead past the records is about 16.2 KiB plus 0.4%.
 
 ## Staged records: one segment per turn
 
-`start()` takes the oldest pending records whose `record_cost` sum fits
-`turn_room(segment_bytes)`, the first record's budget above, and leaves the rest pending in order
-for the next turn. `run()`, `commit()` under the blocking entry, and a host calling `begin()` while
+`start()` takes the oldest pending records that one turn encodes in an empty segment, and leaves
+the rest pending in order for the next turn. That is the limit `TurnLog::encode` has always
+applied ("turn exceeds a segment"), so every load that fit one turn before still takes one. While
+the pending records' `record_cost` sum fits `turn_room(segment_bytes)`, the first record's budget
+above, they all fit and nothing is measured; past it, `TurnLog::fitting` finds the longest prefix
+that encodes, by binary search over trial encodes of at most a segment (no forwarded copies, which
+ride only where they fit). `turn_room` stays the sealers' budget: they need a bound before a record
+exists, and the turn cannot hold them back. `run()`, `commit()` under the blocking entry, and a host calling `begin()` while
 `idle()` is false write turn after turn until nothing is pending. A wave of opens, 64 groups each
 staging a create checkpoint and a first batch at once, so commits in two or three turns instead of
 failing the driver (consensus-wave-open, D114).
 
-- **Sealed records are never deferred.** The sealers spend the same room after the pending
-  records, so a turn that seals anything fits whole; while pending records alone exceed the room,
-  no sealer is called and the turn takes only pending records.
+- **Sealed records are never deferred.** The sealers spend `turn_room` after the pending records,
+  so a turn that seals anything is within the room and fits whole; while pending records alone
+  exceed the room, no sealer is called and the turn takes only pending records.
 - **Order and durability.** A turn takes a prefix of the pending records, so every group's records
   reach the log in sequence, and each turn is still one write and one data barrier: an operation
   completes at its own turn's barrier, and a crash between two turns of one wave keeps the first
   turn's records and the second whole or not at all.
 
-**A record no segment holds.** A pending record whose `record_cost` exceeds
-`turn_room(segment_bytes)` is refused before sealing, at the next turn, wherever it sits among the
+**A record no segment holds.** A pending record that does not encode alone in an empty segment,
+the record `TurnLog::encode` refuses, is refused before sealing, at the next turn, wherever it sits among the
 pending records: waits on it can fail before its group's older deferred records are durable. Its operation
 fails with `std::length_error("turn record exceeds a segment")`, and so does every later record of
 its group: the ones pending now, and any staged until the group is forgotten. A `durable()` wait
@@ -264,9 +269,10 @@ staged records' bound:
 
 | Case | Shows |
 |---|---|
-| `wave` | 16 seeds of 64 groups' create checkpoint and first batch plus a record of exactly the room between two small ones: every operation completes over three or more turns, each turn under the room and in staged order, and recovery holds every record in order |
+| `wave` | 16 seeds of 64 groups' create checkpoint and first batch plus a record of exactly the room between two small ones: every operation completes over several turns in staged order, and recovery holds every record in order |
 | `wave_run` | The same wave under `run()`, with 64 `durable()` waiters: every waiter resumes, the driver stays healthy |
-| `oversize` | A record one byte past the room fails its operation with `length_error`, as do its group's later records and the waits on them, linked before or after; the records around it commit; its sealer is not called again; `forget` retires the refused sequences; recovery holds the acknowledged records |
+| `bound` | At main's limit, measured through `TurnLog::append` in a new log: one record of the largest payload main encodes commits, one byte more is refused alone; the most records of 10, 100 and 1000 bytes main encodes in one turn commit in one, and one more takes a second turn; each limit lies above the room |
+| `oversize` | A record one byte past what a segment holds fails its operation with `length_error`, as do its group's later records and the waits on them, linked before or after; the records around it commit; its sealer is not called again; `forget` retires the refused sequences; recovery holds the acknowledged records |
 | `owed` | A sealed group whose waiter on the open record makes its sealer owed when its staged record is refused, through `commit()` and through `begin()` with a waiter linking below the hole while its record is in flight: the driver goes idle, a re-registered sealer leaves it idle, the blocking entry returns and `run()` sleeps |
 | `forget` | Forgetting a refused group retires through the open record past the refused ones (3 after a refused 2), as a plain group's through 2: a wait on it fails `group_closed`, and the reopened incarnation's first record does not acknowledge it |
 | `crash` | Power cut at every I/O operation of two waves, 6 seeds, cuts between two turns of one wave counted: recovery keeps every acknowledged record and the in-flight turn whole or absent |

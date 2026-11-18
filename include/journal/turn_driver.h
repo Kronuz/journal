@@ -444,23 +444,22 @@ private:
 			waiter = next;
 		}
 	}
-	// Refuses the records no segment holds, seals, then stages the oldest pending records whose
-	// costs fit an empty segment's room as one turn; nullptr when none are pending. A turn of
-	// sealed records fits whole: seal_turn spends the same room after the staged records.
+	// Refuses the records no segment holds, seals, then stages as one turn the oldest pending
+	// records that encode in an empty segment; nullptr when none are pending. A turn of sealed
+	// records fits whole: seal_turn spends an empty segment's room after the staged records.
 	const TurnLog::TurnWrite* start() {
 		if (write_) { throw std::logic_error("a turn is already in flight"); }
 		refuse();
 		try { seal_turn(); } catch (...) { fail(std::current_exception()); throw; }
 		if (pending_.empty()) { return nullptr; }
-		const auto room = whole_room();
-		std::size_t take = 0;
-		for (std::uint64_t used = 0; take < pending_.size(); ++take) {
-			used += turn_log_detail::record_cost(pending_[take].record.payload.size());
-			if (used > room) { break; }
-		}
-		// refuse() left no record above the room, so the first one always fits.
-		std::vector<TurnRecord> records; records.reserve(take);
-		for (std::size_t i = 0; i < take; ++i) { records.push_back(std::move(pending_[i].record)); }
+		std::vector<TurnRecord> records; records.reserve(pending_.size());
+		std::uint64_t used = 0;
+		for (auto& item : pending_) { used += turn_log_detail::record_cost(item.record.payload.size()); records.push_back(std::move(item.record)); }
+		// Within the room every record fits; past it, the log measures. refuse() left each record
+		// fitting alone, so the first one always fits.
+		const auto take = used <= whole_room() ? records.size() : log_.fitting(records);
+		for (std::size_t i = take; i < records.size(); ++i) { pending_[i].record = std::move(records[i]); }
+		records.resize(take);
 		flight_.assign(std::make_move_iterator(pending_.begin()), std::make_move_iterator(pending_.begin() + static_cast<std::ptrdiff_t>(take)));
 		pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(take));
 		try { write_ = log_.stage(records); }
@@ -480,9 +479,10 @@ private:
 		auto found = refused_.find(group);
 		return found != refused_.end() && sequence >= found->second.hole ? found->second.error : nullptr;
 	}
-	// Takes out of pending_ each record whose cost exceeds the room, and every later record of
-	// its group, and fails their operations and the durable() waits on them; the rest keep their
-	// order. A refused group seals nothing more, and its sealer owes nothing, until it is forgotten.
+	// Takes out of pending_ each record that does not encode alone in an empty segment, as encode()
+	// refuses it, and every later record of its group, and fails their operations and the durable()
+	// waits on them; the rest keep their order. A refused group seals nothing more, and its sealer
+	// owes nothing, until it is forgotten.
 	void refuse() {
 		const auto room = whole_room();
 		std::vector<Pending> refused;
@@ -490,7 +490,7 @@ private:
 		for (auto& item : pending_) {
 			const auto group = item.record.group, sequence = item.record.sequence;
 			auto found = refused_.find(group);
-			if (found == refused_.end() && turn_log_detail::record_cost(item.record.payload.size()) > room) {
+			if (found == refused_.end() && turn_log_detail::record_cost(item.record.payload.size()) > room && !log_.fitting(std::span(&item.record, 1))) {
 				auto error = std::make_exception_ptr(std::length_error("turn record exceeds a segment"));
 				found = refused_.emplace(group, Refusal{sequence, sequence, error}).first;
 			}
