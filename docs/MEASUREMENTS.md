@@ -58,6 +58,17 @@ Artifact version 2 adds one file synchronization per preparation before payload 
 
 The preceding version 1 artifact samples took 0.077054 and 0.706718 seconds preparing and verifying the same workloads. These individual runs expose the additional barrier cost but do not isolate it statistically. Publication remains approximately 63 ms in these samples. The format adds 12 header bytes per artifact, does not duplicate payloads, and does not change the checkpoint encoder. Reproduce with `checkpoint_bench`; no power or hosting-cost conversion is available.
 
+## Durable syncs through the IO seam
+
+Every durable sync goes through the IO seam (`IO::sync_files`, `IO::sync_data_files`), so a host that skips or counts them sees all of them. `journal_sync_seam_test open_cost 200` opens 200 groups on a real directory (a host-table commit and a first turn each) with every seam sync skipped, the mode a test host uses; the time left is the work that does not go through the seam. On the Intel Mac/AppleClang 17 Release configuration, single strict samples (journal:`3282210` before, journal:`54d2972` after):
+
+| Library | Seam syncs | Direct syncs | Per group open |
+| --- | ---: | ---: | ---: |
+| Before (main) | 0 | 203 files, 201 data | 52.9 ms |
+| After | 203 files, 201 data, skipped | 0 | 6.4 ms |
+
+The 46.5 ms difference per group (88% of the open) was syncs the skip could not reach. Single samples: this measures the open with syncs skipped, not the cost of the syncs. Reproduce with `journal_sync_seam_test open_cost 200`.
+
 ## Qualification log
 
 Each completion-driven milestone was qualified across the cluster, Detent, and sanitizer suites before it landed.

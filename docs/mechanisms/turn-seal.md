@@ -10,7 +10,7 @@
 A group that collects work between turns (strata's logged index, with its open record) registers a
 sealer instead of staging one record per operation. Each turn asks every sealer for records until
 it has none or the turn's room is spent, so the turn writes every group's work, a backlog of
-several closed records included, with one `pwrite` and one `File::sync_data`.
+several closed records included, with one `pwrite` and one data barrier through the IO seam (`TurnLog::flush`).
 
 ## The contract
 
