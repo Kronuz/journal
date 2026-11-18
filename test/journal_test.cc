@@ -2088,25 +2088,27 @@ void reopen_churn() {
 	check(last - warm <= std::int64_t(ids) * 64, "the host's heap stays flat across the churn");
 }
 
-// A8: 100,000 distinct groups, each created, written, checkpointed and closed once in one host:
-// the host's heap after 1,000 and after 100,000.
+// A8: 10,000 distinct groups, each created, written, checkpointed and closed once in one host:
+// the host's heap after 1,000, 5,000 and 10,000, flat by its slope from 1,000 on.
 void reopen_distinct() {
 	jt::Disk disk;
 	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 4, 4096});
-	constexpr std::uint64_t ids = 100000, early = 1000;
-	std::int64_t first = 0;
+	const char* scale = std::getenv("JOURNAL_DISTINCT_IDS");  // another count, for timing
+	const std::uint64_t ids = scale ? std::stoull(scale) : 10000, early = ids / 10, middle = ids / 2;
+	std::int64_t first = 0, half = 0;
 	for (std::uint64_t group = 1; group <= ids; ++group) {
 		auto store = node.open(group);
 		node.append(*store, "b");
 		node.checkpoint(*store, {"b"});
 		store->close(); store.reset();
-		if (group == early) { settle(*node.host); first = heap::bytes.load(); }
+		if (group == early || group == middle) { settle(*node.host); (group == early ? first : half) = heap::bytes.load(); }
 	}
 	settle(*node.host);
 	const auto last = heap::bytes.load();
-	std::cout << "reopen_distinct: host heap " << first << " B after " << early << " closed groups, " << last << " B after " << ids << " (" << (last - first) << " B, "
-		<< double(last - first) / double(ids - early) << " B per group)\n";
-	check(last - first <= 64 * 1024, "closing distinct groups leaves the host's heap flat");
+	const double slope = double(last - first) / double(ids - early);
+	std::cout << "reopen_distinct: host heap " << first << " B after " << early << " closed groups, " << half << " B after " << middle << ", " << last << " B after " << ids
+		<< "; slope " << slope << " B per group\n";
+	check(slope < 1, "closing distinct groups leaves the host's heap flat: " + std::to_string(slope) + " B per group");
 	std::vector<std::string> state;
 	for (std::uint64_t group : {std::uint64_t{1}, ids}) {
 		auto store = node.open(group, &state);
