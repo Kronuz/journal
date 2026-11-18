@@ -282,11 +282,15 @@ Rolling back an entire store consistently needs an external witness to detect.
 
 ## Testing
 
-`memory_io.h` is an injected filesystem that tracks visible and durable contents and
-names separately. The tests interrupt every operation before and after each side effect,
-take both namespace outcomes before a barrier, restart and then cut power, corrupt every
-durable byte, and truncate every acknowledged prefix; the sync and completion drivers run
-the same schedules and must recover the same history. The turn log runs at every crash
+The power-loss tests and fuzzers run on [faultlab](https://github.com/Kronuz/faultlab)'s
+faultfs, an injected filesystem that tracks visible and durable contents and names separately;
+a crash keeps each unsynced 512-byte sector or not and cuts an unsynced file at any sector
+boundary (`size_pick::sector`), and a truncate is durable only once synced. `journal_test.cc`
+keeps its own model; `memory_io.h` stays for consensus and Detent until they move. The tests
+interrupt every operation before and after each side effect, take both namespace outcomes
+before a barrier, restart and then cut power, corrupt every durable byte, and truncate every
+acknowledged prefix; the sync and completion drivers run the same schedules and must recover
+the same history. The turn log runs at every crash
 point with corrupted blocks (T9), and `fuzz/` fuzzes its segments and checkpoint records.
 The POSIX tests cover real create, append, checkpoint, reopen, locking, confinement, and
 rejection of symlinks, hard links, and special files.

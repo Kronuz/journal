@@ -1,6 +1,6 @@
 // Runs the fuzz target over seeded inputs without libFuzzer, as a test: valid turn-log
 // segments and checkpoint records from real workloads, and their single-byte corruptions.
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include "journal/store.h"
 
 #include <cstdio>
@@ -10,7 +10,7 @@
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size);
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 static void run(char mode, const std::string& bytes) {
 	std::string input(1, mode); input += bytes;
@@ -22,7 +22,7 @@ int main() {
 	std::size_t inputs = 0;
 	for (int seed = 0; seed < 6; ++seed) {
 		// A real segment: a few turns of several groups.
-		jt::Disk disk; jt::MemoryIO io(disk, "log/");
+		fl::filesystem disk; disk.make_directory("log"); fl::io io(disk, "log");
 		{
 			j::TurnRecovery recovered; j::TurnLog log(io, {'F', 'U', 'Z', 'Z'}, recovered, {8 * 512, 512, 1, 4, 1024});
 			std::map<std::uint64_t, std::uint64_t> next;
@@ -41,7 +41,7 @@ int main() {
 	j::Frontier genesis; genesis.identity = {'G'};
 	std::string manifest;  // built through a shared Store's create
 	{
-		jt::Disk disk; auto io = std::make_shared<jt::MemoryIO>(disk, "host/");
+		fl::filesystem disk; disk.make_directory("host"); auto io = std::make_shared<fl::io>(disk, "host");
 		const j::HostOptions options{1, {8 * 512, 512, 1, 4, 1024}};
 		{
 			j::Host host(io, {'F', 'U', 'Z', 'Z'}, options);

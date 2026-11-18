@@ -25,7 +25,7 @@
 // 4, 5 and 6 with the model's counts, then one case per row of the rule.
 
 #include "journal/framing.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
 #include <filesystem>
 #include <fstream>
@@ -273,7 +273,7 @@ void rule_rows() {
 	check(threw, "a block too small for a header and a fragment is refused");
 
 	// read_file reads a growing file, its partial last block included.
-	kronuz::journal::testing::Disk disk; kronuz::journal::testing::MemoryIO io(disk, "framing/");
+	kronuz::faultlab::filesystem disk; disk.make_directory("framing"); kronuz::faultlab::io io(disk, "framing");
 	auto file = io.create_exclusive("log"); file->write_at(0, log);
 	check(f::read_file(*file) == log, "read_file reads the whole file");
 	check(f::read_record(*file, stream, clean.records[2].offset) == std::string(700, 'x'), "read_record reads a record across blocks");

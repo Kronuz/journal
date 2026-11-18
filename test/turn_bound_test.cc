@@ -22,10 +22,10 @@
 
 // A turn never exceeds a segment: a wave of records larger than one segment commits across
 // several turns, in order; a record no segment holds fails only its group; power cut at every
-// I/O operation of a wave keeps every acknowledged record and the in-flight turn whole or absent.
-// `turn_bound_test [case]`, every case by default.
+// mutating I/O operation of a wave keeps every acknowledged record and the in-flight turn whole
+// or absent, on faultlab's faultfs. `turn_bound_test [case]`, every case by default.
+#include "faultlab/faultfs.h"
 #include "journal/blocking.h"
-#include "journal/memory_io.h"
 #include <algorithm>
 #include <functional>
 #include <iostream>
@@ -37,7 +37,7 @@
 #include <vector>
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 namespace d = kronuz::journal::turn_log_detail;
 
 namespace {
@@ -72,7 +72,7 @@ template <class E> bool is(const std::exception_ptr& error) {
 // Main's one-turn limit: TurnLog::append encodes one turn in a new log, as main's driver did with
 // every pending record, and throws "turn exceeds a segment" past it.
 bool main_encodes(std::size_t count, std::size_t payload) {
-	jt::Disk disk; jt::MemoryIO io(disk);
+	fl::filesystem disk; fl::io io(disk);
 	j::TurnDriver driver(io, identity, options);
 	std::vector<j::TurnRecord> records;
 	for (std::size_t i = 0; i < count; ++i) { records.push_back(record(i + 1, 1, payload, j::TurnRecordKind::Checkpoint)); }
@@ -99,11 +99,11 @@ std::size_t main_count(std::size_t payload) {
 // A staged record's operation: records whether the disk had power when its turn submitted it,
 // and how it completed.
 struct Op final : j::IOOperation {
-	Op(j::IO& io, const jt::Disk& disk) : backend(io), power(disk) {}
+	Op(j::IO& io, const fl::filesystem& disk) : backend(io), power(disk) {}
 	const j::MutationRequest& request() const override { return request_; }
 	void submitted() override {
 		if (busy || finished) { throw std::logic_error("submitted twice"); }
-		busy = true; live = !power.dead();
+		busy = true; live = !power.powered_off();
 	}
 	bool complete(j::MutationCompletion completion) noexcept override {
 		if (!busy) { return false; }
@@ -116,7 +116,7 @@ struct Op final : j::IOOperation {
 	bool acknowledged() const noexcept { return finished && !error; }
 
 	j::IO& backend;
-	const jt::Disk& power;
+	const fl::filesystem& power;
 	j::MutationRequest request_;
 	std::exception_ptr error;
 	bool busy = false, finished = false, live = false;
@@ -132,7 +132,7 @@ struct Staged { j::TurnRecord record; std::shared_ptr<Op> op; };
 void wave() {
 	for (std::uint64_t seed = 1; seed <= 16; ++seed) {
 		const auto at = "seed " + std::to_string(seed);
-		jt::Disk disk; jt::MemoryIO io(disk);
+		fl::filesystem disk; fl::io io(disk);
 		std::mt19937_64 random(seed);
 		Model model; std::vector<Staged> staged;
 		std::uint64_t cost = 0;
@@ -182,7 +182,7 @@ void wave() {
 // A1 through run(): a wave staged at once while run() sleeps, every group waiting on its last
 // record; run() writes turn after turn until every waiter resumes.
 void wave_run() {
-	jt::Disk disk; jt::MemoryIO io(disk);
+	fl::filesystem disk; fl::io io(disk);
 	j::TurnDriver driver(io, identity, options);
 	task::inline_scheduler loop; auto ref = task::scheduler_ref::of(loop);
 	j::InlineCompletion inline_io; task::cancel_source stop;
@@ -214,7 +214,7 @@ void wave_run() {
 // after; its group's sealer is no longer called. The driver stays healthy: the records staged
 // around it, and later ones, commit, and recovery holds them.
 void oversize() {
-	jt::Disk disk; jt::MemoryIO io(disk);
+	fl::filesystem disk; fl::io io(disk);
 	Model model;
 	{
 		j::TurnDriver driver(io, identity, options);
@@ -276,7 +276,7 @@ void oversize() {
 void bound() {
 	struct Run { unsigned commits = 0; std::vector<unsigned> turn; std::vector<std::exception_ptr> errors; bool failed = false; };
 	auto drive = [](const std::vector<j::TurnRecord>& records) {
-		jt::Disk disk; jt::MemoryIO io(disk);
+		fl::filesystem disk; fl::io io(disk);
 		j::TurnDriver driver(io, identity, options);
 		std::vector<std::shared_ptr<Op>> ops;
 		for (const auto& r : records) { ops.push_back(std::make_shared<Op>(io, disk)); driver.stage(r, ops.back()); }
@@ -318,7 +318,7 @@ void bound() {
 // linked below the hole or a new registration, so the driver goes idle and run() and the
 // blocking entry sleep instead of spinning.
 void owed() {
-	jt::Disk disk; jt::MemoryIO io(disk);
+	fl::filesystem disk; fl::io io(disk);
 	j::TurnDriver driver(io, identity, options);
 	task::inline_scheduler loop; auto ref = task::scheduler_ref::of(loop);
 	struct Outcome { bool done = false; std::exception_ptr error; };
@@ -370,7 +370,7 @@ void owed() {
 // open record a writer may hold, as it does past a plain group's last record: a wait on it fails
 // group_closed, and a reopened incarnation's first record never acknowledges it.
 void forget() {
-	jt::Disk disk; jt::MemoryIO io(disk);
+	fl::filesystem disk; fl::io io(disk);
 	j::TurnDriver driver(io, identity, options);
 	driver.stage(record(1, 1, 10, j::TurnRecordKind::Checkpoint));
 	driver.stage(record(3, 1, 10, j::TurnRecordKind::Checkpoint));
@@ -398,11 +398,11 @@ void forget() {
 	check(driver.sequence(1) == 4 && !driver.failed(), "the reopened group commits past the retired sequences");
 }
 
-// A3. Power is cut at every I/O operation of a run of two waves, each larger than a segment, so
+// A3. Power is cut at every mutating I/O operation of a run of two waves, each larger than a segment, so
 // cuts fall inside a turn and between two turns of one wave. Recovery keeps every acknowledged
 // record, and the turn in flight at the cut whole or not at all; no turn ever exceeds a segment.
 bool crash_run(std::uint64_t seed, std::uint64_t cut, bool& reached, unsigned& between) {
-	jt::Disk disk; disk.random.seed(seed * 7919 + cut); jt::MemoryIO io(disk);
+	fl::filesystem disk; fl::io io(disk);
 	std::mt19937_64 random(seed);
 	Model acknowledged; std::vector<Staged> staged;
 	std::size_t folded = 0;  // staged[0, folded) are acknowledged, in turn order
@@ -410,7 +410,7 @@ bool crash_run(std::uint64_t seed, std::uint64_t cut, bool& reached, unsigned& b
 	bool split = false;  // a wave has acknowledged turns and records still to write
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	try {
-		disk.cut = cut;
+		disk.power_off_after(cut - 1);
 		j::TurnDriver driver(io, identity, options);
 		for (unsigned round = 0; round < 2; ++round) {
 			const auto first = staged.size();
@@ -433,16 +433,15 @@ bool crash_run(std::uint64_t seed, std::uint64_t cut, bool& reached, unsigned& b
 			driver.log().prepare();
 		}
 		reached = true;
-	} catch (const jt::PowerLoss&) {
 	} catch (const std::exception& error) {
-		check(false, "run threw " + std::string(error.what()) + ": " + at);
+		check(disk.powered_off(), "only the power cut fails the run, which threw " + std::string(error.what()) + ": " + at);
 	}
 	if (split) { ++between; }
 	std::vector<j::TurnRecord> in_flight;
 	for (std::size_t i = folded; i < staged.size(); ++i) {
 		if (staged[i].op->live && !staged[i].op->acknowledged()) { in_flight.push_back(staged[i].record); }
 	}
-	disk.power_loss();
+	disk.crash(seed * 7919 + cut, {.size = fl::size_pick::sector});
 	try {
 		j::TurnDriver after(io, identity, options);
 		const auto& recovered = after.recovered();

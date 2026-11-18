@@ -25,9 +25,9 @@
 // torn-tail truncation. A CountingIO counts the seam's calls and each File::sync made past it.
 // `sync_seam_test [case]` runs one case; `sync_seam_test open_cost [groups]` times group opens
 // with every seam sync skipped (docs/MEASUREMENTS.md).
+#include "faultlab/faultfs.h"
 #include "journal/host.h"
 #include "journal/journal.h"
-#include "journal/memory_io.h"
 #include "journal/turn_log.h"
 #include "completion/posix.h"
 #include <chrono>
@@ -35,7 +35,7 @@
 #include <iostream>
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 int checks = 0, failures = 0;
@@ -101,8 +101,8 @@ const j::TurnLogOptions turn_options{16 * 1024, 1024, 1, 4, 4096};
 
 // A host's table commit syncs its shard file once through the seam, then the directory once.
 void host_table() {
-	jt::Disk disk;
-	auto io = std::make_shared<CountingIO>(std::make_shared<jt::MemoryIO>(disk, "host/"));
+	fl::filesystem disk; disk.make_directory("host");
+	auto io = std::make_shared<CountingIO>(std::make_shared<fl::io>(disk, "host"));
 	j::Host host(io, host_identity, j::HostOptions{1, turn_options});
 	const auto opened = io->counts;
 	expect(opened.direct + opened.direct_data, 0, "opening the host syncs no file past the seam");
@@ -116,8 +116,8 @@ void host_table() {
 
 // Preparing a turn log segment syncs the preallocated file through the seam, then the directory.
 void turn_segments() {
-	jt::Disk disk;
-	CountingIO io(std::make_shared<jt::MemoryIO>(disk));
+	fl::filesystem disk;
+	CountingIO io(std::make_shared<fl::io>(disk));
 	j::TurnRecovery recovered;
 	j::TurnLog log(io, j::Identity{'T', 'U', 'R', 'N'}, recovered, turn_options);
 	log.prepare();
@@ -129,8 +129,8 @@ void turn_segments() {
 // Each turn's data barrier goes through the seam: one sync_data_files call per turn, and the
 // open record's.
 void turn_flush() {
-	jt::Disk disk;
-	CountingIO io(std::make_shared<jt::MemoryIO>(disk));
+	fl::filesystem disk;
+	CountingIO io(std::make_shared<fl::io>(disk));
 	j::TurnRecovery recovered;
 	j::TurnLog log(io, j::Identity{'T', 'U', 'R', 'N'}, recovered, turn_options);
 	for (std::uint64_t turn = 1; turn <= 5; ++turn) {
@@ -145,9 +145,9 @@ void turn_flush() {
 // A journal's creation syncs its header through the seam; recovering a torn tail truncates it
 // and syncs the file through the seam once.
 void journal_tail() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	{
-		CountingIO io(std::make_shared<jt::MemoryIO>(disk));
+		CountingIO io(std::make_shared<fl::io>(disk));
 		j::Journal journal(io, 1024);
 		journal.create(j::Identity{'A'});
 		check(io.counts.seam >= 1, "creation syncs the data file header through the seam");
@@ -155,10 +155,10 @@ void journal_tail() {
 		expect(io.counts.direct + io.counts.direct_data, 0, "create and append sync no file past the seam");
 	}
 	std::string data;
-	for (const auto& [name, id] : disk.names) { if (name.starts_with("journal-")) { data = name; } }
+	for (const auto& name : disk.list()) { if (name.starts_with("journal-")) { data = name; } }
 	check(!data.empty(), "the journal's data file exists");
-	{ jt::MemoryIO raw(disk); auto file = raw.open_existing(data); file->write_at(file->size(), "torn tail"); file->sync(); }
-	CountingIO io(std::make_shared<jt::MemoryIO>(disk));
+	{ fl::io raw(disk); auto file = raw.open_existing(data); file->write_at(file->size(), "torn tail"); file->sync(); }
+	CountingIO io(std::make_shared<fl::io>(disk));
 	j::Journal journal(io, 1024);
 	std::size_t batches = 0;
 	journal.recover([&](auto, auto) { ++batches; });

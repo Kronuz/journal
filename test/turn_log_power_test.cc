@@ -21,11 +21,12 @@
  */
 
 // T9 (strata Track C): RFTW0001 under power loss. A randomized multi-group workload over
-// an in-memory filesystem whose unsynced 512-byte sectors each persist or not, and whose
-// namespace changes persist only after a directory sync. Power is cut after every I/O
-// operation of each run, and at every third point again during the recovery that follows.
-// Segments recycle, so stale blocks from an earlier use are present (condition 10).
-#include "journal/memory_io.h"
+// faultlab's faultfs, whose unsynced 512-byte sectors each persist or not, whose unsynced size
+// may end at any sector boundary (size_pick::sector), and whose namespace changes persist only
+// after a directory sync. Power is cut after every mutating I/O operation of each run, and at
+// every third point again during the recovery that follows. Segments recycle, so stale blocks
+// from an earlier use are present (condition 10).
+#include "faultlab/faultfs.h"
 #include "journal/turn_log.h"
 #include <cstdlib>
 #include <iostream>
@@ -41,7 +42,9 @@ void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 20) { std::cerr << "FAIL: " << what << '\n'; } }
 }
-using namespace j::testing;
+namespace fl = kronuz::faultlab;
+// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
+const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
 
 const j::Identity identity{'P', 'O', 'W', 'E', 'R'};
 using Model = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
@@ -78,41 +81,42 @@ struct Workload {
 };
 const j::TurnLogOptions options{8 * 512, 512, 1, 3, 600};
 
-// Runs `turns` turns, cutting power at operation `cut` (and at `second` during the
-// recovery that follows), then reopens and continues for `after` more turns.
+// Runs `turns` turns, cutting power at mutation `cut` (and at `second` during the recovery
+// that follows), then reopens and continues for `after` more turns. Only the power cut fails a
+// run: any other error is a failure.
 void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned turns, unsigned after) {
-	Disk disk; disk.random.seed(seed * 7919 + cut); MemoryIO io(disk); Workload work(seed);
-	j::TurnRecovery recovered; bool lost_power = false;
+	fl::filesystem disk; fl::io io(disk); Workload work(seed);
+	j::TurnRecovery recovered;
+	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut) + " second " + std::to_string(second);
 	try {
-		disk.cut = cut;
+		disk.power_off_after(cut - 1);
 		j::TurnLog log(io, identity, recovered, options);
 		for (unsigned t = 0; t < turns; ++t) {
 			work.in_flight = work.turn(log); log.append(work.in_flight);
 			work.acknowledge(work.in_flight); work.in_flight.clear();
 			log.prepare();
 		}
-	} catch (const PowerLoss&) { lost_power = true; }
-	disk.power_loss();
+	} catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails the run: " + at + ": " + error.what()); }
+	disk.crash(seed * 7919 + cut, sector_cut);
 	if (second) {
-		disk.cut = disk.operations + second;
-		try { j::TurnLog log(io, identity, recovered, options); } catch (const PowerLoss&) {}
-		disk.power_loss();
+		disk.power_off_after(second - 1);
+		try { j::TurnLog log(io, identity, recovered, options); }
+		catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails recovery: " + at + ": " + error.what()); }
+		disk.crash(seed * 7919 + cut + (second << 32), sector_cut);
 	}
 	try {
 		j::TurnLog log(io, identity, recovered, options);
-		const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut) + " second " + std::to_string(second);
 		check(!recovered.damaged && recovered.lost.empty(), "power loss alone damages nothing and loses no group: " + at);
 		check(work.matches(recovered), "every acknowledged record survives, and the in-flight turn whole or not at all: " + at);
 		work.in_flight.clear();
 		for (unsigned t = 0; t < after; ++t) { auto batch = work.turn(log); log.append(batch); work.acknowledge(batch); }
 	} catch (const std::exception& error) {
-		check(false, "seed " + std::to_string(seed) + " cut " + std::to_string(cut) + ": " + error.what());
+		check(false, at + ": " + error.what());
 	}
-	(void)lost_power;
 }
 
 // The blocks each record's fragments occupy, on a clean disk: what a damaged block may cost.
-std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> groups_by_block(MemoryIO& io) {
+std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> groups_by_block(j::IO& io) {
 	namespace d = j::turn_log_detail; namespace f = j::framing;
 	std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> result;
 	auto cursor = io.scan_directory();
@@ -140,9 +144,9 @@ std::map<std::pair<std::uint64_t, std::uint64_t>, std::set<std::uint64_t>> group
 // One corrupted block costs only the groups with records in it: every other group's
 // acknowledged records survive, and the damage is reported.
 void corrupted_blocks(std::uint64_t seed, std::uint64_t& blocks) {
-	Disk clean; MemoryIO clean_io(clean); Workload work(seed); j::TurnRecovery recovered;
+	fl::filesystem clean; fl::io clean_io(clean); Workload work(seed); j::TurnRecovery recovered;
 	{ j::TurnLog log(clean_io, identity, recovered, options); for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); } }
-	clean.power_loss();  // everything acknowledged is durable
+	clean.crash(seed, sector_cut);  // everything acknowledged is durable
 	auto truth = groups_by_block(clean_io);
 	if (truth.empty()) { return; }
 	// Damage to the last turn reads as a torn tail: recovery cannot tell it from a turn
@@ -165,12 +169,15 @@ void corrupted_blocks(std::uint64_t seed, std::uint64_t& blocks) {
 	}
 	for (const auto& [where, groups] : truth) {
 		if (where >= last) { continue; }
-		Disk disk = clean; MemoryIO io(disk); ++blocks;
+		fl::filesystem disk = clean.snapshot(); fl::io io(disk); ++blocks;
 		auto name = j::turn_log_detail::segment_name(where.first);
-		auto& inode = disk.inodes.at(disk.names.at(name));
 		std::mt19937_64 random(seed * 131 + where.second);
 		const auto offset = where.second * options.block_bytes + random() % options.block_bytes;
-		inode.durable[offset] = static_cast<char>(inode.durable[offset] ^ 0x5a);
+		{
+			auto file = io.open_existing(name); char byte = 0;
+			check(file->read_at(offset, std::span<char>(&byte, 1)) == 1, "the damaged byte is in the segment");
+			byte = static_cast<char>(byte ^ 0x5a); file->write_at(offset, std::string_view(&byte, 1)); file->sync();
+		}
 		const auto at = "seed " + std::to_string(seed) + " segment " + std::to_string(where.first) + " block " + std::to_string(where.second);
 		try {
 			j::TurnLog log(io, identity, recovered, options);
@@ -199,14 +206,14 @@ int main(int argc, char** argv) {
 	const std::uint64_t seeds = argc > 1 ? std::stoull(argv[1]) : 8;
 	std::uint64_t points = 0, seconds = 0;
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
-		// How many operations an uninterrupted run makes.
-		Disk disk; MemoryIO io(disk); Workload work(seed); j::TurnRecovery recovered;
+		// How many mutations an uninterrupted run makes.
+		fl::filesystem disk; fl::io io(disk); Workload work(seed); j::TurnRecovery recovered;
 		{
 			j::TurnLog log(io, identity, recovered, options);
 			for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); }
 			check(log.stats().segments_recycled > 0 && log.stats().forwarded_records > 0, "the run recycles segments and moves records forward (condition 10)");
 		}
-		for (std::uint64_t cut = 1; cut <= disk.operations; ++cut, ++points) {
+		for (std::uint64_t cut = 1; cut <= disk.mutations(); ++cut, ++points) {
 			const std::uint64_t second = cut % 3 == 0 ? cut % 7 + 1 : 0;
 			seconds += second != 0;
 			run(seed, cut, second, 60, 5);
