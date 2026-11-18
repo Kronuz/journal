@@ -478,7 +478,12 @@ private:
 		pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(take));
 		try { write_ = log_.stage(records); }
 		catch (...) { fail(std::current_exception()); throw; }
-		for (auto& item : flight_) { if (item.operation) { item.operation->submitted(); item.submitted = true; } }
+		// An operation that refuses submission (its Store fenced) is dropped, never told; its
+		// record goes with the turn, so its group's sequence stays whole and its neighbors run.
+		for (auto& item : flight_) {
+			if (!item.operation) { continue; }
+			try { item.operation->submitted(); item.submitted = true; } catch (...) { item.operation.reset(); }
+		}
 		return &*write_;
 	}
 	// The record cost one turn may carry in an empty segment.

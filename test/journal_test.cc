@@ -1920,13 +1920,16 @@ void reopen_released(bool fenced) {
 	std::vector<std::string> state, expected{"a1", "a2", "a3"};
 	{
 		Shared node(disk);
-		auto a = node.open(7);
+		auto a = node.open(7), neighbor = node.open(9);
 		node.append(*a, "a1"); node.checkpoint(*a, {"a1"}); node.append(*a, "a2");
 		auto staged = node.stage(*a, "a3");
 		if (fenced) { a->fence_storage(); staged.reset(); }
 		a.reset();
 		check(busy(node, 7), "a recover while the ended Store's record is staged is busy: " + kind);
+		auto beside = node.stage(*neighbor, "n1");
 		node.commit();
+		check(!throws([&] { beside->result(); }), "a neighbor's append in the ended Store's turn completes: " + kind);
+		beside.reset(); neighbor.reset();
 		if (!fenced) { staged->result(); staged.reset(); }
 		auto filler = node.open(8);
 		for (int b = 0; b < 200; ++b) { node.append(*filler, std::string(900, 'x')); }
@@ -2122,11 +2125,11 @@ void reopen_heap() {
 	}
 	const auto held = heap::bytes.load();
 	settle(*node.host);
-	const auto parked = heap::bytes.load();
+	const auto settled = heap::bytes.load();
 	bool all = true;
 	for (std::uint64_t group = 1; group <= ids; ++group) { all &= parked(node.turns(), group); }
 	check(all, "settle parks every released group");
-	const double before = double(held - empty) / ids, after = double(parked - empty) / ids;
+	const double before = double(held - empty) / ids, after = double(settled - empty) / ids;
 	std::cout << "reopen_heap: " << ids << " released groups, " << before << " B per group before settle, " << after << " B after\n";
 	check(after < before && after < 400, "a released group keeps little of the host's heap");
 	std::vector<std::string> state;
