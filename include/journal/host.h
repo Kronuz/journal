@@ -34,6 +34,7 @@
 #pragma once
 
 #include "turn_driver.h"
+#include <cerrno>
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -41,6 +42,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <system_error>
 #include <tuple>
 #include <vector>
 
@@ -277,7 +279,7 @@ public:
 		if (found->state == GroupState::closed) { return GroupStatus::closed; }
 		auto& turns = drivers_.at(loop(group));
 		if (turns->lost(group)) { return GroupStatus::lost; }
-		return opened_.contains(group) || turns->has_group(group) || !found->manifest.empty() ? GroupStatus::stored : GroupStatus::none;
+		return opened_[loop(group)].contains(group) || turns->has_group(group) || turns->holds(group) || !found->manifest.empty() ? GroupStatus::stored : GroupStatus::none;
 	}
 	// The group's view of the directory: its own names, and a scan that probes its serials.
 	std::shared_ptr<IO> group_io(std::uint64_t group) {
@@ -301,7 +303,53 @@ public:
 	}
 
 	// A Store recovered the group: it is stored whatever its turn log still holds in memory.
-	void attach(std::uint64_t group) { opened_.insert(group); }
+	void attach(std::uint64_t group) { opened_[loop(group)].insert(group); }
+
+	// A Store's hold on its group (journal.h), from its create or recover until its close or the
+	// end of its Journal, whichever comes first: two live Stores never hold one id. Busy
+	// (EWOULDBLOCK, as a held owner lock is) while another Store holds the group or while records
+	// its last one staged are unsettled. On the group's loop; a hold ends on any thread.
+	class Hold {
+	public:
+		Hold(const Hold&) = delete;
+		Hold& operator=(const Hold&) = delete;
+		~Hold() { host_.unhold(group_); }
+	private:
+		friend class Host;
+		Hold(Host& host, std::uint64_t group) : host_(host), group_(group) {}
+		Host& host_;
+		std::uint64_t group_;
+	};
+	std::unique_ptr<Hold> hold(std::uint64_t group) {
+		const auto at = loop(group);
+		settle(at);
+		const bool staged = driver(at).staged(group);
+		std::lock_guard lock(holds_mutex_);
+		if (staged || holds_.contains(group)) {
+			throw std::system_error(EWOULDBLOCK, std::generic_category(), "the group is held by a live Store or its last records are unsettled");
+		}
+		holds_.insert(group);
+		return std::unique_ptr<Hold>(new Hold(*this, group));
+	}
+	bool holding(std::uint64_t group) const { std::lock_guard lock(holds_mutex_); return holds_.contains(group); }
+	// Releases the loop's groups whose holds ended and whose records are settled: each leaves
+	// memory but not the log (TurnDriver::park), so retention keeps every durable record and
+	// the next recover reads them back. On the loop; hold() runs it first.
+	void settle(std::uint32_t at) {
+		std::vector<std::uint64_t> ended;
+		{ std::lock_guard lock(holds_mutex_); ended.swap(released_[at]); }
+		std::vector<std::uint64_t> unsettled;
+		auto& turns = driver(at);
+		for (auto group : ended) {
+			if (holding(group)) { continue; }
+			if (turns.staged(group)) { unsettled.push_back(group); continue; }
+			turns.park(group); opened_[at].erase(group);
+		}
+		if (!unsettled.empty()) {
+			std::lock_guard lock(holds_mutex_);
+			released_[at].insert(released_[at].end(), unsettled.begin(), unsettled.end());
+		}
+	}
 	// The shared Journal's table transitions (journal.h); each is durable when it returns.
 	// A new incarnation of the group, with its first serial block: a group the table does not
 	// hold, or one whose first turn never became durable, whose artifacts go first.
@@ -311,7 +359,7 @@ public:
 			if (remove_artifacts(group, entry)) { io_->sync_directory(); }
 			entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, host_detail::serial_block, 0, {}, 0};
 		});
-		opened_.insert(group);
+		opened_[loop(group)].insert(group);
 	}
 	void reopen_group(std::uint64_t group) {
 		held(group, GroupState::closed);
@@ -344,6 +392,11 @@ public:
 	}
 
 private:
+	void unhold(std::uint64_t group) noexcept {
+		std::lock_guard lock(holds_mutex_);
+		holds_.erase(group);
+		try { released_[loop(group)].push_back(group); } catch (...) {}  // unsettled: its records stay indexed
+	}
 	GroupEntry& held(std::uint64_t group, GroupState state) {
 		auto& shard = shards_[host_detail::slot(group)];
 		auto found = shard.find(group);
@@ -447,6 +500,7 @@ private:
 		if (removed) { io_->sync_directory(); }
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
+		opened_.resize(loops_); released_.resize(loops_);
 		auto groups = known(loops_);
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
@@ -530,7 +584,10 @@ private:
 	std::vector<std::map<std::uint64_t, GroupEntry>> shards_ = std::vector<std::map<std::uint64_t, GroupEntry>>(host_detail::slots);
 	std::map<std::pair<std::uint64_t, std::uint32_t>, std::vector<std::string>> logs_;
 	std::vector<std::shared_ptr<IO>> loop_views_;
-	std::set<std::uint64_t> opened_;  // groups a Store created or recovered this open
+	std::vector<std::set<std::uint64_t>> opened_;  // per loop: groups a Store created or recovered, until released
+	mutable std::mutex holds_mutex_;
+	std::set<std::uint64_t> holds_;  // groups a live Store holds
+	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()
 	std::multimap<std::uint64_t, std::weak_ptr<host_detail::Range>> ranges_;  // the groups' views
 	std::vector<std::unique_ptr<TurnDriver>> drivers_;
 };

@@ -137,6 +137,14 @@ public:
 		auto found = recovered_.groups.find(group); return found == recovered_.groups.end() ? none : found->second;
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
+	// A group no Store holds leaves memory but not the log (TurnLog::park); live() reads its
+	// records back for the next Store. Nothing of it may be staged.
+	void park(std::uint64_t group) {
+		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
+		log_.park(group); recovered_.groups.erase(group);
+	}
+	bool parked(std::uint64_t group) const { return log_.parked(group); }
+	std::vector<TurnRecord> live(std::uint64_t group) { return log_.live(group); }
 	// A closed group leaves the log (TurnLog::forget) and its sealer is unregistered: no
 	// sealer of it runs once this returns. Nothing of it may be staged. Every durable() waiter
 	// of the group fails with group_closed, and the sequences it could hold are retired.
