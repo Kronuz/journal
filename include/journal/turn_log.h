@@ -432,7 +432,7 @@ private:
 	}
 	// Releases segments from the oldest while no live record remains in them: recycled into
 	// the spare pool while it is short, removed otherwise. Only the oldest go, each ordered
-	// ahead of the next, so a power cut keeps the oldest of them and the turns left stay contiguous.
+	// ahead of the next, so a power cut undoes only the newest of them and the turns left stay contiguous.
 	void reclaim() {
 		bool changed = false;
 		while (!data_segments_.empty() && *data_segments_.begin() != segment_ && !live_counts_.contains(*data_segments_.begin())) {
