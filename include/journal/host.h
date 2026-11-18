@@ -37,6 +37,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -268,12 +269,16 @@ public:
 	TurnDriver& driver(std::uint32_t loop) { return *drivers_.at(loop); }
 	TurnDriver& driver_of(std::uint64_t group) { return driver(loop(group)); }
 	IO& io() noexcept { return *io_; }
-	const GroupEntry* entry(std::uint64_t group) const {
-		const auto& shard = shards_[host_detail::slot(group)];
-		auto found = shard.find(group); return found == shard.end() ? nullptr : &found->second;
+	// The group's table entry. Open and lost entries live in memory; a closed one only in its
+	// shard file, read back here, so a closed id costs the live host nothing.
+	std::optional<GroupEntry> entry(std::uint64_t group) const {
+		if (const auto* found = resident(group)) { return *found; }
+		return stored(group);
 	}
 	GroupStatus status(std::uint64_t group) const {
-		const auto* found = entry(group);
+		std::optional<GroupEntry> closed;
+		const auto* found = resident(group);
+		if (!found) { closed = stored(group); found = closed ? &*closed : nullptr; }
 		if (!found) { return GroupStatus::none; }
 		if (found->state == GroupState::lost) { return GroupStatus::lost; }
 		if (found->state == GroupState::closed) { return GroupStatus::closed; }
@@ -287,7 +292,7 @@ public:
 		std::erase_if(ranges_, [](const auto& item) { return item.second.expired(); });
 		auto range = std::make_shared<host_detail::Range>();
 		ranges_.emplace(group, range);
-		if (const auto* found = entry(group)) { publish(group, *found); }
+		if (const auto* found = resident(group)) { publish(group, *found); }
 		return std::make_shared<PrefixIO>(io_, host_detail::group_prefix(group), [io = io_, group, range]() -> std::unique_ptr<DirectoryCursor> {
 			std::uint64_t incarnation, serial, high;
 			{ std::lock_guard hold(range->mutex); incarnation = range->incarnation; serial = range->mark; high = range->high; }
@@ -362,6 +367,7 @@ public:
 		opened_[loop(group)].insert(group);
 	}
 	void reopen_group(std::uint64_t group) {
+		if (!resident(group)) { if (auto closed = stored(group)) { shards_[host_detail::slot(group)].emplace(group, std::move(*closed)); } }
 		held(group, GroupState::closed);
 		update(group, [](GroupEntry& entry) { entry.state = GroupState::open; });
 	}
@@ -380,7 +386,8 @@ public:
 		update(group, [&](GroupEntry& entry) {
 			settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
 		});
-		turns.forget(group);
+		shards_[host_detail::slot(group)].erase(group);
+		turns.forget(group, sequence + 1);
 	}
 	// The group's next artifact identity; a used-up block reserves the next one in the table.
 	Identity next_artifact(std::uint64_t group) {
@@ -392,6 +399,31 @@ public:
 	}
 
 private:
+	const GroupEntry* resident(std::uint64_t group) const {
+		const auto& shard = shards_[host_detail::slot(group)];
+		auto found = shard.find(group); return found == shard.end() ? nullptr : &found->second;
+	}
+	// The slot's shard file as stored, or nothing before its first commit.
+	std::map<std::uint64_t, GroupEntry> stored_shard(std::uint32_t slot) const {
+		if (!stored_[slot]) { return {}; }
+		return host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name(slot), std::uint64_t{1} << 32), identity_, slot);
+	}
+	std::optional<GroupEntry> stored(std::uint64_t group) const {
+		auto entries = stored_shard(host_detail::slot(group));
+		auto found = entries.find(group);
+		if (found == entries.end()) { return std::nullopt; }
+		return std::move(found->second);
+	}
+	// retired() for the loops' drivers: a group the table closed retires through its close's
+	// sequence + 1 (TurnDriver::forget keeps any floor past it), and so does the incarnation
+	// reopened after it, until its own close. An unreadable table retires every sequence.
+	std::uint64_t retired_floor(std::uint64_t group) const noexcept {
+		try {
+			if (const auto* found = resident(group)) { return found->base ? found->base + 1 : 0; }
+			const auto closed = stored(group);
+			return closed && closed->base ? closed->base + 1 : 0;
+		} catch (...) { return std::numeric_limits<std::uint64_t>::max(); }
+	}
 	void unhold(std::uint64_t group) noexcept {
 		std::lock_guard lock(holds_mutex_);
 		holds_.erase(group);
@@ -425,11 +457,21 @@ private:
 		if (auto found = shard.find(group); found != shard.end()) { before = found->second; }
 		auto& entry = shard[group];
 		try { change(entry); commit({host_detail::slot(group)}); }
-		catch (...) { if (before) { entry = std::move(*before); } else { shard.erase(group); } throw; }
+		catch (...) {
+			if (before && before->state != GroupState::closed) { entry = std::move(*before); } else { shard.erase(group); }
+			throw;
+		}
 	}
 	// Replaces the shards, then syncs the directory once; the groups' views see their ranges.
+	// A shard holds the slot's entries in memory and the closed ones only its file holds.
 	void commit(const std::set<std::uint32_t>& slots) {
-		for (auto slot : slots) { host_detail::replace_file(*io_, host_detail::shard_name(slot), host_detail::encode_shard(identity_, shards_[slot])); }
+		for (auto slot : slots) {
+			auto entries = stored_shard(slot);
+			std::erase_if(entries, [&](const auto& item) { return item.second.state != GroupState::closed || shards_[slot].contains(item.first); });
+			for (const auto& [id, entry] : shards_[slot]) { entries.insert_or_assign(id, entry); }
+			host_detail::replace_file(*io_, host_detail::shard_name(slot), host_detail::encode_shard(identity_, entries));
+			stored_[slot] = true;
+		}
 		io_->sync_directory();
 		for (auto slot : slots) { for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); } }
 	}
@@ -488,7 +530,7 @@ private:
 		} else {
 			std::tie(stored, generation_) = host_detail::decode_layout(host_detail::read_file(*io_, host_detail::layout_name, 64), identity_);
 		}
-		for (auto slot : names.shards) { shards_[slot] = host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name(slot), std::uint64_t{1} << 32), identity_, slot); }
+		for (auto slot : names.shards) { shards_[slot] = host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name(slot), std::uint64_t{1} << 32), identity_, slot); stored_[slot] = true; }
 		// Logs of another generation are leftovers: an unfinished re-partition's, or the old
 		// generation's that its commit had not yet removed.
 		bool removed = false;
@@ -506,10 +548,12 @@ private:
 			auto view = loop_io(generation_, loop);
 			loop_views_.push_back(view);
 			drivers_.push_back(std::make_unique<TurnDriver>(*view, identity_, options_.turns, groups[loop]));
+			drivers_.back()->retire_with([this](std::uint64_t group) { return retired_floor(group); });
 		}
 		std::set<std::uint64_t> lost;
 		for (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }
 		mark_lost(lost);
+		for (auto& shard : shards_) { std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; }); }
 	}
 	// Every open marks the ids recovery calls lost, durably, before it serves; then their
 	// artifacts go, and the entries keep the ids refused for good.
@@ -581,7 +625,8 @@ private:
 	std::unique_ptr<OwnerLock> lock_;  // released after the drivers' files close
 	std::uint32_t loops_ = 0;
 	std::uint64_t generation_ = 0;
-	std::vector<std::map<std::uint64_t, GroupEntry>> shards_ = std::vector<std::map<std::uint64_t, GroupEntry>>(host_detail::slots);
+	std::vector<std::map<std::uint64_t, GroupEntry>> shards_ = std::vector<std::map<std::uint64_t, GroupEntry>>(host_detail::slots);  // open and lost entries
+	std::vector<bool> stored_ = std::vector<bool>(host_detail::slots);  // slots with a shard file
 	std::map<std::pair<std::uint64_t, std::uint32_t>, std::vector<std::string>> logs_;
 	std::vector<std::shared_ptr<IO>> loop_views_;
 	std::vector<std::set<std::uint64_t>> opened_;  // per loop: groups a Store created or recovered, until released

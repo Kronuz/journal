@@ -1866,6 +1866,11 @@ struct Shared {
 		commit(); publication->result();
 	}
 };
+// Host::settle and TurnDriver::parked where they exist, so the cases also build at main.
+template <class H> void settle(H& host) { if constexpr (requires { host.settle(0u); }) { host.settle(0u); } }
+template <class D> bool parked(D& turns, std::uint64_t group) {
+	if constexpr (requires { turns.parked(group); }) { return turns.parked(group); } else { return false; }
+}
 // A recover of the group refused as busy, as a held owner lock is.
 bool busy(Shared& node, std::uint64_t group) {
 	Store store(*node.host, group, reopen_limits);
@@ -2068,32 +2073,58 @@ void reopen_churn() {
 			node.checkpoint(*store, batches); store->close();
 		}
 		store.reset();
-		if (c + 1 == ids) { node.host->settle(0); warm = heap::bytes.load(); }
+		if (c + 1 == ids) { settle(*node.host); warm = heap::bytes.load(); }
 	}
-	node.host->settle(0);
+	settle(*node.host);
 	const auto last = heap::bytes.load();
 	check(wrong == 0, "every recover holds its group's batches: " + std::to_string(wrong) + " wrong");
 	std::cout << "reopen_churn: " << cycles << " cycles of " << ids << " ids, host heap " << warm << " B after the first pass, " << last << " B after the last (" << (last - warm) << " B)\n";
 	check(last - warm <= std::int64_t(ids) * 64, "the host's heap stays flat across the churn");
 }
 
-// A4b: 10,000 groups, each created, given a batch and released by its Store's end: the bytes per
+// A8: 100,000 distinct groups, each created, written, checkpointed and closed once in one host:
+// the host's heap after 1,000 and after 100,000.
+void reopen_distinct() {
+	jt::Disk disk;
+	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 4, 4096});
+	constexpr std::uint64_t ids = 100000, early = 1000;
+	std::int64_t first = 0;
+	for (std::uint64_t group = 1; group <= ids; ++group) {
+		auto store = node.open(group);
+		node.append(*store, "b");
+		node.checkpoint(*store, {"b"});
+		store->close(); store.reset();
+		if (group == early) { settle(*node.host); first = heap::bytes.load(); }
+	}
+	settle(*node.host);
+	const auto last = heap::bytes.load();
+	std::cout << "reopen_distinct: host heap " << first << " B after " << early << " closed groups, " << last << " B after " << ids << " (" << (last - first) << " B, "
+		<< double(last - first) / double(ids - early) << " B per group)\n";
+	check(last - first <= 64 * 1024, "closing distinct groups leaves the host's heap flat");
+	std::vector<std::string> state;
+	for (std::uint64_t group : {std::uint64_t{1}, ids}) {
+		auto store = node.open(group, &state);
+		check(state == std::vector<std::string>{"b"}, "a closed group recovers from the table: " + text(state));
+	}
+}
+
+// A7: 10,000 groups, each created, given a batch and released by its Store's end: the bytes per
 // group the host keeps before settle() parks them and after, and a sample that recovers exactly.
 void reopen_heap() {
 	jt::Disk disk;
 	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 1000, 4096});
 	constexpr std::uint64_t ids = 10000;
-	node.host->settle(0);
+	settle(*node.host);
 	const auto empty = heap::bytes.load();
 	for (std::uint64_t group = 1; group <= ids; ++group) {
 		auto store = node.open(group);
 		node.append(*store, "b" + std::to_string(group));
 	}
 	const auto held = heap::bytes.load();
-	node.host->settle(0);
+	settle(*node.host);
 	const auto parked = heap::bytes.load();
 	bool all = true;
-	for (std::uint64_t group = 1; group <= ids; ++group) { all &= node.turns().parked(group); }
+	for (std::uint64_t group = 1; group <= ids; ++group) { all &= parked(node.turns(), group); }
 	check(all, "settle parks every released group");
 	const double before = double(held - empty) / ids, after = double(parked - empty) / ids;
 	std::cout << "reopen_heap: " << ids << " released groups, " << before << " B per group before settle, " << after << " B after\n";
@@ -2111,7 +2142,7 @@ int main(int argc, char** argv) {
 	const std::map<std::string_view, std::function<void()>> cases{
 		{"reopen_clean_close", reopen_clean_close}, {"reopen_released", [] { reopen_released(false); reopen_released(true); }},
 		{"reopen_two_stores", reopen_two_stores}, {"reopen_race", reopen_race}, {"reopen_crash", reopen_crash},
-		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}};
+		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}, {"reopen_distinct", reopen_distinct}};
 	if (argc > 1) {
 		const auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::cerr << "no case " << argv[1] << '\n'; return 2; }

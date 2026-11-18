@@ -48,8 +48,26 @@ The records stay live for retention: the per-segment live counts do not change, 
 updating its parked positions. `TurnLog::sequence` answers for a parked group from its entry, so
 `holds()` and `status()` still see it as stored. A parked group stages nothing; `live()` unparks it.
 
-The table entry stays in memory: the table is rewritten whole from memory per slot, so dropping an
-entry would drop it from disk.
+A released group's table entry stays in memory while it is open: `next_artifact` and the serial
+range its views scan read it there.
+
+## Closing: what the Host keeps for a closed group
+
+Nothing. `close_group` commits the entry closed, with its checkpoint record, then drops it from
+memory; `Host::entry` and `status` read a closed entry back from its slot's shard file, and
+`reopen_group` loads it again. `commit` writes a slot's shard as the entries in memory plus the
+closed ones only the file holds, so an entry out of memory is never dropped from disk. The open
+loads every shard (the logs' recovery needs each closed group's base) and then drops the closed
+entries. Open and lost entries stay in memory.
+
+The turn driver's retired floor goes with it. A closed group's stale writer must not reuse a
+sequence its incarnation could have handed out, and a stale `durable()` wait at or below it fails
+with `group_closed`. `TurnDriver::forget` used to keep that floor per group forever. A Host's
+drivers now ask the table (`TurnDriver::retire_with`, `Host::retired_floor`): a group closed at
+sequence `s` retires through `s + 1`, the open record a writer may still hold, and its reopened
+incarnation keeps that floor until its own close. `forget` keeps an entry only for a floor past
+`s + 1` (a waiter on a later sequence, or refused records), so an ordinary close leaves none. A
+bare `TurnDriver` with no host keeps every floor, as before.
 
 ## Why the old guard existed
 
@@ -63,4 +81,6 @@ Store while the first was live. The hold answers the second; `TurnLog::live` ans
 `journal_test reopen_heap` releases 10,000 groups, each with its first checkpoint record and one
 batch, and reports the host's heap per group before and after `settle()`; `reopen_churn` runs
 10,000 close-and-recover cycles over 1,000 groups and reports the host's heap after the first pass
-and after the last. Both read a heap counter that leaves out the memory disk's own allocations.
+and after the last; `reopen_distinct` closes 100,000 distinct groups once each and reports the
+host's heap after 1,000 and after 100,000. All three read a heap counter that leaves out the memory
+disk's own allocations.

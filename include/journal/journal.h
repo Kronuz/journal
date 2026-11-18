@@ -598,7 +598,7 @@ private:
 			if (released) { live = turns_->live(group_); }
 			if (!turns_->has_group(group_) && !released) {
 				if (status == GroupStatus::closed) { host_->reopen_group(group_); }
-				const auto* entry = host_->entry(group_);
+				const auto entry = host_->entry(group_);
 				owner_->lock = io_.acquire_owner(false);
 				restore_checkpoint(entry->manifest, restore);
 				// The table's record covers through its base; it follows what the closed incarnation retired.

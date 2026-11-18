@@ -147,13 +147,15 @@ public:
 	std::vector<TurnRecord> live(std::uint64_t group) { return log_.live(group); }
 	// A closed group leaves the log (TurnLog::forget) and its sealer is unregistered: no
 	// sealer of it runs once this returns. Nothing of it may be staged. Every durable() waiter
-	// of the group fails with group_closed, and the sequences it could hold are retired.
-	void forget(std::uint64_t group) {
+	// of the group fails with group_closed, and the sequences it could hold are retired. The
+	// driver keeps the floor only past `implied`, the floor its host's table already gives
+	// (retire_with); a bare driver keeps every one.
+	void forget(std::uint64_t group, std::uint64_t implied = 0) {
 		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
-		auto& floor = retired_[group];
-		floor = std::max(floor, log_.sequence(group) + 1);  // the open record a writer may hold
+		auto floor = std::max(kept(group), log_.sequence(group) + 1);  // the open record a writer may hold
 		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { floor = std::max(floor, waiter->sequence); } }
 		if (auto found = refused_.find(group); found != refused_.end()) { floor = std::max(floor, found->second.last + 1); refused_.erase(found); }  // and the open record past the refused ones
+		if (floor > implied) { retired_[group] = floor; } else { retired_.erase(group); }
 		resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);
 		{
 			std::lock_guard hold(sealers_mutex_);
@@ -226,7 +228,11 @@ public:
 	std::uint64_t sequence(std::uint64_t group) const { return log_.sequence(group); }
 	// The last sequence an earlier incarnation of the group could hand out, 0 for none: a
 	// reopened group's records follow it, and a durable() at or below it fails with group_closed.
-	std::uint64_t retired(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
+	std::uint64_t retired(std::uint64_t group) const { return retired_by_ ? std::max(kept(group), retired_by_(group)) : kept(group); }
+	// A host answers retired() from its table: a group it closed retires through its close's
+	// sequence + 1, so forget() keeps no entry per closed group. Called on the loop, maybe under
+	// the sealers' lock; it must not throw.
+	void retire_with(std::function<std::uint64_t(std::uint64_t)> floor) { retired_by_ = std::move(floor); }
 	bool failed() const noexcept { return log_failed_; }
 
 	// Stages a record for the next turn that has room for it; its operation, if any, completes
@@ -658,7 +664,9 @@ private:
 	mutable std::mutex sealers_mutex_;  // the sealer table and running_; never held while a sealer runs
 	std::condition_variable sealer_done_;  // a sealer call finished
 	std::map<std::uint64_t, Sealing> sealers_;
-	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten: retired()
+	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten past its host's floor: retired()
+	std::function<std::uint64_t(std::uint64_t)> retired_by_;  // the host's floor: retire_with()
+	std::uint64_t kept(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
 	// A group whose record at `hole` no segment holds: its records from there through `last` failed.
 	struct Refusal { std::uint64_t hole = 0, last = 0; std::exception_ptr error; };
 	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten
