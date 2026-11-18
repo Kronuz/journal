@@ -1814,11 +1814,13 @@ public:
 	std::unique_ptr<File> open_existing(std::string_view name) override { return wrap([&] { return io_->open_existing(name); }); }
 	std::unique_ptr<File> open_existing_read_only(std::string_view name) override { return wrap([&] { return io_->open_existing_read_only(name); }); }
 	std::unique_ptr<File> create_exclusive(std::string_view name) override { return wrap([&] { return io_->create_exclusive(name); }); }
-	void replace(std::string_view source, std::string_view destination) override { heap::Off off; io_->replace(source, destination); }
-	void remove(std::string_view name) override { heap::Off off; io_->remove(name); }
+	void replace(std::string_view source, std::string_view destination) override { heap::Off off; unordered_ = true; io_->replace(source, destination); }
+	void remove(std::string_view name) override { heap::Off off; unordered_ = true; io_->remove(name); }
 	std::unique_ptr<DirectoryCursor> scan_directory() override { heap::Off off; return io_->scan_directory(); }
 	std::optional<EntryFootprint> entry_footprint(std::string_view name) override { heap::Off off; return io_->entry_footprint(name); }
-	void sync_directory() override { heap::Off off; io_->sync_directory(); }
+	void sync_directory() override { heap::Off off; namespace_barriers += std::exchange(unordered_, false); io_->sync_directory(); }
+	// Directory syncs that follow a removal or replacement; an ordering point is one here.
+	std::size_t namespace_barriers = 0;
 protected:
 	std::unique_ptr<OwnerLock> lock_owner(const OwnerLockOptions& options) override { heap::Off off; return io_->acquire_owner(options); }
 private:
@@ -1828,6 +1830,7 @@ private:
 		return file ? std::make_unique<MeteredFile>(std::move(file)) : nullptr;
 	}
 	std::shared_ptr<IO> io_;
+	bool unordered_ = false;
 };
 
 // One host on a memory disk.
@@ -2138,6 +2141,29 @@ void reopen_heap() {
 		check(state == std::vector<std::string>{"b" + std::to_string(group)}, "a parked group recovers exactly: " + text(state));
 	}
 }
+
+// A9: the directory barriers reclaim spends per reclaimed segment, over turn_log_power's
+// workload (one to three of six groups a turn, records up to 700 bytes, one in five a checkpoint).
+void reclaim_syncs() {
+	std::size_t segments = 0, barriers = 0;
+	for (std::uint64_t seed = 1; seed <= 200; ++seed) {
+		jt::Disk disk; MeteredIO io(std::make_shared<jt::MemoryIO>(disk, "log/"));
+		TurnRecovery recovered; TurnLog log(io, reopen_host, recovered, TurnLogOptions{8 * 512, 512, 1, 3, 600});
+		std::mt19937_64 random(seed); std::map<std::uint64_t, std::uint64_t> next;
+		for (int t = 0; t < 60; ++t) {
+			std::vector<TurnRecord> batch;
+			for (auto n = random() % 3 + 1; n; --n) {
+				const auto group = random() % 6 + 1, sequence = ++next[group], bytes = random() % 700 + 1;
+				const auto kind = random() % 5 ? TurnRecordKind::Batch : TurnRecordKind::Checkpoint;
+				batch.push_back({group, sequence, kind, std::string(bytes, 'r'), sequence - 1});
+			}
+			log.append(batch); log.prepare();
+		}
+		segments += log.stats().segments_recycled + log.stats().segments_removed; barriers += io.namespace_barriers;
+	}
+	std::cout << "reclaim_syncs: " << segments << " segments reclaimed, " << barriers << " directory barriers, " << double(barriers) / double(segments) << " per segment\n";
+	check(segments > 0 && barriers == segments, "reclaim orders each reclaimed segment's removal");
+}
 } // namespace
 
 // `journal_test reopen_<case>` runs one case; with none, every case but the long reopen ones.
@@ -2145,7 +2171,7 @@ int main(int argc, char** argv) {
 	const std::map<std::string_view, std::function<void()>> cases{
 		{"reopen_clean_close", reopen_clean_close}, {"reopen_released", [] { reopen_released(false); reopen_released(true); }},
 		{"reopen_two_stores", reopen_two_stores}, {"reopen_race", reopen_race}, {"reopen_crash", reopen_crash},
-		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}, {"reopen_distinct", reopen_distinct}};
+		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}, {"reopen_distinct", reopen_distinct}, {"reclaim_syncs", reclaim_syncs}};
 	if (argc > 1) {
 		const auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::cerr << "no case " << argv[1] << '\n'; return 2; }
