@@ -145,7 +145,7 @@ public:
 		auto& floor = retired_[group];
 		floor = std::max(floor, log_.sequence(group) + 1);  // the open record a writer may hold
 		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { floor = std::max(floor, waiter->sequence); } }
-		if (auto found = refused_.find(group); found != refused_.end()) { floor = std::max(floor, found->second.last); refused_.erase(found); }
+		if (auto found = refused_.find(group); found != refused_.end()) { floor = std::max(floor, found->second.last + 1); refused_.erase(found); }  // and the open record past the refused ones
 		resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);
 		{
 			std::lock_guard hold(sealers_mutex_);
@@ -422,7 +422,7 @@ private:
 		{
 			std::lock_guard hold(sealers_mutex_);
 			auto found = sealers_.find(waiter.group);
-			if (found == sealers_.end()) { return; }
+			if (found == sealers_.end() || refused_.contains(waiter.group)) { return; }  // a refused group never owes
 			found->second.quiet = false; found->second.wanted = std::max(found->second.wanted, waiter.sequence);
 			mark(found->second); owed = found->second.owed;
 		}
@@ -482,7 +482,7 @@ private:
 	}
 	// Takes out of pending_ each record whose cost exceeds the room, and every later record of
 	// its group, and fails their operations and the durable() waits on them; the rest keep their
-	// order. A refused group seals nothing more until it is forgotten.
+	// order. A refused group seals nothing more, and its sealer owes nothing, until it is forgotten.
 	void refuse() {
 		const auto room = whole_room();
 		std::vector<Pending> refused;
@@ -504,6 +504,10 @@ private:
 		}
 		if (refused.empty()) { return; }
 		pending_.erase(kept, pending_.end());
+		{
+			std::lock_guard hold(sealers_mutex_);  // a refused group's sealer owes no turn again
+			for (const auto& [group, _] : refused_) { if (auto found = sealers_.find(group); found != sealers_.end()) { found->second.quiet = true; mark(found->second); } }
+		}
 		for (auto& item : refused) { settle(item, refused_.at(item.record.group).error); }
 		resume([this](const detail::TurnWaiter& waiter) { return refusal(waiter.group, waiter.sequence) != nullptr; }, detail::TurnWaiter::failed);
 	}

@@ -238,12 +238,97 @@ void oversize() {
 		check(sealer_calls == calls, "the refused group's sealer is not called: " + std::to_string(sealer_calls - calls) + " calls");
 		driver.unseal(2, nullptr);
 		driver.forget(2);
-		check(driver.retired(2) >= 4, "forgetting the refused group retires its refused sequences: " + std::to_string(driver.retired(2)));
+		check(driver.retired(2) == 5, "forgetting the refused group retires its refused sequences and the open record past them: " + std::to_string(driver.retired(2)));
 		model.erase(2);
 	}
 	j::TurnDriver recovered(io, identity, options);
 	auto groups = recovered.recovered().groups; groups.erase(2);
 	check(groups == model, "recovery holds every record the driver acknowledged");
+}
+
+// A2, a sealed group. Its sealer owes a turn to a waiter on the open record (staged + 1) when
+// its staged record is refused; after the refusal the sealer owes nothing, through a waiter
+// linked below the hole or a new registration, so the driver goes idle and run() and the
+// blocking entry sleep instead of spinning.
+void owed() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	task::inline_scheduler loop; auto ref = task::scheduler_ref::of(loop);
+	struct Outcome { bool done = false; std::exception_ptr error; };
+	auto wait = [&](Outcome& o, std::uint64_t group, std::uint64_t sequence) -> task::task<void> {
+		try { co_await driver.durable(group, sequence); } catch (...) { o.error = std::current_exception(); }
+		o.done = true;
+	};
+	auto nothing = [](std::uint64_t, bool) -> std::optional<j::TurnRecord> { return std::nullopt; };
+	auto settle = [&] { for (unsigned i = 0; i < 4 && !driver.idle(); ++i) { driver.commit(); loop.run(); } return driver.idle(); };
+	driver.stage(record(1, 1, 10, j::TurnRecordKind::Checkpoint));
+	driver.stage(record(2, 1, 10, j::TurnRecordKind::Checkpoint));
+	while (!driver.idle()) { driver.commit(); }
+	driver.seal(1, nothing); driver.seal(2, nothing);
+	// Group 1, through commit(): the open-record waiter fails with the refusal.
+	driver.stage(record(1, 2, room - d::record_cost(0) + 1));
+	Outcome open1; task::spawn(ref, wait(open1, 1, 3)); loop.run();
+	driver.commit(); loop.run();
+	check(open1.done && is<std::length_error>(open1.error), "the open-record waiter fails with the refusal: " + what(open1.error));
+	check(settle(), "after the refusal the driver goes idle");
+	// Group 2, by hand: its record 2 is in the turn the refusal of 3 leaves, and a waiter on 2
+	// links while that turn is in flight.
+	driver.stage(record(2, 2, 10));
+	driver.stage(record(2, 3, room - d::record_cost(0) + 1));
+	Outcome open2, below; task::spawn(ref, wait(open2, 2, 4)); loop.run();
+	const auto& write = driver.begin(); loop.run();
+	task::spawn(ref, wait(below, 2, 2)); loop.run();
+	check(!below.done, "a waiter below the hole links while its record is in flight");
+	write.file->write_at(write.offset, write.bytes); write.file->sync_data(); driver.completed(); loop.run();
+	check(open2.done && is<std::length_error>(open2.error) && below.done && !below.error, "the waiter on the refused group's in-flight record resolves: " + what(below.error));
+	check(settle(), "a waiter linked below the hole leaves the driver idle");
+	driver.seal(2, nothing);
+	check(settle(), "registering a refused group's sealer again leaves the driver idle");
+	if (!driver.idle()) { return; }  // run() and the blocking entry would spin
+	Outcome entry; std::exception_ptr ran;
+	try { j::run(driver, wait(entry, 2, 1)); } catch (...) { ran = std::current_exception(); }
+	check(!ran && entry.done && !entry.error, "the blocking entry returns: " + what(ran) + what(entry.error));
+	j::InlineCompletion inline_io; task::cancel_source stop; bool ended = false;
+	auto runner = [&]() -> task::task<void> {
+		try { co_await driver.run(j::completion_ref::of(inline_io), stop.token()); } catch (...) { ran = std::current_exception(); }
+		ended = true;
+	};
+	task::spawn(ref, runner()); loop.run();
+	check(!ended && !driver.in_flight(), "run() sleeps with nothing to write");
+	stop.request(); loop.run();
+	check(ended && !ran, "run() ends cleanly: " + what(ran));
+}
+
+// A2, closing a refused group. forget() retires through the record past the refused ones, the
+// open record a writer may hold, as it does past a plain group's last record: a wait on it fails
+// group_closed, and a reopened incarnation's first record never acknowledges it.
+void forget() {
+	jt::Disk disk; jt::MemoryIO io(disk);
+	j::TurnDriver driver(io, identity, options);
+	driver.stage(record(1, 1, 10, j::TurnRecordKind::Checkpoint));
+	driver.stage(record(3, 1, 10, j::TurnRecordKind::Checkpoint));
+	while (!driver.idle()) { driver.commit(); }
+	driver.stage(record(1, 2, room - d::record_cost(0) + 1));
+	while (!driver.idle()) { driver.commit(); }
+	driver.forget(1); driver.forget(3);
+	check(driver.retired(1) == 3 && driver.retired(3) == 2, "retired: the refused group through 3, the plain one through 2: " + std::to_string(driver.retired(1)) + ", " + std::to_string(driver.retired(3)));
+	task::inline_scheduler loop; auto ref = task::scheduler_ref::of(loop);
+	std::exception_ptr refused, plain; bool refused_done = false, plain_done = false;
+	auto wait = [&](std::uint64_t group, std::uint64_t sequence, std::exception_ptr& error, bool& done) -> task::task<void> {
+		try { co_await driver.durable(group, sequence); } catch (...) { error = std::current_exception(); }
+		done = true;
+	};
+	task::spawn(ref, wait(1, 3, refused, refused_done));  // the old writer's open record
+	task::spawn(ref, wait(3, 2, plain, plain_done));
+	loop.run();
+	check(plain_done && is<j::group_closed>(plain), "a plain group's old open-record wait fails group_closed: " + what(plain));
+	check(refused_done && is<j::group_closed>(refused), "a refused group's old open-record wait fails group_closed: " + what(refused));
+	// The reopened incarnation follows retired().
+	driver.stage(record(1, driver.retired(1) + 1, 10, j::TurnRecordKind::Checkpoint));
+	while (!driver.idle()) { driver.commit(); }
+	loop.run();
+	check(refused_done && refused, "the new incarnation's first record does not acknowledge the old wait");
+	check(driver.sequence(1) == 4 && !driver.failed(), "the reopened group commits past the retired sequences");
 }
 
 // A3. Power is cut at every I/O operation of a run of two waves, each larger than a segment, so
@@ -319,7 +404,7 @@ void crash() {
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
-		{"wave", wave}, {"wave_run", wave_run}, {"oversize", oversize}, {"crash", crash},
+		{"wave", wave}, {"wave_run", wave_run}, {"oversize", oversize}, {"owed", owed}, {"forget", forget}, {"crash", crash},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {
