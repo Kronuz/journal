@@ -34,6 +34,7 @@
 #pragma once
 
 #include "turn_driver.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <functional>
@@ -79,6 +80,7 @@ namespace host_detail {
 inline constexpr std::string_view layout_magic{"RJHL0001", 8}, table_magic{"RJGT0001", 8};
 inline constexpr std::uint32_t slots = 4096;
 inline constexpr std::uint64_t serial_block = 64;
+inline constexpr std::size_t sweep_floor = 64;  // the range table's least sweep threshold
 inline constexpr std::string_view layout_name = "layout";
 
 // A group's slot: its id mixed (splitmix64's finalizer) into 4,096 slots.
@@ -198,8 +200,9 @@ inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, 
 	return entries;
 }
 
-// A group's serial range as its view's scan reads it, on whichever thread runs the scan
-// primitive; the host updates it on the loop's thread whenever the table entry changes.
+// A group's serial range as its views' scans read it, on whichever thread runs the scan
+// primitive; the host updates it on the loop's thread whenever the table entry changes. Every
+// live view of a group shares one.
 struct Range {
 	std::mutex mutex;
 	std::uint64_t incarnation = 0, mark = 0, high = 0;
@@ -287,12 +290,19 @@ public:
 		return opened_[loop(group)].contains(group) || turns->has_group(group) || turns->holds(group) || !found->manifest.empty() ? GroupStatus::stored : GroupStatus::none;
 	}
 	// The group's view of the directory: its own names, and a scan that probes its serials.
+	// The range table drops dead ranges once it doubles since its last sweep: O(log ids) amortized.
 	std::shared_ptr<IO> group_io(std::uint64_t group) {
 		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
-		std::erase_if(ranges_, [](const auto& item) { return item.second.expired(); });
-		auto range = std::make_shared<host_detail::Range>();
-		ranges_.emplace(group, range);
-		if (const auto* found = resident(group)) { publish(group, *found); }
+		if (ranges_.size() >= sweep_at_) {
+			std::erase_if(ranges_, [](const auto& item) { return item.second.expired(); });
+			sweep_at_ = std::max(2 * ranges_.size(), host_detail::sweep_floor);
+		}
+		auto& slot = ranges_[group];
+		auto range = slot.lock();
+		if (!range) {
+			range = std::make_shared<host_detail::Range>(); slot = range;
+			if (const auto* found = resident(group)) { publish(group, *found); }
+		}
 		return std::make_shared<PrefixIO>(io_, host_detail::group_prefix(group), [io = io_, group, range]() -> std::unique_ptr<DirectoryCursor> {
 			std::uint64_t incarnation, serial, high;
 			{ std::lock_guard hold(range->mutex); incarnation = range->incarnation; serial = range->mark; high = range->high; }
@@ -478,10 +488,9 @@ private:
 		for (auto slot : slots) { for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); } }
 	}
 	void publish(std::uint64_t group, const GroupEntry& entry) {
-		auto [first, last] = ranges_.equal_range(group);
-		for (; first != last; ++first) {
-			if (auto range = first->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
-		}
+		auto found = ranges_.find(group);
+		if (found == ranges_.end()) { return; }
+		if (auto range = found->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
 	}
 	std::shared_ptr<IO> loop_io(std::uint64_t generation, std::uint32_t loop) {
 		auto names = logs_[{generation, loop}];
@@ -635,7 +644,8 @@ private:
 	mutable std::mutex holds_mutex_;
 	std::set<std::uint64_t> holds_;  // groups a live Store holds
 	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()
-	std::multimap<std::uint64_t, std::weak_ptr<host_detail::Range>> ranges_;  // the groups' views
+	std::map<std::uint64_t, std::weak_ptr<host_detail::Range>> ranges_;  // the groups' views: a range each
+	std::size_t sweep_at_ = host_detail::sweep_floor;  // ranges_'s size that sweeps it: twice the live after a sweep
 	std::vector<std::unique_ptr<TurnDriver>> drivers_;
 };
 

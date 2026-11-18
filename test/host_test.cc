@@ -27,8 +27,9 @@
 // incarnation; a failed close that leaves the group open; a failed reopen that leaves it closed;
 // two loops' table commits free of races under TSan; a close behind an acknowledged record
 // refused; a close with a sealed open record in flight fails its wait, never acknowledging it,
-// under power loss too; a second recovery on one host refused; and one owner lock, the
-// directory's own.
+// under power loss too; a second recovery on one host refused; one owner lock, the directory's
+// own; and group views that keep their range however many dead views the host sweeps around
+// them, in a range table bounded by twice the live ids.
 // `host_test [case]` runs one case.
 #include "completion/posix.h"
 #include "faultlab/faultfs.h"
@@ -44,6 +45,11 @@
 namespace j = kronuz::journal;
 namespace fl = kronuz::faultlab;
 namespace hd = kronuz::journal::host_detail;
+
+// Reaches Host::ranges_ with no change to Host: explicit instantiation ignores access.
+template <class Tag, auto Member> struct Steal { friend constexpr auto steal(Tag) { return Member; } };
+struct RangesTag { friend constexpr auto steal(RangesTag); };
+template struct Steal<RangesTag, &j::Host::ranges_>;
 
 namespace {
 int checks = 0, failures = 0;
@@ -599,6 +605,37 @@ void second_recovery() {
 	check(node.recovered[9].batches == std::vector<std::string>{"neighbor", "still"}, "the neighbor keeps both batches");
 }
 
+// Views of 100 groups, two each, taken before the groups exist, outlive 4,000 views that die at
+// once: the range table holds one range per group, never more than twice the live ids (or the
+// sweep floor), and each held view still lists its group's first artifact once the group is
+// created. Once every view dies the table falls to the sweep floor.
+void view_sweep() {
+	fl::filesystem disk;
+	Node node(disk);
+	auto& host = *node.host;
+	const auto& ranges = host.*steal(RangesTag{});
+	constexpr std::uint64_t live = 100;
+	const std::size_t bound = std::max<std::size_t>(2 * live, hd::sweep_floor);
+	std::vector<std::shared_ptr<j::IO>> views;
+	for (std::uint64_t g = 1; g <= live; ++g) { views.push_back(host.group_io(g)); views.push_back(host.group_io(g)); }
+	check(ranges.size() == live, "two views of a group share its one range: " + std::to_string(ranges.size()));
+	std::size_t largest = 0;
+	std::uint64_t fresh = std::uint64_t{1} << 20;
+	for (std::uint64_t round = 0; round < 10; ++round) {
+		for (std::uint64_t i = 0; i < 4 * live; ++i) { host.group_io(fresh++); largest = std::max(largest, ranges.size()); }
+		host.group_io(1 + round);
+	}
+	check(largest <= bound && largest > live, "dead views gather and are swept within twice the live ids: " + std::to_string(largest));
+	const std::set<std::string> first{"artifact-" + hd::hex(1, 16) + hd::hex(0, 16)};
+	for (std::uint64_t g = 1; g <= live; ++g) { host.create_group(g); node.io->create_exclusive(hd::artifact_name(g, 1, 0)); }
+	for (std::size_t i = 0; i < views.size(); ++i) {
+		check(listing(*views[i]) == first, "a held view lists its group's first artifact: group " + std::to_string(1 + i / 2));
+	}
+	views.clear();
+	for (std::size_t i = 0; i < 2 * bound; ++i) { host.group_io(fresh++); }
+	check(ranges.size() <= hd::sweep_floor, "once every view dies the table falls to the sweep floor: " + std::to_string(ranges.size()));
+}
+
 // One owner lock, the directory's own (what strata's cold tier takes): a second host on the
 // directory is refused while the first holds it.
 void lock() {
@@ -622,7 +659,7 @@ int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
-		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}};
+		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }
