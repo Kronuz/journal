@@ -28,8 +28,9 @@
 // two loops' table commits free of races under TSan; a close behind an acknowledged record
 // refused; a close with a sealed open record in flight fails its wait, never acknowledging it,
 // under power loss too; a second recovery on one host refused; one owner lock, the directory's
-// own; and group views that keep their range however many dead views the host sweeps around
-// them, in a range table bounded by twice the live ids.
+// own; group views that keep their range however many dead views the host sweeps around them, in
+// a range table bounded by twice the live ids; and a view taken while its group is closed, which
+// lists none of the closed incarnation's artifacts while the view held across the close keeps its.
 // `host_test [case]` runs one case.
 #include "completion/posix.h"
 #include "faultlab/faultfs.h"
@@ -636,6 +637,26 @@ void view_sweep() {
 	check(ranges.size() <= hd::sweep_floor, "once every view dies the table falls to the sweep floor: " + std::to_string(ranges.size()));
 }
 
+// A view held across its group's close keeps listing the closed incarnation's artifacts; a view
+// taken while the group is closed lists none (its own range, as every view had before the table
+// shared them); both list the reopened group's, then its next checkpoint's.
+void closed_view() {
+	fl::filesystem disk;
+	Node node(disk);
+	node.checkpoint(7, "state");
+	auto held = node.host->group_io(7);
+	check(listing(*held).size() == 2, "a view of an open group lists its artifacts: " + std::to_string(listing(*held).size()));
+	node.store(7).close(); node.stores.erase(7);
+	check(node.host->status(7) == j::GroupStatus::closed, "the table holds the group closed");
+	check(listing(*held).size() == 2, "the view held across the close keeps its artifacts: " + std::to_string(listing(*held).size()));
+	auto fresh = node.host->group_io(7);
+	check(listing(*fresh).empty(), "a view taken while the group is closed lists none: " + std::to_string(listing(*fresh).size()));
+	node.store(7);
+	check(listing(*held).size() == 2 && listing(*fresh).size() == 2, "both views list the reopened group's artifacts: " + std::to_string(listing(*held).size()) + ", " + std::to_string(listing(*fresh).size()));
+	node.append(7, "after"); node.checkpoint(7, "again");
+	check(listing(*held).size() == 4 && listing(*fresh).size() == 4, "both views list the next checkpoint's: " + std::to_string(listing(*held).size()) + ", " + std::to_string(listing(*fresh).size()));
+}
+
 // One owner lock, the directory's own (what strata's cold tier takes): a second host on the
 // directory is refused while the first holds it.
 void lock() {
@@ -659,7 +680,7 @@ int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
-		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}};
+		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

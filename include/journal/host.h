@@ -201,8 +201,8 @@ inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, 
 }
 
 // A group's serial range as its views' scans read it, on whichever thread runs the scan
-// primitive; the host updates it on the loop's thread whenever the table entry changes. Every
-// live view of a group shares one.
+// primitive; the host updates it on the loop's thread whenever the table entry changes. Live
+// views of a resident group share one.
 struct Range {
 	std::mutex mutex;
 	std::uint64_t incarnation = 0, mark = 0, high = 0;
@@ -297,11 +297,22 @@ public:
 			std::erase_if(ranges_, [](const auto& item) { return item.second.expired(); });
 			sweep_at_ = std::max(2 * ranges_.size(), host_detail::sweep_floor);
 		}
-		auto& slot = ranges_[group];
-		auto range = slot.lock();
+		// A resident group's live views share one range; a closed or unborn group's view shares only
+		// an unpublished one, so it never shows a closed incarnation's artifacts.
+		const auto* found = resident(group);
+		std::shared_ptr<host_detail::Range> range;
+		for (auto [at, last] = ranges_.equal_range(group); at != last;) {
+			auto live = at->second.lock();
+			if (!live) { at = ranges_.erase(at); continue; }
+			if (!range) {
+				std::lock_guard hold(live->mutex);
+				if (found || !live->incarnation) { range = live; }
+			}
+			++at;
+		}
 		if (!range) {
-			range = std::make_shared<host_detail::Range>(); slot = range;
-			if (const auto* found = resident(group)) { publish(group, *found); }
+			range = std::make_shared<host_detail::Range>(); ranges_.emplace(group, range);
+			if (found) { publish(group, *found); }
 		}
 		return std::make_shared<PrefixIO>(io_, host_detail::group_prefix(group), [io = io_, group, range]() -> std::unique_ptr<DirectoryCursor> {
 			std::uint64_t incarnation, serial, high;
@@ -488,9 +499,9 @@ private:
 		for (auto slot : slots) { for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); } }
 	}
 	void publish(std::uint64_t group, const GroupEntry& entry) {
-		auto found = ranges_.find(group);
-		if (found == ranges_.end()) { return; }
-		if (auto range = found->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
+		for (auto [at, last] = ranges_.equal_range(group); at != last; ++at) {
+			if (auto range = at->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
+		}
 	}
 	std::shared_ptr<IO> loop_io(std::uint64_t generation, std::uint32_t loop) {
 		auto names = logs_[{generation, loop}];
@@ -644,7 +655,7 @@ private:
 	mutable std::mutex holds_mutex_;
 	std::set<std::uint64_t> holds_;  // groups a live Store holds
 	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()
-	std::map<std::uint64_t, std::weak_ptr<host_detail::Range>> ranges_;  // the groups' views: a range each
+	std::multimap<std::uint64_t, std::weak_ptr<host_detail::Range>> ranges_;  // the groups' views' ranges
 	std::size_t sweep_at_ = host_detail::sweep_floor;  // ranges_'s size that sweeps it: twice the live after a sweep
 	std::vector<std::unique_ptr<TurnDriver>> drivers_;
 };
