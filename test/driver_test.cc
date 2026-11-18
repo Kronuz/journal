@@ -24,7 +24,7 @@
 // inline_scheduler, and the blocking entry's rules over blocking_scheduler (async-drivers D5):
 // `driver_test [case]`, every case by default.
 #include "journal/blocking.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include "journal/store.h"
 #include <atomic>
 #include <chrono>
@@ -33,7 +33,7 @@
 #include <thread>
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 int checks = 0, failures = 0;
@@ -48,14 +48,14 @@ j::Identity identity(std::uint64_t group) { j::Identity id{'G'}; id[1] = static_
 
 // One core: a turn log and shared Stores on one in-memory disk.
 struct Core {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::unique_ptr<j::Host> host;
 	j::TurnDriver* turns = nullptr;
 	std::map<std::uint64_t, std::unique_ptr<j::Store>> stores;
-	Core() { open(); }
+	Core() { disk.make_directory("host"); open(); }
 	void open() {
 		stores.clear(); host.reset();
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), log_identity, j::HostOptions{1, options});
+		host = std::make_unique<j::Host>(std::make_shared<fl::io>(disk, "host"), log_identity, j::HostOptions{1, options});
 		turns = &host->driver(0);
 	}
 	j::Store& store(std::uint64_t group) {

@@ -28,12 +28,13 @@
 // lost id refused once the damage is gone: after a 1->2 re-partition, after a re-partition that
 // first sees the damage, and after retention; `damaged_absent`, a group whose only records the
 // damage took, is lost rather than offered for create. `placement_test [case [shard shards]]`.
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include "journal/host.h"
+#include <algorithm>
 #include <iostream>
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 namespace hd = kronuz::journal::host_detail;
 
 namespace {
@@ -48,20 +49,40 @@ const j::Identity host_identity{'P', 'L', 'A', 'C', 'E'};
 const j::TurnLogOptions turn_options{256 * 1024, 1024, 1, 4, 4096}, small_segments{16 * 1024, 1024, 1, 4, 4096};
 using Records = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
 
-std::unique_ptr<j::Host> open(jt::Disk& disk, std::uint32_t loops, const j::TurnLogOptions& options = turn_options) {
-	return std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), host_identity, j::HostOptions{loops, options});
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<fl::io> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
+std::unique_ptr<j::Host> open(fl::filesystem& disk, std::uint32_t loops, const j::TurnLogOptions& options = turn_options) {
+	return std::make_unique<j::Host>(host_io(disk), host_identity, j::HostOptions{loops, options});
+}
+// A crash keeps any sector-boundary prefix of an unsynced append, as a real device may.
+const fl::crash_policy sector_cut{.size = fl::size_pick::sector};
+// The host's turn-log segment holding `bytes`, or empty.
+std::string holder(fl::filesystem& disk, const std::string& bytes) {
+	for (const auto& name : disk.list("host")) {
+		if (name.starts_with("l") && disk.view("host/" + name).find(bytes) != std::string_view::npos) { return name; }
+	}
+	return {};
+}
+// Overwrites the host file `name` at `offset` with `bytes`, durably.
+void overwrite(fl::filesystem& disk, const std::string& name, std::uint64_t offset, std::string_view bytes) {
+	auto file = host_io(disk)->open_existing(name);
+	file->write_at(offset, bytes); file->sync();
 }
 // Every fiftieth group, unless a later checkpoint supersedes its damaged batch.
 bool victim(std::uint64_t group) { return group % 50 == 0 && group % 3 != 0; }
 void commit(j::Host& host) { for (std::uint32_t l = 0; l < host.loops(); ++l) { while (!host.driver(l).idle()) { host.driver(l).commit(); } } }
 // Flips a byte of a durable record's payload, at `marker`, in whichever segment holds it.
-bool damage(jt::Disk& disk, const std::string& marker) {
-	for (const auto& [name, inode] : disk.durable_names) {
-		if (!name.starts_with("host/l")) { continue; }
-		auto& bytes = disk.inodes.at(inode).durable;
-		if (auto at = bytes.find(marker); at != std::string::npos) { bytes[at + marker.size() / 2] ^= 0x5a; return true; }
-	}
-	return false;
+bool damage(fl::filesystem& disk, const std::string& marker) {
+	const auto name = holder(disk, marker);
+	if (name.empty()) { return false; }
+	const auto at = disk.view("host/" + name).find(marker) + marker.size() / 2;
+	const char flipped = static_cast<char>(disk.view("host/" + name)[at] ^ 0x5a);
+	overwrite(disk, name, at, std::string_view(&flipped, 1));
+	return true;
 }
 // A victim's first batch is a run of its own letter spanning whole blocks; the damage lands in
 // the middle of the run.
@@ -76,7 +97,7 @@ bool refused(j::Host& host, std::uint64_t group) {
 // Groups 1..count, each a checkpoint record then batches over four turns, every third with a
 // later checkpoint; the first batch of every fiftieth is damaged. Returns what each group wrote
 // from its latest checkpoint.
-Records populate(jt::Disk& disk, std::uint64_t count, std::set<std::uint64_t>& victims, const j::TurnLogOptions& options = turn_options) {
+Records populate(fl::filesystem& disk, std::uint64_t count, std::set<std::uint64_t>& victims, const j::TurnLogOptions& options = turn_options) {
 	Records written;
 	{
 		auto host = open(disk, 1, options);
@@ -148,7 +169,7 @@ void map() {
 // `shard`; every shard repeats the uncut re-partitions, so the shards together cut every point.
 std::uint64_t shard = 0, shards = 1;
 void remap() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 400, victims);
 	std::set<std::uint64_t> lost;
@@ -161,18 +182,18 @@ void remap() {
 	}
 	std::uint64_t points = 0;
 	for (std::uint32_t loops : {3u, 2u, 5u, 4u}) {
-		const jt::Disk before = disk;
-		const auto start = disk.operations;
+		const fl::filesystem before = disk.snapshot();
+		const auto start = disk.mutations();
 		{ auto host = open(disk, loops); verify(*host, written, lost, loops, "re-partition to " + std::to_string(loops)); }
-		const auto total = disk.operations - start;
+		const auto total = disk.mutations() - start;
 		for (std::uint64_t cut = 1; cut <= total; ++cut) {
 			if ((cut - 1) % shards != shard) { continue; }
 			++points;
-			jt::Disk crashed = before;
-			crashed.cut = crashed.operations + cut;
-			try { open(crashed, loops); } catch (const jt::PowerLoss&) {}
-			crashed.power_loss();
+			fl::filesystem crashed = before.snapshot();
 			const auto at = "re-partition to " + std::to_string(loops) + " cut at " + std::to_string(cut);
+			crashed.power_off_after(cut - 1);
+			try { open(crashed, loops); } catch (const std::exception& error) { check(crashed.powered_off(), "only the power cut fails the re-partition: " + at + ": " + error.what()); }
+			crashed.crash(loops * 7919 + cut, sector_cut);
 			for (int restart = 0; restart < 3; ++restart) {
 				try { auto host = open(crashed, loops); verify(*host, written, lost, loops, at + " restart " + std::to_string(restart)); }
 				catch (const std::exception& error) { check(false, at + ": " + error.what()); }
@@ -185,7 +206,7 @@ void remap() {
 // Journal's own damage scenario: a group lost to a damaged block of the only loop's log, then a
 // 1->2 re-partition. The new logs hold no damage; only the table's mark refuses the id.
 void repartition_lost() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 60, victims);
 	std::set<std::uint64_t> lost;
@@ -200,12 +221,12 @@ void repartition_lost() {
 // Damage first seen by a re-partition: step 1 marks the lost ids before the new generation,
 // which holds no damage, is written.
 void repartition_damaged() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 120, victims);
 	std::set<std::uint64_t> lost;
 	{
-		jt::Disk probe = disk;  // what the stored generation lost, read on a copy
+		fl::filesystem probe = disk.snapshot();  // what the stored generation lost, read on a copy
 		auto host = open(probe, 1); lost = host->driver(0).recovered().lost;
 	}
 	check(lost.contains(50) && lost.contains(100), "the damage loses its victims");
@@ -221,7 +242,7 @@ void damaged_absent() {
 	const std::uint64_t group = 7;
 	for (int mode = 0; mode < 3; ++mode) {
 		const auto at = " (mode " + std::to_string(mode) + ")";
-		jt::Disk disk;
+		fl::filesystem disk;
 		{
 			auto host = open(disk, 1, options);
 			host->create_group(group);
@@ -234,15 +255,13 @@ void damaged_absent() {
 			}
 			commit(*host);
 		}
-		std::string holder;
-		for (const auto& [name, inode] : disk.durable_names) {
-			if (name.starts_with("host/l") && disk.inodes.at(inode).durable.find(std::string(200, 'Q')) != std::string::npos) { holder = name; }
-		}
-		check(!holder.empty(), "the group's record is on disk" + at);
-		auto& bytes = disk.inodes.at(disk.durable_names.at(holder)).durable;
-		if (mode == 0) { bytes[bytes.find(std::string(200, 'Q')) + 100] ^= 0x5a; }
-		else if (mode == 1) { std::fill(bytes.begin() + 1024, bytes.end(), '\0'); }
-		else { disk.durable_names.erase(holder); disk.names.erase(holder); }
+		const auto segment = holder(disk, std::string(200, 'Q'));
+		check(!segment.empty(), "the group's record is on disk" + at);
+		const std::string bytes(disk.view("host/" + segment));
+		const auto record = bytes.find(std::string(200, 'Q'));
+		if (mode == 0) { const char flipped = static_cast<char>(bytes[record + 100] ^ 0x5a); overwrite(disk, segment, record + 100, std::string_view(&flipped, 1)); }
+		else if (mode == 1) { overwrite(disk, segment, 1024, std::string(bytes.size() - 1024, '\0')); }
+		else { auto io = host_io(disk); io->remove(segment); io->sync_directory(); }
 		for (int restart = 0; restart < 2; ++restart) {
 			auto host = open(disk, 1, options);
 			check(host->status(group) == j::GroupStatus::lost && refused(*host, group), "the group is lost" + at);
@@ -255,7 +274,7 @@ void damaged_absent() {
 
 // A lost id stays lost once retention recycled the damaged segment.
 void retention() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 60, victims, small_segments);
 	std::set<std::uint64_t> lost;

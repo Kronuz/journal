@@ -25,14 +25,14 @@
 //      either throws Corruption or recovers, and a recovered log accepts a turn.
 //   1: the input is a group's checkpoint record; a shared Store's recovery either throws
 //      Corruption or recovers a frontier whose sequence is its base.
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include "journal/store.h"
 
 #include <cstdlib>
 #include <string>
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 const j::Identity identity{'F', 'U', 'Z', 'Z'};
@@ -40,7 +40,7 @@ const j::TurnLogOptions options{8 * 512, 512, 1, 4, 1024};
 const j::AdmissionLimits limits{{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3};
 
 void segment(std::string_view bytes) {
-	jt::Disk disk; jt::MemoryIO io(disk, "log/");
+	fl::filesystem disk; disk.make_directory("log"); fl::io io(disk, "log");
 	{ auto file = io.create_exclusive(j::turn_log_detail::segment_name(1)); file->write_at(0, bytes); file->sync(); }
 	io.sync_directory();
 	try {
@@ -55,7 +55,7 @@ void segment(std::string_view bytes) {
 
 void checkpoint_record(std::string_view bytes) {
 	if (bytes.size() > 1024) { bytes = bytes.substr(0, 1024); }  // within one turn of the fuzz geometry
-	jt::Disk disk; auto io = std::make_shared<jt::MemoryIO>(disk, "host/");
+	fl::filesystem disk; disk.make_directory("host"); auto io = std::make_shared<fl::io>(disk, "host");
 	{
 		j::Host host(io, identity, j::HostOptions{1, options});
 		j::Store store(host, 1, limits);

@@ -27,7 +27,7 @@
 // multiple; the records re-emit to the input's bytes outside padding; the prefix through the
 // last whole record reads clean; read_record reads each record back.
 #include "journal/framing.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 
 #include <cstdlib>
 #include <string>
@@ -85,7 +85,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
 	}
 
 	if (!scan.records.empty()) {
-		j::testing::Disk disk; j::testing::MemoryIO io(disk, "fuzz/");
+		kronuz::faultlab::filesystem disk; disk.make_directory("fuzz"); kronuz::faultlab::io io(disk, "fuzz");
 		auto file = io.create_exclusive("log"); file->write_at(0, bytes);
 		require(f::read_file(*file) == bytes);
 		for (const auto& record : scan.records) { require(f::read_record(*file, stream, record.offset) == record.bytes); }

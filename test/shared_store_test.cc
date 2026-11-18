@@ -21,15 +21,15 @@
  */
 
 // Stores on the shared backend: several groups of one host, their batches and checkpoint
-// records in one turn log and their artifacts in the host's one directory, on an in-memory disk.
-// Power is cut after every I/O operation of a randomized run: every acknowledged batch
+// records in one turn log and their artifacts in the host's one directory, on faultlab's faultfs.
+// Power is cut after every mutating I/O operation of a randomized run: every acknowledged batch
 // and checkpoint survives, nothing unstaged appears, and the groups carry on. Checkpoints
 // cross every publication step (artifacts durable, record staged, barrier, reclamation),
 // which is Condition 25's ordering under T9. Each run goes twice: once through the synchronous
 // calls and TurnDriver::commit, once through Store's tasks and TurnDriver::run over a
 // HeldCompletion on an inline_scheduler, whose primitives complete in the order issued. The two
-// must write the same history (the same count of disk operations) and keep the same batches.
-#include "journal/memory_io.h"
+// must write the same history (the same count of disk mutations) and keep the same batches.
+#include "faultlab/faultfs.h"
 #include "journal/store.h"
 #include <deque>
 #include <iostream>
@@ -38,7 +38,7 @@
 #include <random>
 
 namespace j = kronuz::journal;
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 
 namespace {
 int checks = 0, failures = 0;
@@ -78,7 +78,7 @@ bool tasks = false;  // drive the rounds through the coroutine drivers
 struct Call { std::uint64_t group = 0; std::string batch; bool done = false; std::exception_ptr error; };
 
 struct Node {
-	jt::Disk& disk;
+	fl::filesystem& disk;
 	std::unique_ptr<j::Host> host;
 	j::TurnDriver* driver = nullptr;
 	std::map<std::uint64_t, Group> groups;
@@ -86,7 +86,7 @@ struct Node {
 	task::inline_scheduler loop;
 	j::HeldCompletion held;
 	std::deque<Call> calls;  // the task round's appends, in order
-	explicit Node(jt::Disk& d) : disk(d) {}
+	explicit Node(fl::filesystem& d) : disk(d) {}
 	~Node() { close(); }
 	// The process ends: the Stores, then the host and its lock.
 	void close() {
@@ -97,7 +97,7 @@ struct Node {
 
 	// Opens the host and every group: recovers it, or creates it when it has no records.
 	void open() {
-		host = std::make_unique<j::Host>(std::make_shared<jt::MemoryIO>(disk, "host/"), log_identity, j::HostOptions{1, options});
+		host = std::make_unique<j::Host>(std::make_shared<fl::io>(disk, "host"), log_identity, j::HostOptions{1, options});
 		driver = &host->driver(0);
 		for (std::uint64_t g = 1; g <= group_count; ++g) {
 			auto& group = groups[g];
@@ -300,19 +300,19 @@ struct Node {
 };
 
 std::uint64_t run(std::uint64_t seed, std::uint64_t cut, unsigned rounds) {
-	jt::Disk disk; disk.random.seed(seed * 7919 + cut);
+	fl::filesystem disk; disk.make_directory("host");
 	std::mt19937_64 random(seed);
 	Node node(disk);
+	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	try {
-		disk.cut = cut;
+		if (cut != std::numeric_limits<std::uint64_t>::max()) { disk.power_off_after(cut - 1); }
 		node.open();
 		for (unsigned r = 0; r < rounds; ++r) { node.round(random); }
-	} catch (const jt::PowerLoss&) {}
+	} catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails the run: " + at + ": " + error.what()); }
 	node.collect();
-	const auto operations = disk.operations;
+	const auto operations = disk.mutations();
 	node.close();
-	disk.power_loss();
-	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
+	disk.crash(seed * 7919 + cut, {.size = fl::size_pick::sector});
 	try {
 		Node again(disk);
 		for (auto& [g, group] : node.groups) { again.groups[g].acknowledged = group.acknowledged; }

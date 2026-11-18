@@ -30,7 +30,7 @@
 #include <iostream>
 #include <map>
 #include <vector>
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include <atomic>
 #include <cstdlib>
 #include <random>
@@ -1791,7 +1791,7 @@ void posix() {
 // A Store's id in a live Host (docs/mechanisms/group-lifetime.md): a close into the table and a
 // release that leaves the records in the log both let the id recover in the same Host; two live
 // Stores never hold it.
-namespace jt = kronuz::journal::testing;
+namespace fl = kronuz::faultlab;
 const Identity reopen_host{'R', 'H'};
 const TurnLogOptions reopen_turns{16 * 1024, 1024, 1, 4, 4096};
 const AdmissionLimits reopen_limits{{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3};
@@ -1853,11 +1853,17 @@ private:
 	bool unordered_ = false;
 };
 
+// The host's directory on `disk`, made on first use.
+std::shared_ptr<IO> host_io(fl::filesystem& disk) {
+	const auto names = disk.list();
+	if (std::find(names.begin(), names.end(), "host") == names.end()) { disk.make_directory("host"); }
+	return std::make_shared<fl::io>(disk, "host");
+}
 // One host on a memory disk.
 struct Shared {
 	std::unique_ptr<Host> host;
-	explicit Shared(jt::Disk& disk, TurnLogOptions turns = reopen_turns)
-		: host(std::make_unique<Host>(std::make_shared<MeteredIO>(std::make_shared<jt::MemoryIO>(disk, "host/")), reopen_host, HostOptions{1, turns})) {}
+	explicit Shared(fl::filesystem& disk, TurnLogOptions turns = reopen_turns)
+		: host(std::make_unique<Host>(std::make_shared<MeteredIO>(host_io(disk)), reopen_host, HostOptions{1, turns})) {}
 	TurnDriver& turns() { return host->driver(0); }
 	void commit() { while (!turns().idle()) { turns().commit(); } }
 	// Creates the group or recovers it; `state` is its checkpoint's batches, then those replayed.
@@ -1906,7 +1912,7 @@ bool busy(Shared& node, std::uint64_t group) {
 // A1, clean: a close needs its records settled and a checkpoint covering them; once the table
 // holds it, the group recovers in the live host, even while the closed Store still exists.
 void reopen_clean_close() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::vector<std::string> state;
 	{
 		Shared node(disk);
@@ -1938,7 +1944,7 @@ void reopen_clean_close() {
 // the log's records, read back by position after retention forwarded them, exactly as a
 // reopened host recovers it.
 void reopen_released(bool fenced) {
-	jt::Disk disk;
+	fl::filesystem disk;
 	const std::string kind = fenced ? "fenced" : "unfenced";
 	std::vector<std::string> state, expected{"a1", "a2", "a3"};
 	{
@@ -1972,7 +1978,7 @@ void reopen_released(bool fenced) {
 // A Store whose append was refused (a record no segment holds) ends; the next Store recovers
 // the group in the live host and appends, and the reopened host recovers what it appended.
 void reopen_refused() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::vector<std::string> state;
 	{
 		Shared node(disk);
@@ -1992,7 +1998,7 @@ void reopen_refused() {
 // A2: a live Store's group is busy to a recover and a create, and so is a group whose first record
 // its ended Store left staged; the holder carries on unharmed.
 void reopen_two_stores() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	Shared node(disk);
 	std::vector<std::string> state;
 	auto a = node.open(7);
@@ -2019,7 +2025,7 @@ void reopen_two_stores() {
 // A2 under TSan: a Store ends on another thread while the loop keeps trying to recover its group;
 // the first recover that holds it follows the end's start, and replays every record.
 void reopen_race() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	Shared node(disk);
 	auto a = node.open(7);
 	node.append(*a, "a1"); node.append(*a, "a2");
@@ -2043,7 +2049,7 @@ void reopen_race() {
 // release, a release, a clean close, or nothing, each with a record staged). The reopened host
 // holds every record a recover or an append acknowledged, and nothing past what was attempted.
 bool reopen_crash_run(std::uint64_t cut, std::uint64_t seed) {
-	jt::Disk disk;
+	fl::filesystem disk;
 	std::optional<Shared> node;
 	std::unique_ptr<Store> store;
 	std::vector<std::string> acknowledged, attempted;
@@ -2051,7 +2057,8 @@ bool reopen_crash_run(std::uint64_t cut, std::uint64_t seed) {
 	bool reached = false;
 	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
 	try {
-		disk.cut = cut;
+		host_io(disk);
+		disk.power_off_after(cut - 1);
 		node.emplace(disk);
 		store = node->open(7);
 		for (unsigned round = 0; round < 8; ++round) {
@@ -2073,11 +2080,11 @@ bool reopen_crash_run(std::uint64_t cut, std::uint64_t seed) {
 		}
 		reached = true;
 	} catch (...) {
-		if (!disk.dead()) { check(false, "the run failed before its power cut: " + at); }
+		if (!disk.powered_off()) { check(false, "the run failed before its power cut: " + at); }
 	}
 	if (node && node->turns().in_flight()) { node->turns().failed(std::make_exception_ptr(std::runtime_error("power lost"))); }
 	store.reset(); node.reset();
-	disk.power_loss();
+	disk.crash(seed * 7919 + cut, fl::crash_policy{.size = fl::size_pick::sector});
 	try {
 		Shared again(disk);
 		std::vector<std::string> state;
@@ -2099,7 +2106,7 @@ void reopen_crash() {
 // closing it into the table (even ids) or checkpointing and releasing it with one batch
 // uncovered (odd ids). The host's heap after the first pass and after the last is reported.
 void reopen_churn() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 8, 4096});
 	constexpr std::uint64_t ids = 1000, cycles = 10000;
 	std::vector<std::vector<std::string>> expected(ids + 1);
@@ -2131,7 +2138,7 @@ void reopen_churn() {
 // A8: 10,000 distinct groups, each created, written, checkpointed and closed once in one host:
 // the host's heap after 1,000, 5,000 and 10,000, flat by its slope from 1,000 on.
 void reopen_distinct() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 4, 4096});
 	const char* scale = std::getenv("JOURNAL_DISTINCT_IDS");  // another count, for timing
 	const std::uint64_t ids = scale ? std::stoull(scale) : 10000, early = ids / 10, middle = ids / 2;
@@ -2159,7 +2166,7 @@ void reopen_distinct() {
 // A7: 10,000 groups, each created, given a batch and released by its Store's end: the bytes per
 // group the host keeps before settle() parks them and after, and a sample that recovers exactly.
 void reopen_heap() {
-	jt::Disk disk;
+	fl::filesystem disk;
 	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 1000, 4096});
 	constexpr std::uint64_t ids = 10000;
 	settle(*node.host);
@@ -2189,7 +2196,7 @@ void reopen_heap() {
 void reclaim_syncs() {
 	std::size_t segments = 0, barriers = 0;
 	for (std::uint64_t seed = 1; seed <= 200; ++seed) {
-		jt::Disk disk; MeteredIO io(std::make_shared<jt::MemoryIO>(disk, "log/"));
+		fl::filesystem disk; MeteredIO io(std::make_shared<fl::io>(disk));
 		TurnRecovery recovered; TurnLog log(io, reopen_host, recovered, TurnLogOptions{8 * 512, 512, 1, 3, 600});
 		std::mt19937_64 random(seed); std::map<std::uint64_t, std::uint64_t> next;
 		for (int t = 0; t < 60; ++t) {
