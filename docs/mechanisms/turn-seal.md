@@ -171,19 +171,26 @@ failing the driver (consensus-wave-open, D114).
   turn's records and the second whole or not at all.
 
 **A record no segment holds.** A pending record whose `record_cost` exceeds
-`turn_room(segment_bytes)` is refused before sealing, at the turn that would take it. Its operation
+`turn_room(segment_bytes)` is refused before sealing, at the next turn, wherever it sits among the
+pending records: waits on it can fail before its group's older deferred records are durable. Its operation
 fails with `std::length_error("turn record exceeds a segment")`, and so does every later record of
 its group: the ones pending now, and any staged until the group is forgotten. A `durable()` wait
 on any of those sequences throws the same error, whether it linked before the refusal or after;
-waits below it resolve as usual. The group's sealer is no longer called. The driver stays healthy,
-and every other group's records commit. `forget()` retires the refused sequences, so a reopened
-incarnation follows them.
+waits below it resolve as usual. The group's sealer is no longer called and owes no turn, whatever
+waits on the group, so `idle()` turns true and `run()` and the blocking entry sleep. The driver
+stays healthy, and every other group's records commit. `forget()` retires the refused sequences and
+the open record past them, as it retires the one past a plain group's last record, so a reopened
+incarnation follows them and never acknowledges an old wait. A refused group backed by a `Journal`
+cannot close or reopen in-process (`Journal::close` needs every assigned sequence durable), so the
+refusal holds it until the host restarts, as a failed turn holds every group.
 
 Why the group's later records fail too, and not only the oversized one:
 
 1. A group's records are one dense sequence. `TurnLog::stage` refuses a record that does not
    follow its group's last sequence, and refuses it for the whole turn: letting record `n + 1`
    through after refusing `n` would fail the driver and every group, the failure this rule removes.
+   The one exception, a new group's first record as a checkpoint at any sequence, would make durable
+   a state that includes the failed operation.
 2. Recovery needs that density too: `Journal::recover_shared` reads a group's records as its
    checkpoint plus one record per sequence and reports a gap as corruption. Writing the later
    records around a hole would make a group that recovers worse than one that stops.
@@ -260,6 +267,8 @@ staged records' bound:
 | `wave` | 16 seeds of 64 groups' create checkpoint and first batch plus a record of exactly the room between two small ones: every operation completes over three or more turns, each turn under the room and in staged order, and recovery holds every record in order |
 | `wave_run` | The same wave under `run()`, with 64 `durable()` waiters: every waiter resumes, the driver stays healthy |
 | `oversize` | A record one byte past the room fails its operation with `length_error`, as do its group's later records and the waits on them, linked before or after; the records around it commit; its sealer is not called again; `forget` retires the refused sequences; recovery holds the acknowledged records |
+| `owed` | A sealed group whose waiter on the open record makes its sealer owed when its staged record is refused, through `commit()` and through `begin()` with a waiter linking below the hole while its record is in flight: the driver goes idle, a re-registered sealer leaves it idle, the blocking entry returns and `run()` sleeps |
+| `forget` | Forgetting a refused group retires through the open record past the refused ones (3 after a refused 2), as a plain group's through 2: a wait on it fails `group_closed`, and the reopened incarnation's first record does not acknowledge it |
 | `crash` | Power cut at every I/O operation of two waves, 6 seeds, cuts between two turns of one wave counted: recovery keeps every acknowledged record and the in-flight turn whole or absent |
 
 `test/turn_seal_mutants.sh` applies each guard's mutant (`one-call`, `framing`, `staged`, `rotation`,
