@@ -279,6 +279,23 @@ public:
 		staged_ = std::move(turn);
 		return {file_.get(), staged_->offset, staged_->bytes, staged_->turn};
 	}
+	// How many of `records`, from the first, one turn encodes in an empty segment without
+	// forwarded copies: what encode() accepts. Sequences are not checked.
+	std::size_t fitting(std::span<const TurnRecord> records) const {
+		std::size_t n = 0;  // a turn holds at least each record's logical bytes
+		for (std::uint64_t bytes = 0; n < records.size() && (bytes += turn_log_detail::record_header + records[n].payload.size()) <= options_.segment_bytes; ++n) {}
+		auto fit = [&](std::size_t count) {
+			return fits([&](framing::Emitter& emitter) {
+				for (const auto& record : records.first(count)) { emitter.record(turn_log_detail::logical(static_cast<std::uint8_t>(record.kind), turn_ + 1, record.group, record.sequence, record.payload), record.group, record.sequence); }
+				std::string tally; put32(tally, static_cast<std::uint32_t>(count));
+				emitter.record(turn_log_detail::logical(turn_log_detail::end_of_turn, turn_ + 1, 0, 0, tally));
+			});
+		};
+		if (fit(n)) { return n; }
+		std::size_t low = 0;  // fits; n does not
+		while (n - low > 1) { const auto mid = low + (n - low) / 2; (fit(mid) ? low : n) = mid; }
+		return low;
+	}
 	// The staged turn's barrier returned: its records are durable.
 	void completed() {
 		if (!staged_) { throw std::logic_error("no turn in flight"); }

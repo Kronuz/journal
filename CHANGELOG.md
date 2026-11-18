@@ -15,6 +15,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   `IO::sync_files` or `IO::sync_data_files` instead of `File::sync`, so a host that counts or skips
   syncs sees them. Pins completion at `f4c19b1`; `PrefixIO` forwards `sync_data_files`;
   `TurnLog::flush(write)` is a turn's barrier for a driver that writes it itself.
+- `TurnDriver` writes the oldest pending records that encode in one segment as a turn and leaves
+  the rest for the next, so a wave of staged records larger than a segment commits over several
+  turns instead of failing every operation with "turn exceeds a segment"; a load that fit one turn
+  still takes one. A record that does not encode alone in a segment fails with
+  `std::length_error`, together with its group's later records and the `durable()` waits on them;
+  the driver and other groups carry on. `TurnLog::fitting` returns how many records, from the
+  first, one turn encodes in an empty segment. The turn format is unchanged.
+  See [the turn-seal note](docs/mechanisms/turn-seal.md#staged-records-one-segment-per-turn).
 - `TurnDriver` calls a sealer again in the same turn while it returns records, with the room left
   after each record's `record_cost` and `first = false`, until it returns nothing or less than
   `record_cost(0)` is left, so one turn carries a group's backlog. A sealer returns nothing when it

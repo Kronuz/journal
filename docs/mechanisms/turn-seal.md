@@ -1,5 +1,6 @@
 > Status: CURRENT (2026-11-17) how `TurnDriver::seal` in `include/journal/turn_driver.h` works,
-> repeat calls per turn included (journal-seal-repeat).
+> repeat calls per turn (journal-seal-repeat) and the one-segment bound on staged records
+> (journal-turn-bound) included.
 > Consumer: strata `docs/design/standalone-turn-log.md` revision 1 (D3, D4, D5; review R3), at
 > strata:8e919415, and the shim it replaces, strata:efe25bcd `include/strata/core/turn_seal.hh`.
 > Format: `RFTW0001`, unchanged.
@@ -113,8 +114,8 @@ the new log. `Store` stages no checkpoint of its own.
 
 `room` is in cost units: a record of `payload` bytes costs `record_cost(payload) = payload + 65`.
 Each turn must fit an empty segment, or
-`TurnLog::encode` throws `length_error` and the loop fails, so the driver works from a bound on a
-turn's encoded bytes that holds whatever the block manifests are:
+`TurnLog::encode` throws `length_error`, so the driver works from a bound on a turn's encoded bytes
+that holds whatever the block manifests are:
 
 ```
 E <= (C + 126 + B/2) * B / (B - 126),   C = sum over records of (payload + 65), end of turn included
@@ -149,8 +150,65 @@ For 32 KiB blocks the overhead past the records is about 16.2 KiB plus 0.4%.
   (`next_seal_`). Two groups that each fill a turn alternate, and a record that needs the whole room
   waits at most one turn for each group ahead of it in the rotation, while staged records
   leave it the whole room (staged records are not budgeted, so they can stretch the wait).
-- Pending records staged with `stage()` are not budgeted: they count against the sealers' room,
-  and a turn of pending records alone that does not fit fails as before.
+- Pending records staged with `stage()` count against the sealers' room before any sealer is
+  called; how many of them a turn takes is the next section's rule.
+
+## Staged records: one segment per turn
+
+`start()` takes the oldest pending records that one turn encodes in an empty segment, and leaves
+the rest pending in order for the next turn. That is the limit `TurnLog::encode` has always
+applied ("turn exceeds a segment"), so every load that fit one turn before still takes one. While
+the pending records' `record_cost` sum fits `turn_room(segment_bytes)`, the first record's budget
+above, they all fit and nothing is measured; past it, `TurnLog::fitting` finds the longest prefix
+that encodes, by binary search over trial encodes of at most a segment (no forwarded copies, which
+ride only where they fit). `turn_room` stays the sealers' budget: they need a bound before a record
+exists, and the turn cannot hold them back. `run()`, `commit()` under the blocking entry, and a host calling `begin()` while
+`idle()` is false write turn after turn until nothing is pending. A wave of opens, 64 groups each
+staging a create checkpoint and a first batch at once, so commits in two or three turns instead of
+failing the driver (consensus-wave-open, D114).
+
+- **Sealed records are never deferred.** The sealers spend `turn_room` after the pending records,
+  so a turn that seals anything is within the room and fits whole; while pending records alone
+  exceed the room, no sealer is called and the turn takes only pending records.
+- **Order and durability.** A turn takes a prefix of the pending records, so every group's records
+  reach the log in sequence, and each turn is still one write and one data barrier: an operation
+  completes at its own turn's barrier, and a crash between two turns of one wave keeps the first
+  turn's records and the second whole or not at all.
+
+**A record no segment holds.** A pending record that does not encode alone in an empty segment,
+the record `TurnLog::encode` refuses, is refused before sealing, at the next turn, wherever it sits among the
+pending records: waits on it can fail before its group's older deferred records are durable. Its operation
+fails with `std::length_error("turn record exceeds a segment")`, and so does every later record of
+its group: the ones pending now, and any staged until the group is forgotten. A `durable()` wait
+on any of those sequences throws the same error, whether it linked before the refusal or after;
+waits below it resolve as usual. The group's sealer is no longer called and owes no turn, whatever
+waits on the group, so `idle()` turns true and `run()` and the blocking entry sleep. The driver
+stays healthy, and every other group's records commit. `forget()` retires the refused sequences and
+the open record past them, as it retires the one past a plain group's last record, so a reopened
+incarnation follows them and never acknowledges an old wait. A refused group backed by a `Journal`
+cannot close or reopen in-process (`Journal::close` needs every assigned sequence durable), so the
+refusal holds it until the host restarts, as a failed turn holds every group.
+
+Why the group's later records fail too, and not only the oversized one:
+
+1. A group's records are one dense sequence. `TurnLog::stage` refuses a record that does not
+   follow its group's last sequence, and refuses it for the whole turn: letting record `n + 1`
+   through after refusing `n` would fail the driver and every group, the failure this rule removes.
+   The one exception, a new group's first record as a checkpoint at any sequence, would make durable
+   a state that includes the failed operation.
+2. Recovery needs that density too: `Journal::recover_shared` reads a group's records as its
+   checkpoint plus one record per sequence and reports a gap as corruption. Writing the later
+   records around a hole would make a group that recovers worse than one that stops.
+3. Renumbering is not available. The `Journal` assigned the sequence when it staged the record,
+   and the frontier it reported to the caller names it; the driver cannot move a later record
+   down without changing what an acknowledged operation already means.
+4. The group is already finished by its own error path. The refused operation fails, so its
+   `Store` fences, as it does for a failed turn, and recovery resumes it at its last durable
+   record. Failing the later records reports at once what the sequence rule would report at the
+   group's next turn, and only for that group.
+
+A record that large means the segment is too small for the group's commands or manifests: the
+first record's budget above names the segment size a command needs.
 
 ## Asking for a turn
 
@@ -205,6 +263,19 @@ new call: its watcher awaits `durable` for the open record.
 | `repeat_latent` | Review F1: with no waiter and nothing more asked for, `commit()`, `completed()` after `begin()` (the driver busy meanwhile) and `run()` with its stop requested each throw the repeat call's error, and `failed()` is true |
 | `repeat_unseal` | A group unsealed or re-sealed during a call is not called again in the turn and its record is durable; `forget` between repeat calls is refused |
 | `repeat_threads` | Under TSan: the third call of a turn waits until another thread's `unseal` has dropped the group; the turn holds three records, no fourth call starts, and `unseal` returns only once the calls end; across 100 rounds of random unseals no call starts after `unseal` returns |
+
+`test/turn_bound_test.cc`, one CTest entry per case (`journal_turn_bound_<case>`), covers the
+staged records' bound:
+
+| Case | Shows |
+|---|---|
+| `wave` | 16 seeds of 64 groups' create checkpoint and first batch plus a record of exactly the room between two small ones: every operation completes over several turns in staged order, and recovery holds every record in order |
+| `wave_run` | The same wave under `run()`, with 64 `durable()` waiters: every waiter resumes, the driver stays healthy |
+| `bound` | At main's limit, measured through `TurnLog::append` in a new log: one record of the largest payload main encodes commits, one byte more is refused alone; the most records of 10, 100 and 1000 bytes main encodes in one turn commit in one, and one more takes a second turn; each limit lies above the room |
+| `oversize` | A record one byte past what a segment holds fails its operation with `length_error`, as do its group's later records and the waits on them, linked before or after; the records around it commit; its sealer is not called again; `forget` retires the refused sequences; recovery holds the acknowledged records |
+| `owed` | A sealed group whose waiter on the open record makes its sealer owed when its staged record is refused, through `commit()` and through `begin()` with a waiter linking below the hole while its record is in flight: the driver goes idle, a re-registered sealer leaves it idle, the blocking entry returns and `run()` sleeps |
+| `forget` | Forgetting a refused group retires through the open record past the refused ones (3 after a refused 2), as a plain group's through 2: a wait on it fails `group_closed`, and the reopened incarnation's first record does not acknowledge it |
+| `crash` | Power cut at every I/O operation of two waves, 6 seeds, cuts between two turns of one wave counted: recovery keeps every acknowledged record and the in-flight turn whole or absent |
 
 `test/turn_seal_mutants.sh` applies each guard's mutant (`one-call`, `framing`, `staged`, `rotation`,
 `unsealed-again`, `repeat-throw`, `deferred-ignored` and the earlier ones); the case named beside it fails at each.

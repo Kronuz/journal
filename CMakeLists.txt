@@ -49,10 +49,17 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME journal_turn_seal_${c} COMMAND journal_turn_seal_test ${c})
 		set_tests_properties(journal_turn_seal_${c} PROPERTIES TIMEOUT 600)
 	endforeach()
+	add_executable(journal_turn_bound_test test/turn_bound_test.cc)
+	target_link_libraries(journal_turn_bound_test PRIVATE journal::journal)
+	foreach(c wave wave_run bound oversize owed forget crash)
+		add_test(NAME journal_turn_bound_${c} COMMAND journal_turn_bound_test ${c})
+		set_tests_properties(journal_turn_bound_${c} PROPERTIES TIMEOUT 600)
+	endforeach()
 	target_compile_definitions(journal_crc_fixture_test PRIVATE JOURNAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/crc32c")
 	target_compile_definitions(journal_framing_test PRIVATE JOURNAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/framing")
 	set_tests_properties(journal_turn_log PROPERTIES TIMEOUT 120)  # a full flush per turn on macOS
 	set_tests_properties(journal_framing PROPERTIES TIMEOUT 120)  # about 27 s under ASan and UBSan at -O0
+	set_tests_properties(journal_crc_fixture PROPERTIES TIMEOUT 120)  # 217 full flushes on macOS: 12-21 s on a busy host
 	set_tests_properties(journal_turn_log_power PROPERTIES TIMEOUT 600)
 	set_tests_properties(journal_shared_store PROPERTIES TIMEOUT 600)
 	# T8: the shared journal's decoders, replayed over seeded inputs; libFuzzer with JOURNAL_FUZZ.
