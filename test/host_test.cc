@@ -496,9 +496,10 @@ void sealer_close_crash() {
 	std::cout << "sealer_close_crash: " << cut << " cuts\n";
 }
 
-// A group closed, reopened from the table, then recovered by a second Store of the same host:
-// its state is in the log, not the table, so the recovery is refused; its loop keeps running,
-// and the reopened host recovers the group's latest state.
+// A group closed, reopened from the table, then recovered by a second Store of the same host
+// (docs/mechanisms/group-lifetime.md): while the first Store lives the recovery is busy and
+// changes nothing; once it ends, the second recovers the group's latest state from the log in
+// the live host, the loop keeps running, and the reopened host recovers the same state.
 void second_recovery() {
 	jt::Disk disk;
 	{
@@ -508,15 +509,16 @@ void second_recovery() {
 		node.store(7);
 		node.checkpoint(7, "new"); node.append(7, "after-new");
 		node.append(9, "neighbor");
-		node.stores.erase(7);
-		bool refused = false;
+		bool busy = false;
 		try {
 			j::Store store(*node.host, 7, limits);
-			store.recover([](std::uint64_t, std::string_view) { check(false, "a refused recovery replays nothing"); },
-				[](const j::Frontier&, j::ArtifactReader&, std::span<j::ArtifactReader>) { check(false, "a refused recovery restores nothing"); });
-		} catch (const j::Corruption&) { refused = true; }
-		check(refused, "a second recovery on the same host is refused");
-		node.commit(7);
+			store.recover([](std::uint64_t, std::string_view) { check(false, "a busy recovery replays nothing"); },
+				[](const j::Frontier&, j::ArtifactReader&, std::span<j::ArtifactReader>) { check(false, "a busy recovery restores nothing"); });
+		} catch (const std::system_error& error) { busy = error.code() == std::errc::operation_would_block; }
+		check(busy, "a second recovery while the first Store lives is busy");
+		node.stores.erase(7);
+		node.store(7);
+		check(node.recovered[7].bundle == "new" && node.recovered[7].batches == std::vector<std::string>{"after-new"}, "the second recovery in the live host has the latest state");
 		check(!node.host->driver(0).failed(), "the group's loop keeps running");
 		node.append(9, "still");
 	}
