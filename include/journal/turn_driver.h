@@ -21,8 +21,10 @@
  */
 
 // One core's turn driver: the groups' Stores (shared backend) stage their records here,
-// and each turn writes them with one data barrier. A record staged with an operation
-// completes that operation at its turn's barrier, or fails it with the turn. run() is the
+// and each turn writes the oldest ones that fit one segment with one data barrier; the rest
+// wait for the next turn. A record staged with an operation completes that operation at its
+// turn's barrier, or fails it with the turn. A record no segment holds fails its operation,
+// and its group's later records theirs, before any turn takes them. run() is the
 // loop's task that writes turns through completion's seam; journal::run (blocking.h) commits
 // them inline instead. One of them holds the driver at a time.
 
@@ -34,10 +36,12 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -141,6 +145,7 @@ public:
 		auto& floor = retired_[group];
 		floor = std::max(floor, log_.sequence(group) + 1);  // the open record a writer may hold
 		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { floor = std::max(floor, waiter->sequence); } }
+		if (auto found = refused_.find(group); found != refused_.end()) { floor = std::max(floor, found->second.last); refused_.erase(found); }
 		resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);
 		{
 			std::lock_guard hold(sealers_mutex_);
@@ -216,8 +221,10 @@ public:
 	std::uint64_t retired(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
 	bool failed() const noexcept { return log_failed_; }
 
-	// Stages a record for the next turn; its operation, if any, completes at that turn's
-	// barrier with the token it was staged with.
+	// Stages a record for the next turn that has room for it; its operation, if any, completes
+	// at that turn's barrier with the token it was staged with. A record no segment holds is
+	// refused at the next turn: its operation, and those of its group's later records, fail with
+	// std::length_error, and so do durable() waits on them, until the group is forgotten.
 	// Returns the record's sequence.
 	std::uint64_t stage(TurnRecord record, std::shared_ptr<IOOperation> operation = {}, MutationToken token = {}) {
 		if (log_failed_) { throw std::logic_error("turn driver failed"); }
@@ -237,8 +244,9 @@ public:
 	bool idle() const noexcept { return pending_.empty() && !owed_.load(std::memory_order_acquire) && !woken_.load(std::memory_order_acquire) && !deferred_; }
 	bool in_flight() const noexcept { return write_.has_value(); }
 
-	// Stages the pending records as one turn and submits their operations; the host writes
-	// write().bytes at write().offset, calls File::sync_data, then completed() or failed().
+	// Stages the oldest pending records that fit a segment as one turn and submits their
+	// operations; the host writes write().bytes at write().offset, calls File::sync_data, then
+	// completed() or failed().
 	const TurnLog::TurnWrite& begin() {
 		if (holder_ == Holder::driver) { throw std::logic_error("run() holds the turn driver"); }
 		auto* write = start();
@@ -263,8 +271,8 @@ public:
 	// staged with it or after it.
 	void failed(std::exception_ptr error) noexcept { log_.failed(); write_.reset(); fail(error); }
 
-	// Writes and syncs the pending and sealed records as one turn; when there are none, writes
-	// nothing if a waiter asked the sealers, and throws otherwise.
+	// Writes and syncs the oldest pending and sealed records that fit a segment as one turn;
+	// when there are none, writes nothing if a waiter asked the sealers, and throws otherwise.
 	void commit() {
 		if (holder_ == Holder::driver) { throw std::logic_error("run() holds the turn driver"); }
 		const bool asked = !idle();
@@ -378,6 +386,7 @@ private:
 			const auto state = waiter.state.load(std::memory_order_acquire);
 			if (state == detail::TurnWaiter::closed) { throw group_closed(waiter.group, waiter.sequence); }
 			if (state == detail::TurnWaiter::cancelled || (token.requested() && !turns.satisfied(waiter))) { throw task::cancelled{}; }
+			if (auto error = turns.refusal(waiter.group, waiter.sequence)) { std::rethrow_exception(error); }
 			// A waiter its turn made durable is answered even if the driver failed after that turn.
 			if (waiter.group && turns.log_failed_ && state != detail::TurnWaiter::completed) { std::rethrow_exception(turns.failure_); }
 		}
@@ -401,7 +410,7 @@ private:
 	};
 	bool satisfied(const detail::TurnWaiter& waiter) const {
 		if (!waiter.group) { return !idle(); }
-		return log_failed_ || log_.sequence(waiter.group) >= waiter.sequence;
+		return log_failed_ || refusal(waiter.group, waiter.sequence) || log_.sequence(waiter.group) >= waiter.sequence;
 	}
 	// A group's waiter asks its sealer, if any, for a turn.
 	void link(detail::TurnWaiter& waiter) noexcept {
@@ -435,18 +444,68 @@ private:
 			waiter = next;
 		}
 	}
-	// Seals, then stages the pending records as one turn; nullptr when there are none.
+	// Refuses the records no segment holds, seals, then stages the oldest pending records whose
+	// costs fit an empty segment's room as one turn; nullptr when none are pending. A turn of
+	// sealed records fits whole: seal_turn spends the same room after the staged records.
 	const TurnLog::TurnWrite* start() {
 		if (write_) { throw std::logic_error("a turn is already in flight"); }
+		refuse();
 		try { seal_turn(); } catch (...) { fail(std::current_exception()); throw; }
 		if (pending_.empty()) { return nullptr; }
-		std::vector<TurnRecord> records; records.reserve(pending_.size());
-		for (auto& item : pending_) { records.push_back(std::move(item.record)); }
-		flight_ = std::move(pending_); pending_.clear();
+		const auto room = whole_room();
+		std::size_t take = 0;
+		for (std::uint64_t used = 0; take < pending_.size(); ++take) {
+			used += turn_log_detail::record_cost(pending_[take].record.payload.size());
+			if (used > room) { break; }
+		}
+		// refuse() left no record above the room, so the first one always fits.
+		std::vector<TurnRecord> records; records.reserve(take);
+		for (std::size_t i = 0; i < take; ++i) { records.push_back(std::move(pending_[i].record)); }
+		flight_.assign(std::make_move_iterator(pending_.begin()), std::make_move_iterator(pending_.begin() + static_cast<std::ptrdiff_t>(take)));
+		pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(take));
 		try { write_ = log_.stage(records); }
 		catch (...) { fail(std::current_exception()); throw; }
 		for (auto& item : flight_) { if (item.operation) { item.operation->submitted(); item.submitted = true; } }
 		return &*write_;
+	}
+	// The record cost one turn may carry in an empty segment.
+	std::uint64_t whole_room() const {
+		const auto& options = log_.options();
+		return turn_log_detail::turn_room(options.segment_bytes, options.block_bytes);
+	}
+	// The error a group's refused record left for `sequence`, null when none: sequences from
+	// the refused one on never reach the log.
+	std::exception_ptr refusal(std::uint64_t group, std::uint64_t sequence) const {
+		if (!group) { return nullptr; }
+		auto found = refused_.find(group);
+		return found != refused_.end() && sequence >= found->second.hole ? found->second.error : nullptr;
+	}
+	// Takes out of pending_ each record whose cost exceeds the room, and every later record of
+	// its group, and fails their operations and the durable() waits on them; the rest keep their
+	// order. A refused group seals nothing more until it is forgotten.
+	void refuse() {
+		const auto room = whole_room();
+		std::vector<Pending> refused;
+		auto kept = pending_.begin();
+		for (auto& item : pending_) {
+			const auto group = item.record.group, sequence = item.record.sequence;
+			auto found = refused_.find(group);
+			if (found == refused_.end() && turn_log_detail::record_cost(item.record.payload.size()) > room) {
+				auto error = std::make_exception_ptr(std::length_error("turn record exceeds a segment"));
+				found = refused_.emplace(group, Refusal{sequence, sequence, error}).first;
+			}
+			if (found != refused_.end() && sequence >= found->second.hole) {
+				found->second.last = std::max(found->second.last, sequence);
+				refused.push_back(std::move(item));
+				continue;
+			}
+			if (&*kept != &item) { *kept = std::move(item); }
+			++kept;
+		}
+		if (refused.empty()) { return; }
+		pending_.erase(kept, pending_.end());
+		for (auto& item : refused) { settle(item, refused_.at(item.record.group).error); }
+		resume([this](const detail::TurnWaiter& waiter) { return refusal(waiter.group, waiter.sequence) != nullptr; }, detail::TurnWaiter::failed);
 	}
 	// Calls each sealer, from the one the last turn left waiting, until it returns nothing or the
 	// room is spent (docs/mechanisms/turn-seal.md). The first sealed record may fill an empty
@@ -479,7 +538,7 @@ private:
 			{
 				std::lock_guard hold(sealers_mutex_);
 				auto found = sealers_.find(group);
-				if (found == sealers_.end()) { continue; }  // unsealed or forgotten since the turn began
+				if (found == sealers_.end() || refused_.contains(group)) { continue; }  // unsealed, forgotten or refused
 				if (room_left() < turn_log_detail::record_cost(0)) { resume_at = group; break; }
 				fn = found->second.fn; running_ = fn; running_group_ = group; running_owner_ = found->second.owner;
 				running_thread_ = std::this_thread::get_id(); running_forgotten_ = false;
@@ -563,18 +622,19 @@ private:
 		MutationCompletion completion; completion.token = item.token; completion.error = error;
 		item.operation->complete(std::move(completion));
 	}
+	// Fails an item's operation; one not yet submitted is submitted first, so failing it settles it.
+	static void settle(Pending& item, std::exception_ptr error) noexcept {
+		if (!item.operation) { return; }
+		if (!item.submitted) { try { item.operation->submitted(); item.submitted = true; } catch (...) { return; } }
+		finish(item, error);
+	}
 	void fail(std::exception_ptr error) noexcept {
 		log_failed_ = true; failure_ = error ? error : std::make_exception_ptr(std::logic_error("turn driver failed"));
 		deferred_ = nullptr;
 		auto flight = std::move(flight_); flight_.clear();
 		for (auto& item : pending_) { flight.push_back(std::move(item)); }
 		pending_.clear();
-		// An operation not yet submitted is submitted first, so failing it settles it.
-		for (auto& item : flight) {
-			if (!item.operation) { continue; }
-			if (!item.submitted) { try { item.operation->submitted(); } catch (...) { continue; } }
-			finish(item, error);
-		}
+		for (auto& item : flight) { settle(item, error); }
 		resume([](const detail::TurnWaiter& waiter) { return waiter.group != 0; }, detail::TurnWaiter::failed);
 	}
 
@@ -587,6 +647,9 @@ private:
 	std::condition_variable sealer_done_;  // a sealer call finished
 	std::map<std::uint64_t, Sealing> sealers_;
 	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten: retired()
+	// A group whose record at `hole` no segment holds: its records from there through `last` failed.
+	struct Refusal { std::uint64_t hole = 0, last = 0; std::exception_ptr error; };
+	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten
 	std::shared_ptr<Sealer> running_;  // the sealer being called, on running_thread_
 	std::uint64_t running_group_ = 0;  // and the group and owner it was called for
 	const void* running_owner_ = nullptr;
