@@ -137,15 +137,26 @@ public:
 		auto found = recovered_.groups.find(group); return found == recovered_.groups.end() ? none : found->second;
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
+	// A group no Store holds leaves memory but not the log (TurnLog::park); live() reads its
+	// records back for the next Store. Nothing of it may be staged. Its refusal goes too: the
+	// refused records never reached the log, and no waiter of the old holder remains.
+	void park(std::uint64_t group) {
+		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
+		log_.park(group); recovered_.groups.erase(group); refused_.erase(group);
+	}
+	bool parked(std::uint64_t group) const { return log_.parked(group); }
+	std::vector<TurnRecord> live(std::uint64_t group) { return log_.live(group); }
 	// A closed group leaves the log (TurnLog::forget) and its sealer is unregistered: no
 	// sealer of it runs once this returns. Nothing of it may be staged. Every durable() waiter
-	// of the group fails with group_closed, and the sequences it could hold are retired.
-	void forget(std::uint64_t group) {
+	// of the group fails with group_closed, and the sequences it could hold are retired. The
+	// driver keeps the floor only past `implied`, the floor its host's table already gives
+	// (retire_with); a bare driver keeps every one.
+	void forget(std::uint64_t group, std::uint64_t implied = 0) {
 		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
-		auto& floor = retired_[group];
-		floor = std::max(floor, log_.sequence(group) + 1);  // the open record a writer may hold
+		auto floor = std::max(kept(group), log_.sequence(group) + 1);  // the open record a writer may hold
 		for (auto* waiter = waiters_; waiter; waiter = waiter->next) { if (waiter->group == group) { floor = std::max(floor, waiter->sequence); } }
 		if (auto found = refused_.find(group); found != refused_.end()) { floor = std::max(floor, found->second.last + 1); refused_.erase(found); }  // and the open record past the refused ones
+		if (floor > implied) { retired_[group] = floor; } else { retired_.erase(group); }
 		resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);
 		{
 			std::lock_guard hold(sealers_mutex_);
@@ -218,13 +229,17 @@ public:
 	std::uint64_t sequence(std::uint64_t group) const { return log_.sequence(group); }
 	// The last sequence an earlier incarnation of the group could hand out, 0 for none: a
 	// reopened group's records follow it, and a durable() at or below it fails with group_closed.
-	std::uint64_t retired(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
+	std::uint64_t retired(std::uint64_t group) const { return retired_by_ ? std::max(kept(group), retired_by_(group)) : kept(group); }
+	// A host answers retired() from its table: a group it closed retires through its close's
+	// sequence + 1, so forget() keeps no entry per closed group. Called on the loop, maybe under
+	// the sealers' lock; it must not throw.
+	void retire_with(std::function<std::uint64_t(std::uint64_t)> floor) { retired_by_ = std::move(floor); }
 	bool failed() const noexcept { return log_failed_; }
 
 	// Stages a record for the next turn that has room for it; its operation, if any, completes
 	// at that turn's barrier with the token it was staged with. A record no segment holds is
 	// refused at the next turn: its operation, and those of its group's later records, fail with
-	// std::length_error, and so do durable() waits on them, until the group is forgotten.
+	// std::length_error, and so do durable() waits on them, until the group is forgotten or parked.
 	// Returns the record's sequence.
 	std::uint64_t stage(TurnRecord record, std::shared_ptr<IOOperation> operation = {}, MutationToken token = {}) {
 		if (log_failed_) { throw std::logic_error("turn driver failed"); }
@@ -464,7 +479,12 @@ private:
 		pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(take));
 		try { write_ = log_.stage(records); }
 		catch (...) { fail(std::current_exception()); throw; }
-		for (auto& item : flight_) { if (item.operation) { item.operation->submitted(); item.submitted = true; } }
+		// An operation that refuses submission (its Store fenced) is dropped, never told; its
+		// record goes with the turn, so its group's sequence stays whole and its neighbors run.
+		for (auto& item : flight_) {
+			if (!item.operation) { continue; }
+			try { item.operation->submitted(); item.submitted = true; } catch (...) { item.operation.reset(); }
+		}
 		return &*write_;
 	}
 	// The record cost one turn may carry in an empty segment.
@@ -482,7 +502,7 @@ private:
 	// Takes out of pending_ each record that does not encode alone in an empty segment, as encode()
 	// refuses it, and every later record of its group, and fails their operations and the durable()
 	// waits on them; the rest keep their order. A refused group seals nothing more, and its sealer
-	// owes nothing, until it is forgotten.
+	// owes nothing, until it is forgotten or parked.
 	void refuse() {
 		const auto room = whole_room();
 		std::vector<Pending> refused;
@@ -650,10 +670,12 @@ private:
 	mutable std::mutex sealers_mutex_;  // the sealer table and running_; never held while a sealer runs
 	std::condition_variable sealer_done_;  // a sealer call finished
 	std::map<std::uint64_t, Sealing> sealers_;
-	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten: retired()
+	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten past its host's floor: retired()
+	std::function<std::uint64_t(std::uint64_t)> retired_by_;  // the host's floor: retire_with()
+	std::uint64_t kept(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
 	// A group whose record at `hole` no segment holds: its records from there through `last` failed.
 	struct Refusal { std::uint64_t hole = 0, last = 0; std::exception_ptr error; };
-	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten
+	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten or parked
 	std::shared_ptr<Sealer> running_;  // the sealer being called, on running_thread_
 	std::uint64_t running_group_ = 0;  // and the group and owner it was called for
 	const void* running_owner_ = nullptr;

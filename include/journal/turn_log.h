@@ -217,10 +217,59 @@ public:
 	void forget(std::uint64_t group) {
 		if (staged_ && staged_->next.contains(group)) { throw std::logic_error("the group has a turn in flight"); }
 		if (auto found = index_.find(group); found != index_.end()) {
-			for (const auto& [_, live] : found->second) { if (!--live_counts_[live.segment]) { live_counts_.erase(live.segment); } }
+			for (const auto& [_, live] : found->second) { drop(live); }
 			index_.erase(found);
 		}
+		if (auto found = parked_.find(group); found != parked_.end()) {
+			for (const auto& live : found->second.live) { drop(live); }
+			parked_.erase(found);
+		}
 		sequences_.erase(group);
+	}
+	// Parks a group no writer holds: its live records stay live, so retention keeps and forwards
+	// them, but the log keeps only their positions, and no sequence or index entry. Nothing of
+	// the group may be in the turn in flight, and it stages nothing until live() unparks it.
+	void park(std::uint64_t group) {
+		if (staged_ && staged_->next.contains(group)) { throw std::logic_error("the group has a turn in flight"); }
+		auto found = index_.find(group);
+		if (found == index_.end() || found->second.empty()) { return; }
+		Parked parked; parked.first = found->second.begin()->first; parked.live.reserve(found->second.size());
+		for (const auto& [sequence, live] : found->second) {
+			if (sequence != parked.first + parked.live.size()) { throw std::logic_error("a group's live records are not consecutive"); }
+			parked.live.push_back(live);
+		}
+		if (parked.first + parked.live.size() - 1 != sequence(group)) { throw std::logic_error("a group's live records end before its sequence"); }
+		parked_.emplace(group, std::move(parked));
+		index_.erase(found); sequences_.erase(group);
+	}
+	bool parked(std::uint64_t group) const { return parked_.contains(group); }
+	// A group's live records from its latest checkpoint record, read back by position; a parked
+	// group is unparked. A record that does not read back as itself throws Corruption and
+	// changes nothing.
+	std::vector<TurnRecord> live(std::uint64_t group) {
+		std::vector<std::pair<std::uint64_t, Live>> positions;
+		const auto parked = parked_.find(group);
+		if (parked != parked_.end()) {
+			for (std::size_t i = 0; i < parked->second.live.size(); ++i) { positions.emplace_back(parked->second.first + i, parked->second.live[i]); }
+		} else if (auto found = index_.find(group); found != index_.end()) {
+			positions.assign(found->second.begin(), found->second.end());
+		}
+		std::vector<TurnRecord> records; records.reserve(positions.size());
+		for (const auto& [sequence, live] : positions) {
+			const auto bytes = framing::read_record(reader(live.segment), turn_log_detail::stream(identity_, options_.block_bytes, live.segment, live.epoch), live.offset);
+			std::string_view logical(bytes);
+			if (logical.size() < turn_log_detail::record_header || static_cast<std::uint8_t>(logical[0]) != static_cast<std::uint8_t>(live.kind)) { throw Corruption("a live record does not read back as itself"); }
+			logical.remove_prefix(1); get64(logical);  // the kind, then the turn
+			if (get64(logical) != group || get64(logical) != sequence) { throw Corruption("a live record does not read back as itself"); }
+			records.push_back({group, sequence, live.kind, std::string(logical)});
+		}
+		if (parked != parked_.end()) {
+			auto& index = index_[group];
+			for (const auto& [sequence, live] : positions) { index.emplace(sequence, live); }
+			sequences_[group] = positions.back().first;
+			parked_.erase(parked);
+		}
+		return records;
 	}
 	// Preallocates spare segments; the host calls it off the turn.
 	void prepare() { while (spares_.size() < options_.spare_segments) { spares_.push_back(preallocate()); } }
@@ -249,6 +298,7 @@ public:
 		for (const auto& record : records) {
 			if (!record.group) { throw std::invalid_argument("group 0 is reserved"); }
 			if (lost_.contains(record.group)) { throw std::invalid_argument("a lost group rejoins under a new id"); }
+			if (parked_.contains(record.group)) { throw std::logic_error("a parked group stages nothing until it is unparked"); }
 			auto [found, fresh] = turn.next.try_emplace(record.group, sequence(record.group));
 			auto& last = found->second;
 			bool start = fresh && !sequences_.contains(record.group) && record.kind == TurnRecordKind::Checkpoint && record.sequence;
@@ -306,7 +356,13 @@ public:
 		for (const auto& n : turn.notes) {
 			if (!n.copy) { note(n.group, n.sequence, n.kind, n.offset); stats_.bytes_appended += n.bytes; continue; }
 			// A copy replaces its original unless a checkpoint in this turn superseded both.
-			if (index_[n.group].contains(n.sequence)) { note(n.group, n.sequence, n.kind, n.offset, true); }
+			if (auto parked = parked_.find(n.group); parked != parked_.end()) {
+				auto& live = parked->second.live;
+				if (n.sequence >= parked->second.first && n.sequence - parked->second.first < live.size()) {
+					auto& original = live[n.sequence - parked->second.first]; drop(original);
+					original = Live{segment_, epoch_, n.offset, n.kind}; ++live_counts_[segment_];
+				}
+			} else if (auto found = index_.find(n.group); found != index_.end() && found->second.contains(n.sequence)) { note(n.group, n.sequence, n.kind, n.offset, true); }
 			stats_.forwarded_bytes += n.bytes; ++stats_.forwarded_records;
 		}
 		reclaim();
@@ -317,7 +373,10 @@ public:
 	std::uint64_t last_turn() const noexcept { return turn_; }
 	std::uint64_t segment() const noexcept { return segment_; }
 	std::uint64_t position() const noexcept { return offset_; }  // in the current segment
-	std::uint64_t sequence(std::uint64_t group) const { auto found = sequences_.find(group); return found == sequences_.end() ? 0 : found->second; }
+	std::uint64_t sequence(std::uint64_t group) const {
+		if (auto found = sequences_.find(group); found != sequences_.end()) { return found->second; }
+		auto found = parked_.find(group); return found == parked_.end() ? 0 : found->second.first + found->second.live.size() - 1;
+	}
 	const TurnLogStats& stats() const noexcept { return stats_; }
 	const TurnLogOptions& options() const noexcept { return options_; }
 	// Segments holding records, the current one included; the oldest goes first.
@@ -333,10 +392,12 @@ private:
 		return options;
 	}
 	struct Live { std::uint64_t segment, epoch, offset; TurnRecordKind kind; };
+	// A parked group's live records, consecutive from `first`.
+	struct Parked { std::uint64_t first = 0; std::vector<Live> live; };
+	void drop(const Live& live) { if (!--live_counts_[live.segment]) { live_counts_.erase(live.segment); } }
 	// A checkpoint supersedes the group's earlier records; a copy only replaces its original.
 	void note(std::uint64_t group, std::uint64_t sequence, TurnRecordKind kind, std::uint64_t offset, bool copy = false) {
 		auto& records = index_[group];
-		auto drop = [&](const Live& live) { if (!--live_counts_[live.segment]) { live_counts_.erase(live.segment); } };
 		if (kind == TurnRecordKind::Checkpoint && !copy) { for (const auto& [_, live] : records) { drop(live); } records.clear(); }
 		if (auto found = records.find(sequence); found != records.end()) { drop(found->second); records.erase(found); }
 		records.emplace(sequence, Live{segment_, epoch_, offset, kind}); ++live_counts_[segment_];
@@ -353,24 +414,29 @@ private:
 		const auto oldest = *data_segments_.begin();
 		if (oldest == segment_ || !live_counts_.contains(oldest)) { return copies; }
 		std::size_t bytes = 0;
+		// Copies one live record of the oldest segment; true once the slice is full.
+		auto forward = [&](std::uint64_t group, std::uint64_t sequence, const Live& live) {
+			if (live.segment != oldest) { return false; }
+			auto record = framing::read_record(reader(oldest), turn_log_detail::stream(identity_, options_.block_bytes, oldest, live.epoch), live.offset);
+			std::string_view logical = record; logical.remove_prefix(turn_log_detail::record_header);
+			copies.push_back({group, sequence, live.kind, std::string(logical)});
+			return (bytes += logical.size()) >= std::min<std::uint64_t>(options_.forward_bytes, options_.segment_bytes / 4);
+		};
 		for (const auto& [group, records] : index_) {
-			for (const auto& [sequence, live] : records) {
-				if (live.segment != oldest) { continue; }
-				std::string_view logical;
-				auto record = framing::read_record(reader(oldest), turn_log_detail::stream(identity_, options_.block_bytes, oldest, live.epoch), live.offset);
-				logical = record; logical.remove_prefix(turn_log_detail::record_header);
-				copies.push_back({group, sequence, live.kind, std::string(logical)});
-				if ((bytes += logical.size()) >= std::min<std::uint64_t>(options_.forward_bytes, options_.segment_bytes / 4)) { return copies; }
-			}
+			for (const auto& [sequence, live] : records) { if (forward(group, sequence, live)) { return copies; } }
+		}
+		for (const auto& [group, parked] : parked_) {
+			for (std::size_t i = 0; i < parked.live.size(); ++i) { if (forward(group, parked.first + i, parked.live[i])) { return copies; } }
 		}
 		return copies;
 	}
 	// Releases segments from the oldest while no live record remains in them: recycled into
-	// the spare pool while it is short, removed otherwise. Only the oldest go, so the turns
-	// left stay contiguous.
+	// the spare pool while it is short, removed otherwise. Only the oldest go, each ordered
+	// ahead of the next, so a power cut undoes only the newest of them and the turns left stay contiguous.
 	void reclaim() {
 		bool changed = false;
 		while (!data_segments_.empty() && *data_segments_.begin() != segment_ && !live_counts_.contains(*data_segments_.begin())) {
+			if (changed) { io_.order_files_and_directory({}); }
 			const auto oldest = *data_segments_.begin();
 			data_segments_.erase(data_segments_.begin()); readers_.erase(oldest);
 			if (spares_.size() < options_.spare_segments) {
@@ -433,6 +499,7 @@ private:
 	std::uint64_t epoch_ = 0, turn_ = 0, segment_ = 0, offset_ = 0, next_segment_ = 1, highest_segment_ = 0;
 	std::map<std::uint64_t, std::uint64_t> sequences_; std::set<std::uint64_t> lost_;
 	std::map<std::uint64_t, std::map<std::uint64_t, Live>> index_; std::map<std::uint64_t, std::size_t> live_counts_;
+	std::map<std::uint64_t, Parked> parked_;  // groups no writer holds: park()
 	std::set<std::uint64_t> data_segments_; std::map<std::uint64_t, std::unique_ptr<File>> readers_;
 	framing::Manifest filling_;  // unknown until the first block this open enters
 	struct Note { std::uint64_t group, sequence; TurnRecordKind kind; std::size_t bytes; bool copy; std::uint64_t offset = 0; };

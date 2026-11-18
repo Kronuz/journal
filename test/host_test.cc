@@ -24,17 +24,22 @@
 // share a name and reclaiming one never touches another; reclamation and the admission census by
 // name with no directory scan; a closed group reopened from the group table after retention
 // recycled every segment that held it; a group whose first turn was lost created again as a new
-// incarnation; a failed close that leaves the group open; a close behind an acknowledged record
+// incarnation; a failed close that leaves the group open; a failed reopen that leaves it closed;
+// two loops' table commits free of races under TSan; a close behind an acknowledged record
 // refused; a close with a sealed open record in flight fails its wait, never acknowledging it,
 // under power loss too; a second recovery on one host refused; and one owner lock, the
 // directory's own.
 // `host_test [case]` runs one case.
+#include "completion/posix.h"
 #include "journal/memory_io.h"
 #include "journal/store.h"
 #include <cerrno>
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <set>
+#include <thread>
+#include <unistd.h>
 
 namespace j = kronuz::journal;
 namespace jt = kronuz::journal::testing;
@@ -52,11 +57,12 @@ const j::AdmissionLimits limits{{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8},
 j::Identity identity(std::uint64_t group) { j::Identity id{'G'}; for (unsigned i = 0; i < 8; ++i) { id[1 + i] = static_cast<char>(group >> (8 * i)); } return id; }
 
 // The host's IO, recording every name it is asked about, its scans and its lock's mode; armed,
-// it fails the next table shard write as a full disk would.
+// it fails the next table shard write as a full disk would, or the next directory sync after
+// the change it would make durable (an EIO from fsync on the directory).
 class RecordingIO final : public j::IO {
 public:
 	explicit RecordingIO(std::shared_ptr<j::IO> io) : io_(std::move(io)) {}
-	std::vector<std::string> names; std::size_t scans = 0; std::optional<j::OwnerLockMode> lock_mode; bool full = false;
+	std::vector<std::string> names; std::size_t scans = 0; std::optional<j::OwnerLockMode> lock_mode; bool full = false, sync_fails = false;
 	std::unique_ptr<j::OwnerLock> acquire_owner(bool create) override { return io_->acquire_owner(create); }
 	void open_existing_read_only_into(std::string_view name, j::File& file) override { note(name); io_->open_existing_read_only_into(name, file); }
 	bool open_reclaim_candidate_read_only_into(std::string_view name, j::File& file) override { note(name); return io_->open_reclaim_candidate_read_only_into(name, file); }
@@ -73,7 +79,10 @@ public:
 	std::unique_ptr<j::DirectoryCursor> scan_directory() override { ++scans; return io_->scan_directory(); }
 	std::optional<j::EntryFootprint> entry_footprint(std::string_view name) override { note(name); return io_->entry_footprint(name); }
 	std::unique_ptr<j::File> open_reclaim_candidate(std::string_view name) override { note(name); return io_->open_reclaim_candidate(name); }
-	void sync_directory() override { io_->sync_directory(); }
+	void sync_directory() override {
+		if (sync_fails) { sync_fails = false; throw std::system_error(EIO, std::generic_category(), "the directory sync failed"); }
+		io_->sync_directory();
+	}
 protected:
 	std::unique_ptr<j::OwnerLock> lock_owner(const j::OwnerLockOptions& options) override { lock_mode = options.mode; return io_->acquire_owner(options); }
 private:
@@ -302,6 +311,59 @@ void failed_close() {
 	check(node.recovered[7].bundle == "state" && node.host->entry(7)->incarnation == 1, "it recovers its checkpoint in its first incarnation");
 }
 
+// A recover of a closed group whose table commit fails after its shard's replace, then a
+// create in the same slot: the group stays closed in the live host and after a restart, and
+// recovers its checkpoint.
+void failed_reopen() {
+	jt::Disk disk;
+	const std::uint64_t group = 7;
+	std::uint64_t neighbor = group + 1;
+	while (hd::slot(neighbor) != hd::slot(group)) { ++neighbor; }
+	{
+		Node node(disk);
+		node.append(group, "a1"); node.checkpoint(group, "bundle-a1");
+		node.store(group).close(); node.stores.erase(group);
+		node.io->sync_fails = true;
+		bool threw = false;
+		try { node.store(group); } catch (const std::system_error&) { threw = true; }
+		node.stores.erase(group);
+		check(threw && !node.io->sync_fails, "the reopen's table commit fails at its directory sync");
+		check(node.host->status(group) == j::GroupStatus::closed, "the group stays closed in the live host");
+		node.store(neighbor);
+		check(node.host->status(group) == j::GroupStatus::closed, "and after a create in its slot");
+	}
+	Node node(disk);
+	check(node.host->status(group) == j::GroupStatus::closed, "after a restart the group is closed");
+	node.store(group);
+	check(node.recovered[group].bundle == "bundle-a1" && node.recovered[group].batches.empty(), "it recovers its checkpoint");
+}
+
+// Two loops on their own threads commit table slots that share a 64-slot word: run under TSan,
+// the slots' shard flags must not race. A real directory, as each loop's IO is.
+void loop_slots() {
+	const auto directory = std::filesystem::current_path() / ".scratch" / ("host-loop-slots-" + std::to_string(::getpid()));
+	std::filesystem::remove_all(directory); std::filesystem::create_directories(directory);
+	std::vector<std::uint64_t> side[2];
+	for (std::uint64_t group = 1; side[0].size() < 40 || side[1].size() < 40; ++group) {
+		const auto slot = hd::slot(group);
+		if (slot < 1344 || slot > 1407) { continue; }  // one word across the loop 0 / loop 1 boundary of 3 loops
+		const auto loop = hd::loop(slot, 3);
+		if (loop < 2 && side[loop].size() < 40) { side[loop].push_back(group); }
+	}
+	{
+		j::Host host(std::make_shared<j::PosixIO>(directory), host_identity, j::HostOptions{3, j::TurnLogOptions{64 * 1024, 1024, 1, 2, 4096}});
+		std::thread threads[2];
+		for (int loop = 0; loop < 2; ++loop) {
+			threads[loop] = std::thread([&, loop] { for (auto group : side[loop]) { host.create_group(group); } });
+		}
+		for (auto& thread : threads) { thread.join(); }
+		bool open = true;
+		for (const auto& groups : side) { for (auto group : groups) { auto entry = host.entry(group); open &= entry && entry->state == j::GroupState::open; } }
+		check(open, "every group either loop created is open in the table");
+	}
+	std::filesystem::remove_all(directory);
+}
+
 // journal-host-guards A1. A close whose record is below the group's last acknowledged one, here
 // the group's real checkpoint record with two batches acknowledged after it, is refused: the
 // forget would drop those batches. The group stays open in the table and the log, retention
@@ -496,9 +558,10 @@ void sealer_close_crash() {
 	std::cout << "sealer_close_crash: " << cut << " cuts\n";
 }
 
-// A group closed, reopened from the table, then recovered by a second Store of the same host:
-// its state is in the log, not the table, so the recovery is refused; its loop keeps running,
-// and the reopened host recovers the group's latest state.
+// A group closed, reopened from the table, then recovered by a second Store of the same host
+// (docs/mechanisms/group-lifetime.md): while the first Store lives the recovery is busy and
+// changes nothing; once it ends, the second recovers the group's latest state from the log in
+// the live host, the loop keeps running, and the reopened host recovers the same state.
 void second_recovery() {
 	jt::Disk disk;
 	{
@@ -508,15 +571,16 @@ void second_recovery() {
 		node.store(7);
 		node.checkpoint(7, "new"); node.append(7, "after-new");
 		node.append(9, "neighbor");
-		node.stores.erase(7);
-		bool refused = false;
+		bool busy = false;
 		try {
 			j::Store store(*node.host, 7, limits);
-			store.recover([](std::uint64_t, std::string_view) { check(false, "a refused recovery replays nothing"); },
-				[](const j::Frontier&, j::ArtifactReader&, std::span<j::ArtifactReader>) { check(false, "a refused recovery restores nothing"); });
-		} catch (const j::Corruption&) { refused = true; }
-		check(refused, "a second recovery on the same host is refused");
-		node.commit(7);
+			store.recover([](std::uint64_t, std::string_view) { check(false, "a busy recovery replays nothing"); },
+				[](const j::Frontier&, j::ArtifactReader&, std::span<j::ArtifactReader>) { check(false, "a busy recovery restores nothing"); });
+		} catch (const std::system_error& error) { busy = error.code() == std::errc::operation_would_block; }
+		check(busy, "a second recovery while the first Store lives is busy");
+		node.stores.erase(7);
+		node.store(7);
+		check(node.recovered[7].bundle == "new" && node.recovered[7].batches == std::vector<std::string>{"after-new"}, "the second recovery in the live host has the latest state");
 		check(!node.host->driver(0).failed(), "the group's loop keeps running");
 		node.append(9, "still");
 	}
@@ -548,7 +612,7 @@ int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
-		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"close_behind", close_behind},
+		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }

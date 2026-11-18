@@ -351,7 +351,8 @@ public:
 	}
 	TurnDriver* turns() const noexcept { return turns_; }
 	// A shared group leaves its loop: the host's table takes its last record, which must be a
-	// durable checkpoint covering every batch, and the journal closes. Recovering reopens it.
+	// durable checkpoint covering every batch, and the journal closes and releases the group.
+	// Recovering reopens it. A journal that cannot close releases the group when it ends.
 	void close() {
 		writable();
 		if (!shared()) { throw std::logic_error("only a shared group closes"); }
@@ -359,6 +360,7 @@ public:
 		if (turns_->sequence(group_) != record_sequence_) { throw std::logic_error("the group's last record is not durable yet"); }
 		try { host_->close_group(group_, record_sequence_, encode_manifest(frontier_)); ready_ = false; }
 		catch (...) { owner_->failed = true; throw; }
+		hold_.reset();
 	}
 private:
 	friend class Store;
@@ -566,6 +568,7 @@ private:
 	// lost is created again, as a new incarnation.
 	Frontier create_shared(Identity identity) {
 		try {
+			hold_ = host_->hold(group_);
 			host_->create_group(group_);
 			owner_->lock = io_.acquire_owner(false);
 			frontier_ = Frontier{}; frontier_.identity = identity;
@@ -576,21 +579,26 @@ private:
 		} catch (...) { owner_->failed = true; throw; }
 	}
 	// The group's records start at its latest checkpoint record; each batch after it is
-	// the checkpoint's sequence plus its distance from the checkpoint record.
+	// the checkpoint's sequence plus its distance from the checkpoint record. They are the ones
+	// the host's open recovered, or, for a group an earlier Store of this host held, the log's
+	// live records read back by position (TurnLog::live).
 	// A group the table holds closed, or one reopened before its first record became durable,
 	// starts from the table's checkpoint record: no turn log is read, and that record is staged
-	// again as the group's first, so its loop holds the group again. A group whose records the
-	// log already handed to a Store of this host recovers only after the host reopens.
+	// again as the group's first, so its loop holds the group again.
 	template <class Replay, class Restore>
 	Frontier recover_shared(Replay& replay, Restore& restore) {
 		try {
+			hold_ = host_->hold(group_);
 			const auto status = host_->status(group_);
 			if (status == GroupStatus::lost) { throw Corruption("the turn log lost this group"); }
 			if (status == GroupStatus::none) { throw Corruption("the group has no checkpoint record"); }
-			if (!turns_->has_group(group_)) {
-				if (turns_->holds(group_)) { throw Corruption("the group was recovered on this host; reopen the host to recover it again"); }
+			// Neither recovered at the host's open nor closed into the table: held and released here.
+			const bool released = !turns_->has_group(group_) && turns_->holds(group_);
+			std::vector<TurnRecord> live;
+			if (released) { live = turns_->live(group_); }
+			if (!turns_->has_group(group_) && !released) {
 				if (status == GroupStatus::closed) { host_->reopen_group(group_); }
-				const auto* entry = host_->entry(group_);
+				const auto entry = host_->entry(group_);
 				owner_->lock = io_.acquire_owner(false);
 				restore_checkpoint(entry->manifest, restore);
 				// The table's record covers through its base; it follows what the closed incarnation retired.
@@ -599,7 +607,7 @@ private:
 				host_->attach(group_); ready_ = true;
 				return frontier_;
 			}
-			const auto& records = turns_->records(group_);
+			const auto& records = released ? live : turns_->records(group_);
 			if (records.empty() || records.front().kind != TurnRecordKind::Checkpoint) { throw Corruption("the group has no checkpoint record"); }
 			owner_->lock = io_.acquire_owner(false);
 			restore_checkpoint(records.front().payload, restore);
@@ -748,6 +756,7 @@ private:
 	TurnDriver* turns_ = nullptr;
 	std::uint64_t group_ = 0, record_sequence_ = 0;
 	std::optional<TurnRecord> turn_record_;  // staged by start_append or start_checkpoint
+	std::unique_ptr<Host::Hold> hold_;  // a shared group's, from create or recover until close or the journal's end
 	bool ready_ = false;
 };
 

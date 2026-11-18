@@ -30,6 +30,54 @@
 #include <iostream>
 #include <map>
 #include <vector>
+#include "journal/memory_io.h"
+#include <atomic>
+#include <cstdlib>
+#include <random>
+#include <thread>
+
+// Live heap bytes, less those a Metered IO or file call makes for the memory disk (reopen_*):
+// a difference of two readings is the host's state alone. TSan's runtime defines operator new,
+// so under TSan nothing is counted and the heap cases skip their heap checks, saying so.
+#if defined(__SANITIZE_THREAD__)
+#define JOURNAL_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define JOURNAL_TEST_TSAN 1
+#endif
+#endif
+namespace heap {
+#ifdef JOURNAL_TEST_TSAN
+constexpr bool counted = false;
+#else
+constexpr bool counted = true;
+#endif
+struct alignas(16) Header { std::size_t size; bool metered; };
+std::atomic<std::int64_t> bytes{0};
+thread_local int off = 0;
+struct Off { Off() { ++off; } ~Off() { --off; } };
+// Whether the case's heap check runs; under TSan it prints why not.
+bool checked(std::string_view name) {
+	if (!counted) { std::cout << name << ": heap check skipped: TSan's runtime defines operator new, so the heap is not counted\n"; }
+	return counted;
+}
+}  // namespace heap
+#ifndef JOURNAL_TEST_TSAN
+void* operator new(std::size_t size) {
+	auto* header = static_cast<heap::Header*>(std::malloc(size + sizeof(heap::Header)));
+	if (!header) { throw std::bad_alloc(); }
+	header->size = size; header->metered = heap::off == 0;
+	if (header->metered) { heap::bytes.fetch_add(static_cast<std::int64_t>(size), std::memory_order_relaxed); }
+	return header + 1;
+}
+void operator delete(void* pointer) noexcept {
+	if (!pointer) { return; }
+	auto* header = static_cast<heap::Header*>(pointer) - 1;
+	if (header->metered) { heap::bytes.fetch_sub(static_cast<std::int64_t>(header->size), std::memory_order_relaxed); }
+	std::free(header);
+}
+void operator delete(void* pointer, std::size_t) noexcept { operator delete(pointer); }
+#endif
 
 using namespace kronuz::journal;
 namespace {
@@ -1739,10 +1787,442 @@ void posix() {
 	check(::mkfifo((directory / "fifo").c_str(), 0600) == 0, "create FIFO fixture");
 	check(throws([&] { io.open_existing("fifo"); }), "POSIX special file is rejected without blocking");
 }
+
+// A Store's id in a live Host (docs/mechanisms/group-lifetime.md): a close into the table and a
+// release that leaves the records in the log both let the id recover in the same Host; two live
+// Stores never hold it.
+namespace jt = kronuz::journal::testing;
+const Identity reopen_host{'R', 'H'};
+const TurnLogOptions reopen_turns{16 * 1024, 1024, 1, 4, 4096};
+const AdmissionLimits reopen_limits{{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3};
+Identity group_identity(std::uint64_t group) { Identity id{'G'}; for (unsigned i = 0; i < 8; ++i) { id[1 + i] = static_cast<char>(group >> (8 * i)); } return id; }
+std::string join(const std::vector<std::string>& batches) {
+	std::string text;
+	for (const auto& batch : batches) { text += (text.empty() ? "" : ",") + batch; }
+	return text;
+}
+std::vector<std::string> split(std::string_view text) {
+	std::vector<std::string> batches;
+	while (!text.empty()) { const auto comma = text.find(','); batches.emplace_back(text.substr(0, comma)); text.remove_prefix(comma == text.npos ? text.size() : comma + 1); }
+	return batches;
+}
+bool prefix(const std::vector<std::string>& shorter, const std::vector<std::string>& longer) {
+	return shorter.size() <= longer.size() && std::equal(shorter.begin(), shorter.end(), longer.begin());
+}
+std::string text(const std::vector<std::string>& batches) { return "[" + join(batches) + "]"; }
+
+// The memory disk's files and calls, kept off the heap reading.
+class MeteredFile final : public File {
+public:
+	explicit MeteredFile(std::unique_ptr<File> file) : file_(std::move(file)) {}
+	~MeteredFile() override { heap::Off off; file_.reset(); }
+	std::uint64_t size() override { heap::Off off; return file_->size(); }
+	std::size_t read_at(std::uint64_t offset, std::span<char> bytes) override { heap::Off off; return file_->read_at(offset, bytes); }
+	std::size_t write_at(std::uint64_t offset, std::string_view bytes) override { heap::Off off; return file_->write_at(offset, bytes); }
+	void truncate(std::uint64_t size) override { heap::Off off; file_->truncate(size); }
+	void sync() override { heap::Off off; file_->sync(); }
+private:
+	std::unique_ptr<File> file_;
+};
+class MeteredIO final : public IO {
+public:
+	explicit MeteredIO(std::shared_ptr<IO> io) : io_(std::move(io)) {}
+	std::unique_ptr<OwnerLock> acquire_owner(bool create) override { heap::Off off; return io_->acquire_owner(create); }
+	void open_existing_read_only_into(std::string_view name, File& file) override { heap::Off off; io_->open_existing_read_only_into(name, file); }
+	bool open_reclaim_candidate_read_only_into(std::string_view name, File& file) override { heap::Off off; return io_->open_reclaim_candidate_read_only_into(name, file); }
+	std::unique_ptr<File> open_reclaim_candidate_read_only(std::string_view name) override { return wrap([&] { return io_->open_reclaim_candidate_read_only(name); }); }
+	std::unique_ptr<File> open_existing(std::string_view name) override { return wrap([&] { return io_->open_existing(name); }); }
+	std::unique_ptr<File> open_existing_read_only(std::string_view name) override { return wrap([&] { return io_->open_existing_read_only(name); }); }
+	std::unique_ptr<File> create_exclusive(std::string_view name) override { return wrap([&] { return io_->create_exclusive(name); }); }
+	void replace(std::string_view source, std::string_view destination) override { heap::Off off; unordered_ = true; io_->replace(source, destination); }
+	void remove(std::string_view name) override { heap::Off off; unordered_ = true; io_->remove(name); }
+	std::unique_ptr<DirectoryCursor> scan_directory() override { heap::Off off; return io_->scan_directory(); }
+	std::optional<EntryFootprint> entry_footprint(std::string_view name) override { heap::Off off; return io_->entry_footprint(name); }
+	void sync_directory() override { heap::Off off; namespace_barriers += std::exchange(unordered_, false); io_->sync_directory(); }
+	// Directory syncs that follow a removal or replacement; an ordering point is one here.
+	std::size_t namespace_barriers = 0;
+protected:
+	std::unique_ptr<OwnerLock> lock_owner(const OwnerLockOptions& options) override { heap::Off off; return io_->acquire_owner(options); }
+private:
+	template <class Open> std::unique_ptr<File> wrap(Open&& open) {
+		std::unique_ptr<File> file;
+		{ heap::Off off; file = open(); }
+		return file ? std::make_unique<MeteredFile>(std::move(file)) : nullptr;
+	}
+	std::shared_ptr<IO> io_;
+	bool unordered_ = false;
+};
+
+// One host on a memory disk.
+struct Shared {
+	std::unique_ptr<Host> host;
+	explicit Shared(jt::Disk& disk, TurnLogOptions turns = reopen_turns)
+		: host(std::make_unique<Host>(std::make_shared<MeteredIO>(std::make_shared<jt::MemoryIO>(disk, "host/")), reopen_host, HostOptions{1, turns})) {}
+	TurnDriver& turns() { return host->driver(0); }
+	void commit() { while (!turns().idle()) { turns().commit(); } }
+	// Creates the group or recovers it; `state` is its checkpoint's batches, then those replayed.
+	std::unique_ptr<Store> open(std::uint64_t group, std::vector<std::string>* state = nullptr) {
+		auto store = std::make_unique<Store>(*host, group, reopen_limits);
+		std::vector<std::string> recovered;
+		if (host->status(group) == GroupStatus::none) { store->create(group_identity(group)); }
+		else {
+			std::vector<std::string> batches;
+			store->recover([&](std::uint64_t, std::string_view bytes) { batches.emplace_back(bytes); },
+				[&](const Frontier&, ArtifactReader& bundle, std::span<ArtifactReader>) { recovered = split(read_artifact(bundle)); });
+			recovered.insert(recovered.end(), batches.begin(), batches.end());
+		}
+		if (state) { *state = std::move(recovered); }
+		commit();
+		while (!store->inventory_step(64).complete) {}
+		return store;
+	}
+	std::shared_ptr<StoreAppend> stage(Store& store, const std::string& batch) {
+		return store.begin_append(std::move(*store.reserve_append(AdmissionClass::Normal, batch.size())), batch);
+	}
+	void append(Store& store, const std::string& batch) { auto operation = stage(store, batch); commit(); operation->result(); }
+	// A checkpoint whose bundle names the batches it covers.
+	void checkpoint(Store& store, const std::vector<std::string>& batches) {
+		auto id = store.reserve_replacement(1024, 1u << 20);
+		store.begin_artifact(*id, ArtifactPart::Application); store.write_chunk(*id, "application"); store.finish_artifact(*id);
+		store.begin_artifact(*id, ArtifactPart::Bundle); store.write_chunk(*id, join(batches)); store.finish_artifact(*id);
+		auto publication = store.begin_publication(*id, store.frontier().sequence);
+		commit(); publication->result();
+	}
+};
+// Host::settle and TurnDriver::parked where they exist, so the cases also build at main.
+template <class H> void settle(H& host) { if constexpr (requires { host.settle(0u); }) { host.settle(0u); } }
+template <class D> bool parked(D& turns, std::uint64_t group) {
+	if constexpr (requires { turns.parked(group); }) { return turns.parked(group); } else { return false; }
+}
+// A recover of the group refused as busy, as a held owner lock is.
+bool busy(Shared& node, std::uint64_t group) {
+	Store store(*node.host, group, reopen_limits);
+	try { store.recover([](std::uint64_t, std::string_view) {}, [](const Frontier&, ArtifactReader&, std::span<ArtifactReader>) {}); }
+	catch (const std::system_error& error) { return error.code() == std::errc::operation_would_block; }
+	catch (const std::exception&) { return false; }
+	return false;
+}
+
+// A1, clean: a close needs its records settled and a checkpoint covering them; once the table
+// holds it, the group recovers in the live host, even while the closed Store still exists.
+void reopen_clean_close() {
+	jt::Disk disk;
+	std::vector<std::string> state;
+	{
+		Shared node(disk);
+		auto a = node.open(7);
+		node.append(*a, "a1"); node.append(*a, "a2");
+		auto staged = node.stage(*a, "a3");
+		check(throws([&] { a->close(); }) && !a->fenced(), "a close with a record staged is refused");
+		node.commit(); staged->result(); staged.reset();
+		check(throws([&] { a->close(); }) && !a->fenced(), "a close with batches no checkpoint covers is refused");
+		node.checkpoint(*a, {"a1", "a2", "a3"});
+		a->close();
+		check(node.host->status(7) == GroupStatus::closed, "the table holds the closed group");
+		auto b = node.open(7, &state);
+		check(state == std::vector<std::string>{"a1", "a2", "a3"}, "the closed group recovers in the live host: " + text(state));
+		node.append(*b, "b1");
+		b.reset(); a.reset();
+		auto c = node.open(7, &state);
+		check(state == std::vector<std::string>{"a1", "a2", "a3", "b1"}, "the reopened group's later Store releases it and it recovers again: " + text(state));
+	}
+	Shared again(disk);
+	again.open(7, &state);
+	check(state == std::vector<std::string>{"a1", "a2", "a3", "b1"}, "the reopened host recovers the same state: " + text(state));
+}
+
+// A1, fenced or uncovered: a Store that cannot close into the table releases the group when it
+// ends, with a record still staged: a fenced one drops its append, so the record is left in the
+// driver alone; an unfenced one's append keeps its Journal, and so its hold, until the record
+// settles. The recover is busy until then, and the group then recovers in the live host from
+// the log's records, read back by position after retention forwarded them, exactly as a
+// reopened host recovers it.
+void reopen_released(bool fenced) {
+	jt::Disk disk;
+	const std::string kind = fenced ? "fenced" : "unfenced";
+	std::vector<std::string> state, expected{"a1", "a2", "a3"};
+	{
+		Shared node(disk);
+		auto a = node.open(7), neighbor = node.open(9);
+		node.append(*a, "a1"); node.checkpoint(*a, {"a1"}); node.append(*a, "a2");
+		auto staged = node.stage(*a, "a3");
+		if (fenced) { a->fence_storage(); staged.reset(); }
+		a.reset();
+		check(busy(node, 7), "a recover while the ended Store's record is staged is busy: " + kind);
+		auto beside = node.stage(*neighbor, "n1");
+		node.commit();
+		check(!throws([&] { beside->result(); }), "a neighbor's append in the ended Store's turn completes: " + kind);
+		beside.reset(); neighbor.reset();
+		if (!fenced) { staged->result(); staged.reset(); }
+		auto filler = node.open(8);
+		for (int b = 0; b < 200; ++b) { node.append(*filler, std::string(900, 'x')); }
+		check(node.turns().log().stats().forwarded_records > 0, "retention forwarded live records: " + kind);
+		auto b = node.open(7, &state);
+		check(state == expected, "the released group recovers every committed record in the live host: " + kind + " " + text(state));
+		node.append(*b, "b1"); expected.push_back("b1");
+		b.reset();
+		auto c = node.open(7, &state);
+		check(state == expected, "a second release recovers again: " + kind + " " + text(state));
+	}
+	Shared again(disk);
+	again.open(7, &state);
+	check(state == expected, "the reopened host recovers the same state: " + kind + " " + text(state));
+}
+
+// A Store whose append was refused (a record no segment holds) ends; the next Store recovers
+// the group in the live host and appends, and the reopened host recovers what it appended.
+void reopen_refused() {
+	jt::Disk disk;
+	std::vector<std::string> state;
+	{
+		Shared node(disk);
+		auto a = node.open(7);
+		node.append(*a, "a1"); node.checkpoint(*a, {"a1"});
+		check(throws([&] { node.append(*a, std::string(20000, 'x')); }), "a record no segment holds is refused");
+		a.reset();
+		auto b = node.open(7, &state);
+		check(state == std::vector<std::string>{"a1"}, "the refused Store's group recovers in the live host: " + text(state));
+		check(!throws([&] { node.append(*b, "b1"); }), "the next Store appends after the refused one");
+	}
+	Shared again(disk);
+	again.open(7, &state);
+	check(state == std::vector<std::string>{"a1", "b1"}, "the reopened host recovers the next Store's append: " + text(state));
+}
+
+// A2: a live Store's group is busy to a recover and a create, and so is a group whose first record
+// its ended Store left staged; the holder carries on unharmed.
+void reopen_two_stores() {
+	jt::Disk disk;
+	Shared node(disk);
+	std::vector<std::string> state;
+	auto a = node.open(7);
+	node.append(*a, "a1");
+	check(busy(node, 7), "a recover of a group a live Store holds is busy");
+	{
+		Store other(*node.host, 7, reopen_limits); bool refused = false;
+		try { other.create(group_identity(7)); } catch (const std::system_error& error) { refused = error.code() == std::errc::operation_would_block; }
+		check(refused, "a create of a group a live Store holds is busy");
+	}
+	node.append(*a, "a2");
+	check(!a->fenced(), "the holder carries on");
+	auto created = std::make_unique<Store>(*node.host, 9, reopen_limits);
+	created->create(group_identity(9)); created.reset();
+	check(busy(node, 9), "a group whose first record its ended Store left staged is busy");
+	node.commit();
+	auto b = node.open(9, &state);
+	check(state.empty() && node.host->status(9) == GroupStatus::stored, "it recovers once the record settled");
+	a.reset();
+	auto c = node.open(7, &state);
+	check(state == std::vector<std::string>{"a1", "a2"}, "the ended holder's group recovers: " + text(state));
+}
+
+// A2 under TSan: a Store ends on another thread while the loop keeps trying to recover its group;
+// the first recover that holds it follows the end's start, and replays every record.
+void reopen_race() {
+	jt::Disk disk;
+	Shared node(disk);
+	auto a = node.open(7);
+	node.append(*a, "a1"); node.append(*a, "a2");
+	std::atomic<bool> ending{false};
+	std::thread closer([&] { ending.store(true); a.reset(); });
+	std::unique_ptr<Store> b; std::vector<std::string> state; unsigned refused = 0;
+	while (!b) {
+		auto store = std::make_unique<Store>(*node.host, 7, reopen_limits);
+		std::vector<std::string> batches;
+		try { store->recover([&](std::uint64_t, std::string_view bytes) { batches.emplace_back(bytes); }, [](const Frontier&, ArtifactReader&, std::span<ArtifactReader>) {}); }
+		catch (const std::system_error& error) { check(error.code() == std::errc::operation_would_block, "a refused recover is busy"); ++refused; continue; }
+		check(ending.load(), "a recover holds the group only once its Store's end began");
+		b = std::move(store); state = std::move(batches);
+	}
+	closer.join();
+	check(state == std::vector<std::string>{"a1", "a2"}, "the recover after the race replays every record: " + text(state));
+	std::cout << "reopen_race: " << refused << " busy recovers\n";
+}
+
+// A3: power cut at every I/O operation of a seeded run of close-then-recover cycles (a fenced
+// release, a release, a clean close, or nothing, each with a record staged). The reopened host
+// holds every record a recover or an append acknowledged, and nothing past what was attempted.
+bool reopen_crash_run(std::uint64_t cut, std::uint64_t seed) {
+	jt::Disk disk;
+	std::optional<Shared> node;
+	std::unique_ptr<Store> store;
+	std::vector<std::string> acknowledged, attempted;
+	std::mt19937_64 random(seed);
+	bool reached = false;
+	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut);
+	try {
+		disk.cut = cut;
+		node.emplace(disk);
+		store = node->open(7);
+		for (unsigned round = 0; round < 8; ++round) {
+			const auto batch = "r" + std::to_string(round);
+			attempted.push_back(batch);
+			auto staged = node->stage(*store, batch);
+			switch (random() % 4) {
+			case 0: store->fence_storage(); [[fallthrough]];
+			case 1: staged.reset(); store.reset(); node->commit(); break;
+			case 2: node->commit(); staged->result(); acknowledged = attempted; node->checkpoint(*store, acknowledged); store->close(); store.reset(); break;
+			default: node->commit(); staged->result(); acknowledged = attempted; break;
+			}
+			if (!store) {
+				std::vector<std::string> state;
+				store = node->open(7, &state);
+				check(state == attempted, "a recover in the live host holds every attempted record: " + at + " " + text(state));
+				acknowledged = state;
+			}
+		}
+		reached = true;
+	} catch (...) {
+		if (!disk.dead()) { check(false, "the run failed before its power cut: " + at); }
+	}
+	if (node && node->turns().in_flight()) { node->turns().failed(std::make_exception_ptr(std::runtime_error("power lost"))); }
+	store.reset(); node.reset();
+	disk.power_loss();
+	try {
+		Shared again(disk);
+		std::vector<std::string> state;
+		if (again.host->status(7) != GroupStatus::none) { again.open(7, &state); }
+		check(prefix(acknowledged, state) && prefix(state, attempted), "recovery keeps every acknowledged record and nothing unattempted: " + at + " recovered " + text(state) + ", acknowledged " + text(acknowledged));
+	} catch (const std::exception& error) { check(false, "recovery threw " + std::string(error.what()) + ": " + at); }
+	return reached;
+}
+void reopen_crash() {
+	std::uint64_t runs = 0;
+	for (std::uint64_t seed = 0; seed < 16; ++seed) {
+		std::uint64_t cut = 1;
+		while (!reopen_crash_run(cut, seed)) { ++cut; ++runs; }
+	}
+	std::cout << "reopen_crash: 16 seeds, " << runs << " power cuts\n";
+}
+
+// A4: 10,000 cycles over 1,000 ids in one host, each recovering its group, appending, and then
+// closing it into the table (even ids) or checkpointing and releasing it with one batch
+// uncovered (odd ids). The host's heap after the first pass and after the last is reported.
+void reopen_churn() {
+	jt::Disk disk;
+	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 8, 4096});
+	constexpr std::uint64_t ids = 1000, cycles = 10000;
+	std::vector<std::vector<std::string>> expected(ids + 1);
+	for (auto& batches : expected) { batches.reserve(cycles / ids + 1); }
+	std::vector<std::string> state; state.reserve(cycles / ids + 1);
+	std::int64_t warm = 0; std::uint64_t wrong = 0;
+	for (std::uint64_t c = 0; c < cycles; ++c) {
+		const auto group = 1 + c % ids;
+		auto store = node.open(group, &state);
+		wrong += state != expected[group];
+		auto& batches = expected[group];
+		if (group % 2) {
+			if (!batches.empty()) { node.checkpoint(*store, batches); }
+			batches.push_back("c" + std::to_string(c)); node.append(*store, batches.back());
+		} else {
+			batches.push_back("c" + std::to_string(c)); node.append(*store, batches.back());
+			node.checkpoint(*store, batches); store->close();
+		}
+		store.reset();
+		if (c + 1 == ids) { settle(*node.host); warm = heap::bytes.load(); }
+	}
+	settle(*node.host);
+	const auto last = heap::bytes.load();
+	check(wrong == 0, "every recover holds its group's batches: " + std::to_string(wrong) + " wrong");
+	std::cout << "reopen_churn: " << cycles << " cycles of " << ids << " ids, host heap " << warm << " B after the first pass, " << last << " B after the last (" << (last - warm) << " B)\n";
+	if (heap::checked("reopen_churn")) { check(last - warm <= std::int64_t(ids) * 64, "the host's heap stays flat across the churn"); }
+}
+
+// A8: 10,000 distinct groups, each created, written, checkpointed and closed once in one host:
+// the host's heap after 1,000, 5,000 and 10,000, flat by its slope from 1,000 on.
+void reopen_distinct() {
+	jt::Disk disk;
+	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 4, 4096});
+	const char* scale = std::getenv("JOURNAL_DISTINCT_IDS");  // another count, for timing
+	const std::uint64_t ids = scale ? std::stoull(scale) : 10000, early = ids / 10, middle = ids / 2;
+	std::int64_t first = 0, half = 0;
+	for (std::uint64_t group = 1; group <= ids; ++group) {
+		auto store = node.open(group);
+		node.append(*store, "b");
+		node.checkpoint(*store, {"b"});
+		store->close(); store.reset();
+		if (group == early || group == middle) { settle(*node.host); (group == early ? first : half) = heap::bytes.load(); }
+	}
+	settle(*node.host);
+	const auto last = heap::bytes.load();
+	const double slope = double(last - first) / double(ids - early);
+	std::cout << "reopen_distinct: host heap " << first << " B after " << early << " closed groups, " << half << " B after " << middle << ", " << last << " B after " << ids
+		<< "; slope " << slope << " B per group\n";
+	if (heap::checked("reopen_distinct")) { check(slope < 1, "closing distinct groups leaves the host's heap flat: " + std::to_string(slope) + " B per group"); }
+	std::vector<std::string> state;
+	for (std::uint64_t group : {std::uint64_t{1}, ids}) {
+		auto store = node.open(group, &state);
+		check(state == std::vector<std::string>{"b"}, "a closed group recovers from the table: " + text(state));
+	}
+}
+
+// A7: 10,000 groups, each created, given a batch and released by its Store's end: the bytes per
+// group the host keeps before settle() parks them and after, and a sample that recovers exactly.
+void reopen_heap() {
+	jt::Disk disk;
+	Shared node(disk, TurnLogOptions{64 * 1024, 1024, 1, 1000, 4096});
+	constexpr std::uint64_t ids = 10000;
+	settle(*node.host);
+	const auto empty = heap::bytes.load();
+	for (std::uint64_t group = 1; group <= ids; ++group) {
+		auto store = node.open(group);
+		node.append(*store, "b" + std::to_string(group));
+	}
+	const auto held = heap::bytes.load();
+	settle(*node.host);
+	const auto settled = heap::bytes.load();
+	bool all = true;
+	for (std::uint64_t group = 1; group <= ids; ++group) { all &= parked(node.turns(), group); }
+	check(all, "settle parks every released group");
+	const double before = double(held - empty) / ids, after = double(settled - empty) / ids;
+	std::cout << "reopen_heap: " << ids << " released groups, " << before << " B per group before settle, " << after << " B after\n";
+	if (heap::checked("reopen_heap")) { check(after < before && after < 400, "a released group keeps little of the host's heap"); }
+	std::vector<std::string> state;
+	for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {
+		auto store = node.open(group, &state);
+		check(state == std::vector<std::string>{"b" + std::to_string(group)}, "a parked group recovers exactly: " + text(state));
+	}
+}
+
+// A9: the directory barriers reclaim spends per reclaimed segment, over turn_log_power's
+// workload (one to three of six groups a turn, records up to 700 bytes, one in five a checkpoint).
+void reclaim_syncs() {
+	std::size_t segments = 0, barriers = 0;
+	for (std::uint64_t seed = 1; seed <= 200; ++seed) {
+		jt::Disk disk; MeteredIO io(std::make_shared<jt::MemoryIO>(disk, "log/"));
+		TurnRecovery recovered; TurnLog log(io, reopen_host, recovered, TurnLogOptions{8 * 512, 512, 1, 3, 600});
+		std::mt19937_64 random(seed); std::map<std::uint64_t, std::uint64_t> next;
+		for (int t = 0; t < 60; ++t) {
+			std::vector<TurnRecord> batch;
+			for (auto n = random() % 3 + 1; n; --n) {
+				const auto group = random() % 6 + 1, sequence = ++next[group], bytes = random() % 700 + 1;
+				const auto kind = random() % 5 ? TurnRecordKind::Batch : TurnRecordKind::Checkpoint;
+				batch.push_back({group, sequence, kind, std::string(bytes, 'r'), sequence - 1});
+			}
+			log.append(batch); log.prepare();
+		}
+		segments += log.stats().segments_recycled + log.stats().segments_removed; barriers += io.namespace_barriers;
+	}
+	std::cout << "reclaim_syncs: " << segments << " segments reclaimed, " << barriers << " directory barriers, " << double(barriers) / double(segments) << " per segment\n";
+	check(segments > 0 && barriers == segments, "reclaim orders each reclaimed segment's removal");
+}
 } // namespace
 
-int main() {
-	try { basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); store_artifact_completions(true); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_replacement_growth(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+// `journal_test reopen_<case>` runs one case; with none, every case but the long reopen ones.
+int main(int argc, char** argv) {
+	const std::map<std::string_view, std::function<void()>> cases{
+		{"reopen_clean_close", reopen_clean_close}, {"reopen_released", [] { reopen_released(false); reopen_released(true); }},
+		{"reopen_two_stores", reopen_two_stores}, {"reopen_refused", reopen_refused}, {"reopen_race", reopen_race}, {"reopen_crash", reopen_crash},
+		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}, {"reopen_distinct", reopen_distinct}, {"reclaim_syncs", reclaim_syncs}};
+	if (argc > 1) {
+		const auto found = cases.find(argv[1]);
+		if (found == cases.end()) { std::cerr << "no case " << argv[1] << '\n'; return 2; }
+		std::cout << argv[1] << ":\n";
+		try { found->second(); } catch (const std::exception& error) { check(false, error.what()); }
+		std::cout << checks << " journal checks, " << failures << " failures\n";
+		return failures ? 1 : 0;
+	}
+	try { reopen_clean_close(); reopen_released(false); reopen_released(true); reopen_two_stores(); reopen_refused(); reopen_race(); basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); store_artifact_completions(true); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_replacement_growth(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
