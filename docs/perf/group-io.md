@@ -46,6 +46,6 @@ At 1,000 ids the two populations cost the same (4.8 and 4.2 ns per id): the tabl
 
 ## Consequence
 
-A host with 100,000 live group views blocks 4.9 ms in each `group_io`; with 1,000,000 it blocks 136 ms. Opening N groups costs the sum of those, which is quadratic in N. The cost is not bounded by the live ids' use: a view that died is reaped by the same sweep, so it is the number of live views that counts.
+A host with 100,000 live group views blocks 4.9 ms in each `group_io`; with 1,000,000 it blocks 136 ms. Opening N groups costs the sum of those, which is quadratic in N.
 
 The fix, so that a call costs O(1) amortized rather than O(live ids), is the quest `journal-group-io-sweep`.
