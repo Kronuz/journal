@@ -31,7 +31,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# reuses the completion target declared above.
 	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG a452a8c5e79655293d114d77c2ebc54af5fb0505)
 	FetchContent_MakeAvailable(faultlab)
-	set(faultfs_tests framing turn_log_power shared_store driver host placement turn_seal sync_seam)
+	set(faultfs_tests journal framing turn_log_power shared_store driver host placement turn_seal sync_seam)
 	foreach(t journal inventory admission framing turn_log turn_log_power shared_store crc_fixture driver host placement turn_seal sync_seam)
 		add_executable(journal_${t}_test test/${t}_test.cc)
 		target_link_libraries(journal_${t}_test PRIVATE journal::journal)
