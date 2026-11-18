@@ -230,7 +230,7 @@ public:
 		auto write = stage(records);
 		try {
 			if (write.file->write_at(write.offset, write.bytes) != write.bytes.size()) { throw std::runtime_error("short turn log write"); }
-			write.file->sync_data();
+			flush(write);
 		} catch (...) { failed(); throw; }
 		completed();
 		return write.turn;
@@ -238,6 +238,8 @@ public:
 	// The write a staged turn needs: its bytes at an offset of a segment, then one
 	// File::sync_data. A host driving completion I/O issues them and reports back.
 	struct TurnWrite { File* file; std::uint64_t offset; std::string_view bytes; std::uint64_t turn; };
+	// The turn's data barrier, through the IO seam; a driver calls it where it would File::sync_data.
+	void flush(const TurnWrite& write) { detail::sync_data_file(io_, *write.file); }
 	// Encodes a turn; one is in flight at a time (condition 7). Nothing it changes is
 	// visible until completed().
 	TurnWrite stage(std::span<const TurnRecord> records) {
@@ -403,7 +405,7 @@ private:
 		auto emitter = encode(body.emit);
 		try {
 			if (file_->write_at(offset_, emitter.bytes()) != emitter.bytes().size()) { throw std::runtime_error("short turn log write"); }
-			file_->sync_data();
+			detail::sync_data_file(io_, *file_);
 		} catch (...) { failed_ = true; throw; }
 		offset_ = emitter.position(); filling_ = emitter.filling(); ++stats_.barriers; stats_.bytes_written += emitter.bytes().size();
 	}

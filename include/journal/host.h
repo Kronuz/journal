@@ -235,6 +235,7 @@ public:
 	std::unique_ptr<File> open_reclaim_candidate(std::string_view name) override { return io_->open_reclaim_candidate(path(name)); }
 	void sync_directory() override { io_->sync_directory(); }
 	void sync_files(std::span<File* const> files) override { io_->sync_files(files); }
+	void sync_data_files(std::span<File* const> files) override { io_->sync_data_files(files); }
 	void sync_files_and_directory(std::span<File* const> files) override { io_->sync_files_and_directory(files); }
 	void order_files_and_directory(std::span<File* const> files) override { io_->order_files_and_directory(files); }
 private:

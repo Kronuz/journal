@@ -11,7 +11,7 @@ set(TASK_ASIO OFF)
 # completion::task: completion_ref, InlineCompletion and HeldCompletion over task.hh.
 set(COMPLETION_TASK ON)
 set(COMPLETION_ASIO OFF)
-FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 7731315d0660a953f7b3bf956df3127d5a525a03)
+FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG f4c19b1cf8c28973a5c0f5147134fd955546f210)
 # Fixed-vector reservation accounting shared with managed local storage.
 FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG 07de45d180f23e2552b9504a6b4d506651594d1e)
 # CRC-32C: one implementation, header-only, no dependencies.

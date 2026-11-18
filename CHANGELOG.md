@@ -10,6 +10,11 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Changed
 
+- Every durable file sync goes through the IO seam: the host table's commit, the turn log's
+  segment preparation and turn barrier, and the journal's header and torn-tail syncs call
+  `IO::sync_files` or `IO::sync_data_files` instead of `File::sync`, so a host that counts or skips
+  syncs sees them. Pins completion at `f4c19b1`; `PrefixIO` forwards `sync_data_files`;
+  `TurnLog::flush(write)` is a turn's barrier for a driver that writes it itself.
 - `TurnDriver` calls a sealer again in the same turn while it returns records, with the room left
   after each record's `record_cost` and `first = false`, until it returns nothing or less than
   `record_cost(0)` is left, so one turn carries a group's backlog. A sealer returns nothing when it
