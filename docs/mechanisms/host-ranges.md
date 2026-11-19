@@ -59,7 +59,7 @@ and the range table follows the same partition.
 ## Test
 
 `host_test loop_views` runs two loops' threads at once. Each takes 2,000 views of its own groups,
-holding every fourth so its table sweeps, and creates 100 groups, each create committing and
+holding every fourth so its table sweeps, and creates 20 groups, each create committing and
 publishing to a view it took first. Under TSan (`-fsanitize=thread`) it reports no race, and every
 held view of a created group lists the group's first artifact afterwards. A mutant that sends
 every group to table 0 (one shared table) makes TSan report the race and the test exit nonzero.

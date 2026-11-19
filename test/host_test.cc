@@ -389,7 +389,7 @@ void loop_slots() {
 void loop_views() {
 	const auto directory = std::filesystem::current_path() / ".scratch" / ("host-loop-views-" + std::to_string(::getpid()));
 	std::filesystem::remove_all(directory); std::filesystem::create_directories(directory);
-	constexpr std::size_t created = 100, viewed = 2000;
+	constexpr std::size_t created = 20, viewed = 2000;  // each create is a full flush on macOS
 	std::vector<std::uint64_t> made[2], seen[2];
 	for (std::uint64_t group = 1; made[0].size() + seen[0].size() < created + viewed || made[1].size() + seen[1].size() < created + viewed; ++group) {
 		const auto loop = hd::loop(hd::slot(group), 2);
