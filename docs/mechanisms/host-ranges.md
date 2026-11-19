@@ -25,12 +25,25 @@ a table from group id to the live `Range`s so that a commit of the group's table
    thread (a completion worker running a reclamation). It reads only its `Range`, through
    `Range::mutex`, never the table; `publish` writes the `Range` under the same mutex.
 4. **The open runs alone.** The constructor's commits (`mark_lost`, a re-partition's) run before
-   any view exists, some before the tables are sized, so `publish` returns at once while the
-   vector is empty. The tables are sized with the other per-loop state once the loop count is
-   final.
+   any view exists, and the tables are sized last, so `publish` returns at once while the vector
+   is empty and the constructor's thread owns no table.
+5. **Debug builds check it.** `owned_ranges(g)`, the one way `group_io` and `publish` reach a
+   table, binds table `loop(g)` to the first thread that touches it after the open, and asserts
+   that every later caller is that thread.
 
-One thread may run several loops (the tests drive every loop from one thread); the rule only
-forbids two threads touching one loop's table.
+One thread may run several loops (the tests drive every loop from one thread). A loop's table
+stays with its first thread for the host's life.
+
+## The callers
+
+`group_io` has one production caller, `Journal(Host&, group, ...)` (`include/journal/journal.h`),
+which every shared `Store` runs at construction. Consensus constructs its Stores in
+`Driver::open` (`consensus/include/consensus/driver.h`), a plain call on the loop (`on_loop()`
+asserts it) that refuses a group placed on another loop (`host_.loop(id) != loop_`), then builds
+the group's `Worker` and its `Store`. Detent, strata and Xapiand construct no shared Store and
+call no `group_io`. The tests and `bench/group_io_bench.cc` call it on the thread that runs the
+group's loop; `publish` runs from `update`, which `create_group`, `close_group`, `reopen_group` and
+`next_artifact` run on the group's loop.
 
 ## Why not one table under a mutex
 

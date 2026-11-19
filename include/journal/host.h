@@ -35,12 +35,14 @@
 
 #include "turn_driver.h"
 #include <algorithm>
+#include <cassert>
 #include <cerrno>
 #include <cstdio>
 #include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <optional>
 #include <set>
 #include <string>
@@ -212,6 +214,7 @@ struct Range {
 struct Ranges {
 	std::multimap<std::uint64_t, std::weak_ptr<Range>> table;
 	std::size_t sweep_at = sweep_floor;  // the table's size that sweeps it: twice the live after a sweep
+	std::thread::id owner;  // the loop's thread, the first to touch the table; debug builds check it
 };
 // The names `scan` yields, in order.
 class NameCursor final : public DirectoryCursor {
@@ -299,10 +302,11 @@ public:
 	// group's loop, which owns the loop's range table (ranges_).
 	std::shared_ptr<IO> group_io(std::uint64_t group) {
 		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
-		auto& [ranges, sweep_at] = ranges_[loop(group)];
-		if (ranges.size() >= sweep_at) {
+		auto& owned = owned_ranges(group);
+		auto& ranges = owned.table;
+		if (ranges.size() >= owned.sweep_at) {
 			std::erase_if(ranges, [](const auto& item) { return item.second.expired(); });
-			sweep_at = std::max(2 * ranges.size(), host_detail::sweep_floor);
+			owned.sweep_at = std::max(2 * ranges.size(), host_detail::sweep_floor);
 		}
 		// A resident group's live views share one range; a closed or unborn group's view shares only
 		// an unpublished one, so it never shows a closed incarnation's artifacts.
@@ -507,9 +511,19 @@ private:
 	}
 	void publish(std::uint64_t group, const GroupEntry& entry) {
 		if (ranges_.empty()) { return; }  // the open's commits: no view exists yet
-		for (auto [at, last] = ranges_[loop(group)].table.equal_range(group); at != last; ++at) {
+		for (auto [at, last] = owned_ranges(group).table.equal_range(group); at != last; ++at) {
 			if (auto range = at->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
 		}
+	}
+	// The group's loop's range table. Debug builds check that the calling thread is the loop's, the
+	// first that touched the table once the host opened.
+	host_detail::Ranges& owned_ranges(std::uint64_t group) {
+		auto& ranges = ranges_[loop(group)];
+#ifndef NDEBUG
+		if (ranges.owner == std::thread::id{}) { ranges.owner = std::this_thread::get_id(); }
+		assert(ranges.owner == std::this_thread::get_id() && "group_io and the table commits run on the group's loop");
+#endif
+		return ranges;
 	}
 	std::shared_ptr<IO> loop_io(std::uint64_t generation, std::uint32_t loop) {
 		auto names = logs_[{generation, loop}];
@@ -572,7 +586,7 @@ private:
 		if (removed) { io_->sync_directory(); }
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
-		opened_.resize(loops_); released_.resize(loops_); ranges_.resize(loops_);
+		opened_.resize(loops_); released_.resize(loops_);
 		auto groups = known(loops_);
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
@@ -584,6 +598,7 @@ private:
 		for (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }
 		mark_lost(lost);
 		for (auto& shard : shards_) { std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; }); }
+		ranges_.resize(loops_);  // last: the open's commits publish to no table
 	}
 	// Every open marks the ids recovery calls lost, durably, before it serves; then their
 	// artifacts go, and the entries keep the ids refused for good.

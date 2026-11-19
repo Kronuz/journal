@@ -4,9 +4,9 @@
 
 ## What a call does
 
-`ranges_` (`include/journal/host.h`) is a `std::multimap<group id, std::weak_ptr<Range>>`: one entry per live `Range`, and a `Range` is owned by its views' scan closures. A call does three things:
+`ranges_` (`include/journal/host.h`) holds one table per loop, a `host_detail::Ranges`: a `std::multimap<group id, std::weak_ptr<Range>>` with one entry per live `Range`, and its own sweep threshold `sweep_at`. A `Range` is owned by its views' scan closures. A call on group `g` touches only table `loop(g)`, on that loop's thread (`docs/mechanisms/host-ranges.md`), and does three things:
 
-1. **Sweep when the table doubled.** When `ranges_.size()` reaches `sweep_at_`, `std::erase_if` drops every expired entry and sets `sweep_at_ = max(2 * size after the sweep, 64)`. A sweep of S entries leaves L, and the next comes after at least `sweep_at_ - L >= sweep_at_ / 2` inserts, so a call pays at most 2 entry visits for sweeping: O(1) amortized.
+1. **Sweep when the table doubled.** When the table's size reaches its `sweep_at`, `std::erase_if` drops every expired entry and sets `sweep_at = max(2 * size after the sweep, 64)`. A sweep of S entries leaves L, and the next comes after at least `sweep_at - L >= sweep_at / 2` inserts, so a call pays at most 2 entry visits for sweeping: O(1) amortized.
 2. **Find the group's range.** The call walks the group's own entries (`equal_range`, O(log ids) plus the group's few entries), erasing the dead ones. Live views of a resident group share one `Range`: the call reuses it. A group that is closed or does not exist yet shares only an unpublished `Range` (`incarnation == 0`), so a new view of a closed group never lists the closed incarnation's artifacts; it gets its own `Range`, and the view held across the close keeps the one it has.
 3. **Build the view.** The remaining work (the `Range` when none is shared, one `emplace`, the `resident` lookup, the `PrefixIO`) does not depend on the table size.
 
@@ -14,7 +14,7 @@
 
 ## Bound
 
-Between sweeps the table holds dead entries. It never exceeds `sweep_at_`, which is the larger of 64 and twice the live count at the last sweep. Entries of views that died since stay resident, about 176 bytes each (a 64-byte multimap node plus a 112-byte `Range` control block kept by the weak count), until the next sweep or until a call on their group drops them. After many views die, nothing is released until enough new ids reach `sweep_at_`: up to 2 x the live count at the last sweep, plus 64, stays resident.
+Each loop's table is bounded on its own. Between sweeps it holds dead entries. It never exceeds its `sweep_at`, which is the larger of 64 and twice the live count at the last sweep. Entries of views that died since stay resident, about 176 bytes each (a 64-byte multimap node plus a 112-byte `Range` control block kept by the weak count), until the next sweep or until a call on their group drops them. After many views die, nothing is released until enough new ids reach `sweep_at`: up to 2 x the live count at the last sweep, plus 64, stays resident.
 
 ## Measurement
 
@@ -27,7 +27,7 @@ clang++ -O3 -DNDEBUG -std=gnu++20 -Iinclude <dependency includes> bench/group_io
 
 Before and after run the same bench source, "before" against the `include/` of `journal:ea397ab` (the per-call `erase_if` over every entry), "after" against `journal:965cd55`'s sweep. Exclusive `campaign` job `261118-123558-25b19c`, the sizes interleaved, on an Intel Core i9-9980HK (2.4 GHz, 256 KiB L2 per core, 16 MiB L3, 32 GiB), Darwin 24.6.0, Apple clang `/usr/bin/clang++`.
 
-The bench builds a `Host` over `MemoryIO` and places N live `Range` entries directly in `ranges_`, then times `group_io`. Each cell is the median of 5 runs. A run spans at least 2N calls when they fit in 10 s, so the amortized sweep falls inside every timed run. "Random ids" are splitmix64 keys (the order a real host sees); "ascending ids" are 1..N; "resident" calls the same id every time, so the range is shared.
+The bench builds a one-loop `Host` over `MemoryIO` and places N live `Range` entries directly in the loop's table, then times `group_io`. Each cell is the median of 5 runs. A run spans at least 2N calls when they fit in 10 s, so the amortized sweep falls inside every timed run. "Random ids" are splitmix64 keys (the order a real host sees); "ascending ids" are 1..N; "resident" calls the same id every time, so the range is shared.
 
 Median ns per call, before then after:
 

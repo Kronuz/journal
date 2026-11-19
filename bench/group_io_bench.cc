@@ -49,10 +49,10 @@ std::uint64_t mix(std::uint64_t& state) {
 	return z ^ (z >> 31);
 }
 
-// N live ranges, as N open group views hold: a Range each, its entry in the host's table.
-// `shuffled` takes ids in random order (a host's real order); otherwise 1..N ascending.
+// N live ranges, as N open group views hold: a Range each, its entry in the host's one loop's
+// table. `shuffled` takes ids in random order (a host's real order); otherwise 1..N ascending.
 std::vector<std::shared_ptr<j::host_detail::Range>> inject(j::Host& host, std::uint64_t count, bool shuffled) {
-	auto& ranges = host.*steal(RangesTag{});
+	auto& ranges = (host.*steal(RangesTag{}))[0].table;
 	std::vector<std::shared_ptr<j::host_detail::Range>> held; held.reserve(count);
 	std::uint64_t state = 1;
 	for (std::uint64_t i = 1; i <= count; ++i) {
