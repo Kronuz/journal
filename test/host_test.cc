@@ -24,7 +24,8 @@
 // share a name and reclaiming one never touches another; reclamation and the admission census by
 // name with no directory scan; a closed group reopened from the group table after retention
 // recycled every segment that held it; a group whose first turn was lost created again as a new
-// incarnation; a failed close that leaves the group open; a failed reopen that leaves it closed;
+// incarnation; a failed close that leaves the group open, in doubt: held by nothing until the
+// host reopens, under power loss too; a failed reopen that leaves it closed;
 // two loops' table commits free of races under TSan; a close behind an acknowledged record
 // refused; a close with a sealed open record in flight fails its wait, never acknowledging it,
 // under power loss too; a second recovery on one host refused; one owner lock, the directory's
@@ -307,8 +308,9 @@ void recreate() {
 	check(node.artifacts(5).contains(hd::artifact_name(5, 2, 1)), "the new ones are named by the new incarnation");
 }
 
-// A close whose table write fails (a full disk) leaves the group open and its records live in
-// the log: retention keeps them, and after a restart the group recovers, never offered for create.
+// A close whose table write fails (a full disk) leaves the group open, in doubt, and its records
+// live in the log: retention keeps them, and after a restart the group recovers, never offered
+// for create.
 void failed_close() {
 	fl::filesystem disk;
 	{
@@ -321,6 +323,10 @@ void failed_close() {
 		check(threw && !node.io->full, "the close's table write fails");
 		check(node.host->status(7) == j::GroupStatus::stored && node.host->entry(7)->state == j::GroupState::open, "the table still holds the group open");
 		node.stores.erase(7);
+		bool refused = false;
+		try { node.store(7); } catch (const std::system_error& error) { refused = error.code() == std::errc::io_error; }
+		node.stores.erase(7);
+		check(refused, "the close is in doubt: the live host refuses to hold the group");
 		for (int b = 0; b < 200; ++b) { node.append(8, std::string(900, 'x')); }
 	}
 	Node node(disk);
@@ -354,6 +360,85 @@ void failed_reopen() {
 	check(node.host->status(group) == j::GroupStatus::closed, "after a restart the group is closed");
 	node.store(group);
 	check(node.recovered[group].bundle == "bundle-a1" && node.recovered[group].batches.empty(), "it recovers its checkpoint");
+}
+
+// A close whose table commit fails at its directory sync, after its shard's replace: the shard
+// on disk may say closed, so the live host refuses to hold the group, and no Store appends to it,
+// until the host reopens. A later directory sync then makes the close durable, and the reopened
+// host recovers the group closed with its checkpoint.
+void close_in_doubt() {
+	fl::filesystem disk;
+	const std::uint64_t group = 7;
+	std::uint64_t neighbor = group + 1;
+	while (hd::slot(neighbor) == hd::slot(group)) { ++neighbor; }
+	{
+		Node node(disk);
+		node.append(group, "a1"); node.checkpoint(group, "bundle-a1");
+		node.io->sync_fails = true;
+		bool threw = false;
+		try { node.store(group).close(); } catch (const std::system_error&) { threw = true; }
+		node.stores.erase(group);
+		check(threw && !node.io->sync_fails, "the close's table commit fails at its directory sync");
+		bool refused = false;
+		try { node.append(group, "x"); } catch (const std::system_error& error) { refused = error.code() == std::errc::io_error; }
+		node.stores.erase(group);
+		check(refused, "the live host refuses to hold the group whose close is in doubt");
+		node.store(neighbor);
+		bool still = false;
+		try { node.store(group); } catch (const std::system_error& error) { still = error.code() == std::errc::io_error; }
+		node.stores.erase(group);
+		check(still, "and still refuses after a later directory sync");
+	}
+	Node node(disk);
+	check(node.host->status(group) == j::GroupStatus::closed, "after a restart the group is closed");
+	node.store(group);
+	check(node.recovered[group].bundle == "bundle-a1" && node.recovered[group].batches.empty(), "it recovers its checkpoint");
+	node.append(group, "after");
+}
+
+// close_in_doubt's sweep: a close whose table commit fails at each of its operations, before or
+// after the operation's effect; then a recovery of the group in the live host, appending if it
+// is let; a create in the group's slot or another, whose commit syncs the directory; and a power
+// cut. The reopened host recovers every record acknowledged: the checkpoint and any append.
+bool failed_close_point(fl::op kind, bool after, bool same_slot, std::uint64_t seed) {
+	fl::filesystem disk;
+	const std::uint64_t group = 7;
+	std::uint64_t neighbor = group + 1;
+	while ((hd::slot(neighbor) == hd::slot(group)) != same_slot) { ++neighbor; }
+	std::vector<std::string> acknowledged;
+	const char* names[] = {"write", "sync", "sync_directory", "create", "replace", "remove"};
+	const auto at = std::string(names[int(kind)]) + (after ? " after" : " before") + (same_slot ? ", same slot" : ", other slot") + ", seed " + std::to_string(seed) + ": ";
+	{
+		Node node(disk);
+		node.append(group, "a1"); node.checkpoint(group, "bundle-a1");
+		disk.add_fault(fl::fault{kind, 1, EIO, after});
+		bool threw = false;
+		try { node.store(group).close(); } catch (const std::system_error&) { threw = true; }
+		disk.clear_faults();
+		node.stores.erase(group);
+		if (!threw) { check(false, at + "the close fails"); return false; }
+		try { node.append(group, "x"); acknowledged.push_back("x"); } catch (const std::system_error&) {}
+		node.stores.erase(group);
+		node.append(neighbor, "n");
+	}
+	disk.crash(seed);
+	Node node(disk);
+	try { node.store(group); } catch (const std::exception& error) { check(false, at + "recovery: " + error.what()); return false; }
+	const auto& state = node.recovered[group];
+	const bool kept = state.bundle == "bundle-a1" && state.batches == acknowledged;
+	check(kept, at + "recovery keeps every acknowledged record: acknowledged " + std::to_string(acknowledged.size()) + " batches, recovered " + std::to_string(state.batches.size()));
+	return kept;
+}
+void failed_close_crash() {
+	std::size_t points = 0, lost = 0;
+	for (auto kind : {fl::op::remove, fl::op::create, fl::op::write, fl::op::sync, fl::op::replace, fl::op::sync_directory}) {
+		for (bool after : {false, true}) {
+			for (bool same_slot : {false, true}) {
+				for (std::uint64_t seed = 0; seed < 8; ++seed) { ++points; lost += !failed_close_point(kind, after, same_slot, seed); }
+			}
+		}
+	}
+	std::cout << "failed_close_crash: " << points << " points, " << lost << " lost\n";
 }
 
 // Two loops on their own threads commit table slots that share a 64-slot word: run under TSan,
@@ -725,7 +810,7 @@ int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
-		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
+		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"close_in_doubt", close_in_doubt}, {"failed_close_crash", failed_close_crash}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
 		{"loop_views", loop_views}};
 	for (const auto& [name, run] : cases) {

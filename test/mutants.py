@@ -82,6 +82,15 @@ MUTANTS = {
     "update-keeps-change": ("include/journal/host.h",
         "catch (...) { if (before) { entry = std::move(*before); } else { shard.erase(group); } throw; }", "catch (...) { throw; }",
         "journal_host_test", ["failed_close"]),
+    # A failed close restores the group to open, not in doubt: a live recovery appends past a
+    # close the disk may hold.
+    "close-restores-open": ("include/journal/host.h",
+        "} catch (...) { shards_[host_detail::slot(group)].at(group).in_doubt = true; throw; }", "} catch (...) { throw; }",
+        "journal_host_test", ["close_in_doubt"]),
+    # The host holds a group whose close is in doubt.
+    "hold-ignores-doubt": ("include/journal/host.h",
+        "if (const auto* found = resident(group); found && found->in_doubt) {", "if (const auto* found = resident(group); found && false) {",
+        "journal_host_test", ["close_in_doubt"]),
     # A second recovery on one host takes the table's stale checkpoint (F3).
     "recover-twice-from-table": ("include/journal/journal.h",
         "if (turns_->holds(group_)) { throw", "if (false) { throw",

@@ -69,6 +69,9 @@ struct GroupEntry {
 	std::uint64_t base = 0;
 	std::string manifest;
 	std::uint64_t next = 0;  // in memory: the next serial, from a fresh block after every open
+	// In memory: a failed close may have reached the disk, so nothing holds the group until the
+	// host reopens and reads which state the disk kept.
+	bool in_doubt = false;
 	bool operator==(const GroupEntry& other) const {
 		return incarnation == other.incarnation && state == other.state && mark == other.mark && high == other.high && base == other.base && manifest == other.manifest;
 	}
@@ -358,6 +361,9 @@ public:
 		std::uint64_t group_;
 	};
 	std::unique_ptr<Hold> hold(std::uint64_t group) {
+		if (const auto* found = resident(group); found && found->in_doubt) {
+			throw std::system_error(EIO, std::generic_category(), "the group's failed close may be on disk: it holds again once the host reopens");
+		}
 		const auto at = loop(group);
 		settle(at);
 		const bool staged = driver(at).staged(group);
@@ -407,7 +413,8 @@ public:
 	// durable the log forgets the group, so retention reclaims its records. As TurnLog's
 	// checkpoint guard does, it refuses a sequence below the group's last acknowledged record,
 	// in the log or the table, whose records the forget would drop. The forget fails the
-	// group's durable() waiters with group_closed (TurnDriver::forget).
+	// group's durable() waiters with group_closed (TurnDriver::forget). A failed commit leaves the
+	// group open in memory and in later commits of its slot, in doubt (GroupEntry::in_doubt).
 	void close_group(std::uint64_t group, std::uint64_t sequence, std::string manifest) {
 		const auto base = held(group, GroupState::open).base;
 		auto& turns = driver_of(group);
@@ -415,9 +422,11 @@ public:
 		if (sequence < std::max(base, turns.sequence(group))) {
 			throw std::logic_error("a close behind the group's last acknowledged record");
 		}
-		update(group, [&](GroupEntry& entry) {
-			settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
-		});
+		try {
+			update(group, [&](GroupEntry& entry) {
+				settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
+			});
+		} catch (...) { shards_[host_detail::slot(group)].at(group).in_doubt = true; throw; }
 		turns.forget(group, sequence + 1);
 	}
 	// The group's next artifact identity; a used-up block reserves the next one in the table.
@@ -463,7 +472,7 @@ private:
 	GroupEntry& held(std::uint64_t group, GroupState state) {
 		auto& shard = shards_[host_detail::slot(group)];
 		auto found = shard.find(group);
-		if (found == shard.end() || found->second.state != state) { throw std::logic_error("the group is not in the table state this needs"); }
+		if (found == shard.end() || found->second.state != state || found->second.in_doubt) { throw std::logic_error("the group is not in the table state this needs"); }
 		return found->second;
 	}
 	// Serials below the first one that still names a file are gone for good: serials are never

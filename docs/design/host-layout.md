@@ -39,6 +39,7 @@ manifest bytes). The table is sharded by slot, each shard replaced whole (`group
 synced, renamed, then the directory synced); at a million groups a shard holds about 244 entries.
 It is read once when the host opens. Every transition writes its shard before anything acts on
 it; a failed write restores the entry in memory, so the table there never runs ahead of the disk.
+A failed close may still have reached the disk, so it also leaves the entry in doubt (below).
 
 - **Naming without a scan.** After a crash, the names a group's artifacts may have are the
   serials in `[mark, high)`. A group's view lists those that exist by probing each name
@@ -51,8 +52,13 @@ it; a failed write restores the entry in memory, so the table there never runs a
   staged, as before.
 - **Close.** The group's last record must be a durable checkpoint covering every batch. The
   table takes it as `base`; once that shard is durable the loop's log forgets the group
-  (`TurnLog::forget`), and retention reclaims its records. A failed write leaves the group open
-  with its records live. `Host::close_group` refuses a `base` below the group's last
+  (`TurnLog::forget`), and retention reclaims its records. A failed commit leaves the group open
+  with its records live, and in doubt: its shard may already say closed (a replace whose
+  directory sync failed), and any later directory sync could make that durable, so a record
+  appended after it would follow a checkpoint the table supersedes. The host refuses every hold
+  of a group in doubt (`EIO`), so no Store creates, recovers or appends to it, until the host
+  reopens and reads whichever state the disk kept; both cover every acknowledged record, since
+  the log never forgot the group. Later commits of its slot write it open. `Host::close_group` refuses a `base` below the group's last
   acknowledged record, the log's durable sequence or the table's earlier `base`, since the
   forget would drop the records after it: the rule TurnLog's checkpoint guard applies to a
   checkpoint's `covers`. Nothing is written, and the group stays open. The forget fails every
