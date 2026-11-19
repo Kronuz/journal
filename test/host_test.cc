@@ -29,14 +29,16 @@
 // refused; a close with a sealed open record in flight fails its wait, never acknowledging it,
 // under power loss too; a second recovery on one host refused; one owner lock, the directory's
 // own; group views that keep their range however many dead views the host sweeps around them, in
-// a range table bounded by twice the live ids; and a view taken while its group is closed, which
-// lists none of the closed incarnation's artifacts while the view held across the close keeps its.
+// a range table bounded by twice the live ids; a view taken while its group is closed, which
+// lists none of the closed incarnation's artifacts while the view held across the close keeps its;
+// and two loops that take views and commit their tables at once, free of races under TSan.
 // `host_test [case]` runs one case.
 #include "completion/posix.h"
 #include "faultlab/faultfs.h"
 #include "journal/store.h"
 #include <cerrno>
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <iostream>
 #include <set>
@@ -380,6 +382,50 @@ void loop_slots() {
 	std::filesystem::remove_all(directory);
 }
 
+// journal-host-ranges-race A1. Each of two loops' threads takes views of its groups, thousands
+// of them so its range table sweeps, and creates some, each commit publishing to the views it
+// holds, while the other does the same: under TSan neither loop's table races with the other's
+// thread, and every held view of a created group lists its first artifact.
+void loop_views() {
+	const auto directory = std::filesystem::current_path() / ".scratch" / ("host-loop-views-" + std::to_string(::getpid()));
+	std::filesystem::remove_all(directory); std::filesystem::create_directories(directory);
+	constexpr std::size_t created = 100, viewed = 2000;
+	std::vector<std::uint64_t> made[2], seen[2];
+	for (std::uint64_t group = 1; made[0].size() + seen[0].size() < created + viewed || made[1].size() + seen[1].size() < created + viewed; ++group) {
+		const auto loop = hd::loop(hd::slot(group), 2);
+		if (made[loop].size() < created) { made[loop].push_back(group); } else if (seen[loop].size() < viewed) { seen[loop].push_back(group); }
+	}
+	{
+		j::Host host(std::make_shared<j::PosixIO>(directory), host_identity, j::HostOptions{2, j::TurnLogOptions{64 * 1024, 1024, 1, 2, 4096}});
+		std::atomic<bool> go{false};
+		std::atomic<int> done{0};
+		std::vector<std::shared_ptr<j::IO>> views[2], held[2];
+		std::thread threads[2];
+		for (int loop = 0; loop < 2; ++loop) {
+			threads[loop] = std::thread([&, loop] {
+				while (!go) {}
+				for (std::size_t i = 0; i < viewed || done < 2; ++i) {
+					auto view = host.group_io(seen[loop][i % viewed]);
+					if (i % 4 == 0 && held[loop].size() < viewed) { held[loop].push_back(std::move(view)); }
+					if (i < created) { views[loop].push_back(host.group_io(made[loop][i])); host.create_group(made[loop][i]); }
+					if (i + 1 == created) { ++done; }
+				}
+			});
+		}
+		go = true;
+		for (auto& thread : threads) { thread.join(); }
+		bool lists = true;
+		for (int loop = 0; loop < 2; ++loop) {
+			for (std::size_t i = 0; i < created; ++i) {
+				host.io().create_exclusive(hd::artifact_name(made[loop][i], 1, 0));
+				lists &= listing(*views[loop][i]) == std::set<std::string>{"artifact-" + hd::hex(1, 16) + hd::hex(0, 16)};
+			}
+		}
+		check(lists, "every held view of a created group lists its first artifact");
+	}
+	std::filesystem::remove_all(directory);
+}
+
 // journal-host-guards A1. A close whose record is below the group's last acknowledged one, here
 // the group's real checkpoint record with two batches acknowledged after it, is refused: the
 // forget would drop those batches. The group stays open in the table and the log, retention
@@ -614,16 +660,16 @@ void view_sweep() {
 	fl::filesystem disk;
 	Node node(disk);
 	auto& host = *node.host;
-	const auto& ranges = host.*steal(RangesTag{});
+	const auto& table = (host.*steal(RangesTag{}))[0].table;  // one loop: every group's
 	constexpr std::uint64_t live = 100;
 	const std::size_t bound = std::max<std::size_t>(2 * live, hd::sweep_floor);
 	std::vector<std::shared_ptr<j::IO>> views;
 	for (std::uint64_t g = 1; g <= live; ++g) { views.push_back(host.group_io(g)); views.push_back(host.group_io(g)); }
-	check(ranges.size() == live, "two views of a group share its one range: " + std::to_string(ranges.size()));
+	check(table.size() == live, "two views of a group share its one range: " + std::to_string(table.size()));
 	std::size_t largest = 0;
 	std::uint64_t fresh = std::uint64_t{1} << 20;
 	for (std::uint64_t round = 0; round < 10; ++round) {
-		for (std::uint64_t i = 0; i < 4 * live; ++i) { host.group_io(fresh++); largest = std::max(largest, ranges.size()); }
+		for (std::uint64_t i = 0; i < 4 * live; ++i) { host.group_io(fresh++); largest = std::max(largest, table.size()); }
 		host.group_io(1 + round);
 	}
 	check(largest <= bound && largest > live, "dead views gather and are swept within twice the live ids: " + std::to_string(largest));
@@ -634,7 +680,7 @@ void view_sweep() {
 	}
 	views.clear();
 	for (std::size_t i = 0; i < 2 * bound; ++i) { host.group_io(fresh++); }
-	check(ranges.size() <= hd::sweep_floor, "once every view dies the table falls to the sweep floor: " + std::to_string(ranges.size()));
+	check(table.size() <= hd::sweep_floor, "once every view dies the table falls to the sweep floor: " + std::to_string(table.size()));
 }
 
 // A view held across its group's close keeps listing the closed incarnation's artifacts; a view
@@ -680,7 +726,8 @@ int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
-		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view}};
+		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
+		{"loop_views", loop_views}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

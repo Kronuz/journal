@@ -207,6 +207,12 @@ struct Range {
 	std::mutex mutex;
 	std::uint64_t incarnation = 0, mark = 0, high = 0;
 };
+// One loop's table of its groups' views' ranges. It drops dead ranges once it doubles since its
+// last sweep: O(log ids) amortized.
+struct Ranges {
+	std::multimap<std::uint64_t, std::weak_ptr<Range>> table;
+	std::size_t sweep_at = sweep_floor;  // the table's size that sweeps it: twice the live after a sweep
+};
 // The names `scan` yields, in order.
 class NameCursor final : public DirectoryCursor {
 public:
@@ -289,21 +295,22 @@ public:
 		if (turns->lost(group)) { return GroupStatus::lost; }
 		return opened_[loop(group)].contains(group) || turns->has_group(group) || turns->holds(group) || !found->manifest.empty() ? GroupStatus::stored : GroupStatus::none;
 	}
-	// The group's view of the directory: its own names, and a scan that probes its serials.
-	// The range table drops dead ranges once it doubles since its last sweep: O(log ids) amortized.
+	// The group's view of the directory: its own names, and a scan that probes its serials. On the
+	// group's loop, which owns the loop's range table (ranges_).
 	std::shared_ptr<IO> group_io(std::uint64_t group) {
 		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
-		if (ranges_.size() >= sweep_at_) {
-			std::erase_if(ranges_, [](const auto& item) { return item.second.expired(); });
-			sweep_at_ = std::max(2 * ranges_.size(), host_detail::sweep_floor);
+		auto& [ranges, sweep_at] = ranges_[loop(group)];
+		if (ranges.size() >= sweep_at) {
+			std::erase_if(ranges, [](const auto& item) { return item.second.expired(); });
+			sweep_at = std::max(2 * ranges.size(), host_detail::sweep_floor);
 		}
 		// A resident group's live views share one range; a closed or unborn group's view shares only
 		// an unpublished one, so it never shows a closed incarnation's artifacts.
 		const auto* found = resident(group);
 		std::shared_ptr<host_detail::Range> range;
-		for (auto [at, last] = ranges_.equal_range(group); at != last;) {
+		for (auto [at, last] = ranges.equal_range(group); at != last;) {
 			auto live = at->second.lock();
-			if (!live) { at = ranges_.erase(at); continue; }
+			if (!live) { at = ranges.erase(at); continue; }
 			if (!range) {
 				std::lock_guard hold(live->mutex);
 				if (found || !live->incarnation) { range = live; }
@@ -311,7 +318,7 @@ public:
 			++at;
 		}
 		if (!range) {
-			range = std::make_shared<host_detail::Range>(); ranges_.emplace(group, range);
+			range = std::make_shared<host_detail::Range>(); ranges.emplace(group, range);
 			if (found) { publish(group, *found); }
 		}
 		return std::make_shared<PrefixIO>(io_, host_detail::group_prefix(group), [io = io_, group, range]() -> std::unique_ptr<DirectoryCursor> {
@@ -499,7 +506,8 @@ private:
 		for (auto slot : slots) { for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); } }
 	}
 	void publish(std::uint64_t group, const GroupEntry& entry) {
-		for (auto [at, last] = ranges_.equal_range(group); at != last; ++at) {
+		if (ranges_.empty()) { return; }  // the open's commits: no view exists yet
+		for (auto [at, last] = ranges_[loop(group)].table.equal_range(group); at != last; ++at) {
 			if (auto range = at->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
 		}
 	}
@@ -564,7 +572,7 @@ private:
 		if (removed) { io_->sync_directory(); }
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
-		opened_.resize(loops_); released_.resize(loops_);
+		opened_.resize(loops_); released_.resize(loops_); ranges_.resize(loops_);
 		auto groups = known(loops_);
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
@@ -655,8 +663,10 @@ private:
 	mutable std::mutex holds_mutex_;
 	std::set<std::uint64_t> holds_;  // groups a live Store holds
 	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()
-	std::multimap<std::uint64_t, std::weak_ptr<host_detail::Range>> ranges_;  // the groups' views' ranges
-	std::size_t sweep_at_ = host_detail::sweep_floor;  // ranges_'s size that sweeps it: twice the live after a sweep
+	// Per loop: its groups' views' ranges. Loop l's table belongs to loop l's thread, the one that
+	// runs group_io and the table commits (publish) of l's groups, so no lock guards it; one shared
+	// table would race across loops. docs/mechanisms/host-ranges.md has the rule.
+	std::vector<host_detail::Ranges> ranges_;
 	std::vector<std::unique_ptr<TurnDriver>> drivers_;
 };
 
