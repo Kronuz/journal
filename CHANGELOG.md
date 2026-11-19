@@ -6,6 +6,17 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-19
+
+### Fixed
+
+- A `Store::close` whose table commit fails no longer leaves its group appendable in the live
+  Host while the shard on disk may say closed, which a later directory sync and a power cut
+  turned into a lost group. The Store is fenced and the group is in doubt: `create` and `recover`
+  of the id in the same Host throw `std::system_error` with `EIO` until the Host reopens and
+  reads whichever state the disk kept. See
+  [group lifetime](docs/mechanisms/group-lifetime.md#the-rule).
+
 ## 2026-11-17
 
 ### Changed

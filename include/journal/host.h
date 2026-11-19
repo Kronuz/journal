@@ -348,7 +348,8 @@ public:
 	// A Store's hold on its group (journal.h), from its create or recover until its close or the
 	// end of its Journal, whichever comes first: two live Stores never hold one id. Busy
 	// (EWOULDBLOCK, as a held owner lock is) while another Store holds the group or while records
-	// its last one staged are unsettled. On the group's loop; a hold ends on any thread.
+	// its last one staged are unsettled. EIO while a failed close leaves the group in doubt, until
+	// the host reopens. On the group's loop; a hold ends on any thread.
 	class Hold {
 	public:
 		Hold(const Hold&) = delete;

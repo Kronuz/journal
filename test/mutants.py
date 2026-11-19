@@ -87,6 +87,10 @@ MUTANTS = {
     "close-restores-open": ("include/journal/host.h",
         "} catch (...) { shards_[host_detail::slot(group)].at(group).in_doubt = true; throw; }", "} catch (...) { throw; }",
         "journal_host_test", ["close_in_doubt"]),
+    # The Store whose close failed is not fenced: it appends past a close the disk may hold.
+    "close-unfenced": ("include/journal/journal.h",
+        "catch (...) { owner_->failed = true; throw; }\n\t\thold_.reset();", "catch (...) { throw; }\n\t\thold_.reset();",
+        "journal_host_test", ["close_in_doubt"]),
     # The host holds a group whose close is in doubt.
     "hold-ignores-doubt": ("include/journal/host.h",
         "if (const auto* found = resident(group); found && found->in_doubt) {", "if (const auto* found = resident(group); found && false) {",

@@ -15,7 +15,9 @@ durable, and without reopening the Host.
 1. **One holder.** `create` and `recover` take the group's hold (`Host::hold`) before anything
    else. While another Store holds it, they throw `std::system_error` with `EWOULDBLOCK`, as a held
    owner lock does, and change nothing. Busy is transient: the caller retries after the holder
-   ends.
+   ends. After a failed `Store::close` the group is in doubt: that Store is fenced, and `create`
+   and `recover` of the id in the same Host throw `std::system_error` with `EIO` until the Host
+   reopens.
 2. **A hold ends at close or at the Journal's end.** `Store::close` (a checkpoint covering every
    batch, durable) closes the group into the host's table and ends the hold at once. A Store that
    cannot close, fenced or with batches no checkpoint covers, ends its hold when its Journal ends:
@@ -61,7 +63,10 @@ memory; `Host::entry` and `status` read a closed entry back from its slot's shar
 closed ones only the file holds, so an entry out of memory is never dropped from disk. A commit
 that fails restores the entry it changed in memory, a closed one too: the file may already hold
 the reopened entry open, and only memory wins over the file, so the next commit of the slot
-writes it closed again. A slot whose commit succeeds keeps no closed entry in memory. The open
+writes it closed again. A slot whose commit succeeds keeps no closed entry in memory. A failed close is the other way
+round: its shard may already say closed while memory restores the entry open, so the entry stays
+open, in doubt, and no Store holds the group until the Host reopens and reads the disk
+([host-layout](../design/host-layout.md#the-group-table)). The open
 loads every shard (the logs' recovery needs each closed group's base) and then drops the closed
 entries. Open and lost entries stay in memory.
 

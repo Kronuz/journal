@@ -363,8 +363,8 @@ void failed_reopen() {
 }
 
 // A close whose table commit fails at its directory sync, after its shard's replace: the shard
-// on disk may say closed, so the live host refuses to hold the group, and no Store appends to it,
-// until the host reopens. A later directory sync then makes the close durable, and the reopened
+// on disk may say closed, so the closing Store is fenced and the live host refuses to hold the
+// group, and no Store appends to it, until the host reopens. A later directory sync then makes the close durable, and the reopened
 // host recovers the group closed with its checkpoint.
 void close_in_doubt() {
 	fl::filesystem disk;
@@ -377,8 +377,11 @@ void close_in_doubt() {
 		node.io->sync_fails = true;
 		bool threw = false;
 		try { node.store(group).close(); } catch (const std::system_error&) { threw = true; }
-		node.stores.erase(group);
 		check(threw && !node.io->sync_fails, "the close's table commit fails at its directory sync");
+		bool fenced = false;
+		try { node.append(group, "x"); } catch (const std::exception&) { fenced = true; }
+		node.stores.erase(group);
+		check(fenced, "the Store whose close failed is fenced: it appends nothing");
 		bool refused = false;
 		try { node.append(group, "x"); } catch (const std::system_error& error) { refused = error.code() == std::errc::io_error; }
 		node.stores.erase(group);
