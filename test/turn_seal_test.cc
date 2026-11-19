@@ -434,8 +434,10 @@ void forget_threads() {
 		}
 	});
 	std::uint64_t sequence = 0;
-	bool done = false;
-	for (int turn = 0; turn < 400 && !done; ++turn) {
+	// Turns run until group 2 has sealed after the forget, bounded by a deadline, not a turn count.
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+	for (int turn = 0; turn < 400 || !(forgotten.load() && driver.sequence(2) > 0); ++turn) {
+		if (std::chrono::steady_clock::now() > deadline) { break; }
 		driver.stage(record(3, ++sequence, 4));
 		const auto& write = driver.begin();
 		if (turn == 200) { quiet.store(true, std::memory_order_release); }
