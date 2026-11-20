@@ -118,6 +118,20 @@ MUTANTS = {
     "park-keeps-log": ("include/journal/host.h",
         "\t\tfor (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); }\n", "",
         "journal_journal_test", ["park_count"]),
+    # A damaged table shard fails the host's open instead of its own groups.
+    "damaged-shard-fails-open": ("include/journal/host.h",
+        "} catch (const Corruption&) { damaged_[slot].push_back(node); }", "} catch (const Corruption&) { throw; }",
+        "journal_host_test", ["table_damage"]),
+    # A split node whose children cover it wins at open: the split's changes revert.
+    "split-keeps-parent": ("include/journal/host.h",
+        "\tif (!rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {",
+        "\tif (!stored && !rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {",
+        "journal_host_test", ["split_crash"]),
+    # A split node removed before its children are durable: a crash loses its entries.
+    "split-removes-early": ("include/journal/host.h",
+        "\t\tio_->sync_directory();\n\t\tfor (auto slot : slots) { orphans_[slot].clear(); }\n\t\tfor (auto shard : split) {",
+        "\t\tfor (auto slot : slots) { orphans_[slot].clear(); }\n\t\tfor (auto shard : split) {",
+        "journal_host_test", ["split_crash"]),
 }
 
 def main():
