@@ -33,6 +33,7 @@
 #include "faultlab/faultfs.h"
 #include <atomic>
 #include <cstdlib>
+#include <chrono>
 #include <random>
 #include <thread>
 
@@ -2163,6 +2164,75 @@ void reopen_distinct() {
 	}
 }
 
+// journal-idle-groups A2: N groups, each created with its first checkpoint record, released, and
+// parked into the table by Host::park, in batches of 10,000. Reports the host's heap per parked
+// group (the slope from the first batch on), the table's bytes on disk per group, and checks the
+// log holds none of them and is back to one segment; a sample wakes with its checkpoint, and so
+// after a restart. JOURNAL_PARKED_GROUPS sets N (1,000,000 in the job; 20,000 in the suite).
+void park_count() {
+	fl::filesystem disk;
+	const char* scale = std::getenv("JOURNAL_PARKED_GROUPS");
+	const std::uint64_t ids = scale ? std::stoull(scale) : 20000, batch = std::min<std::uint64_t>(ids, 10000);
+	const TurnLogOptions turns_options{4u << 20, 4096, 1, 4, 1u << 18};
+	auto payload = [](std::uint64_t group) { return "checkpoint-" + std::to_string(group); };
+	const auto start = std::chrono::steady_clock::now();
+	std::int64_t first = 0;
+	std::uint64_t parked = 0;
+	{
+		Shared node(disk, turns_options);
+		auto& host = *node.host;
+		auto& turns = node.turns();
+		for (std::uint64_t low = 1; low <= ids; low += batch) {
+			const auto high = std::min(ids + 1, low + batch);
+			for (auto group = low; group < high; ++group) {
+				host.create_group(group);
+				turns.stage(TurnRecord{group, 1, TurnRecordKind::Checkpoint, payload(group)});
+			}
+			node.commit();
+			for (auto group = low; group < high; ++group) { host.hold(group); }  // held, then released at once
+			parked += host.park(0);
+			if (low == 1) { first = heap::bytes.load(); }
+		}
+		// A busy group's turns past the retention window reclaim the parked groups' segments.
+		const std::uint64_t busy = ids + 1;
+		host.create_group(busy);
+		turns.stage(TurnRecord{busy, 1, TurnRecordKind::Checkpoint, "busy"});
+		node.commit();
+		for (std::uint64_t s = 2; s < 2 + 64; ++s) { turns.stage(TurnRecord{busy, s, TurnRecordKind::Checkpoint, std::string(128u << 10, 'b'), s - 1}); node.commit(); }
+		const auto last = heap::bytes.load();
+		const double slope = ids > batch ? double(last - first) / double(ids - batch) : 0;
+		std::uint64_t table = 0;
+		for (const auto& name : disk.list("host")) { if (name.starts_with("groups-")) { table += disk.view("host/" + name).size(); } }
+		const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		std::cout << "park_count: " << parked << " of " << ids << " groups parked in " << seconds << " s; host heap " << first << " B after the first " << batch
+			<< ", " << last << " B after all; slope " << slope << " B per parked group; table " << table << " B on disk, " << double(table) / double(ids)
+			<< " B per group; log segments " << turns.log().data_segments().size() << "\n";
+		check(parked == ids, "every idle released group parks");
+		std::uint64_t in_log = 0, open = 0;
+		for (std::uint64_t group = 1; group <= ids; ++group) { in_log += turns.holds(group) || turns.parked(group); }
+		for (std::uint64_t group = 1; group <= ids; group += ids / 97 + 1) { open += host.status(group) != GroupStatus::closed; }
+		check(in_log == 0 && open == 0, "a parked group is closed in the table and the log holds nothing of it");
+		check(turns.log().data_segments().size() <= turns_options.retain_segments, "the log keeps only the busy group's window: " + std::to_string(turns.log().data_segments().size()) + " segments");
+		if (heap::checked("park_count") && ids > batch) { check(slope <= 1, "a parked group costs the host no heap: " + std::to_string(slope) + " B per group"); }
+		// Waking a sample: the table's record staged again, then a batch, in one turn.
+		for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {
+			const auto entry = host.entry(group);
+			check(entry && entry->manifest == payload(group) && entry->base == 1, "the table holds the parked group's checkpoint");
+			host.reopen_group(group);
+			const auto at = std::max(entry->base, turns.retired(group)) + 1;
+			turns.stage(TurnRecord{group, at, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
+			turns.stage(TurnRecord{group, at + 1, TurnRecordKind::Batch, "woken"});
+		}
+		node.commit();
+	}
+	Shared again(disk, turns_options);
+	for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {
+		const auto& records = again.turns().records(group);
+		check(records.size() == 2 && records[0].payload == payload(group) && records[1].payload == "woken", "a woken group recovers its checkpoint and its batch");
+	}
+	check(again.host->status(2) == GroupStatus::closed && again.host->entry(2)->manifest == payload(2), "a parked group stays parked across a restart");
+}
+
 // A7: 10,000 groups, each created, given a batch and released by its Store's end: the bytes per
 // group the host keeps before settle() parks them and after, and a sample that recovers exactly.
 void reopen_heap() {
@@ -2220,7 +2290,7 @@ int main(int argc, char** argv) {
 	const std::map<std::string_view, std::function<void()>> cases{
 		{"reopen_clean_close", reopen_clean_close}, {"reopen_released", [] { reopen_released(false); reopen_released(true); }},
 		{"reopen_two_stores", reopen_two_stores}, {"reopen_refused", reopen_refused}, {"reopen_race", reopen_race}, {"reopen_crash", reopen_crash},
-		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}, {"reopen_distinct", reopen_distinct}, {"reclaim_syncs", reclaim_syncs}};
+		{"reopen_churn", reopen_churn}, {"reopen_heap", reopen_heap}, {"reopen_distinct", reopen_distinct}, {"reclaim_syncs", reclaim_syncs}, {"park_count", park_count}};
 	if (argc > 1) {
 		const auto found = cases.find(argv[1]);
 		if (found == cases.end()) { std::cerr << "no case " << argv[1] << '\n'; return 2; }
@@ -2229,7 +2299,7 @@ int main(int argc, char** argv) {
 		std::cout << checks << " journal checks, " << failures << " failures\n";
 		return failures ? 1 : 0;
 	}
-	try { reopen_clean_close(); reopen_released(false); reopen_released(true); reopen_two_stores(); reopen_refused(); reopen_race(); basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); store_artifact_completions(true); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_replacement_growth(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
+	try { park_count(); reopen_clean_close(); reopen_released(false); reopen_released(true); reopen_two_stores(); reopen_refused(); reopen_race(); basics(); append_failures(); append_failures(3); append_failures(std::numeric_limits<std::size_t>::max(), true); append_failures(3, true); append_failures(std::numeric_limits<std::size_t>::max(), false, true); append_failures(3, false, true); append_failures(std::numeric_limits<std::size_t>::max(), true, true); append_failures(3, true, true); suspended_artifact_operations(); suspended_artifact_ownership(); suspended_append_ownership(); fenced_append_submission(); suspended_append_retirement(); recovery_failures(); recovery_failures(true); recovery_failures(false, true); recovery_failures(true, true); corruption(); initialization_failures(); checkpoint_basics(); checkpoint_successive_generations(); suspended_artifact_open(); suspended_artifact_reads(); incremental_artifact_verification(); store_incremental_verification(); published_artifact_selection(); store_published_selection(); artifact_verification(); preparation_ownership_and_failures(); checkpoint_publication_failures(); checkpoint_publication_failures(3); checkpoint_publication_failures(std::numeric_limits<std::size_t>::max(), true); checkpoint_publication_failures(3, true); checkpoint_corruption(); reclamation_roots_and_unknowns(); reclamation_failures(); reclamation_failures(3); reclamation_failures(std::numeric_limits<std::size_t>::max(), true); reclamation_failures(3, true); durable_staging_ownership(); mixed_artifact_formats(); footprint_plans(); checkpoint_publication_retirement(); store_publication_completions(); store_artifact_completions(); store_artifact_completions(true); detached_old_artifact_lease(); store_append_completions(); store_reclaim_before_inventory(); store_replacement_growth(); store_basics(); store_failures(); store_append_and_cleanup_failures(); store_limits_and_pins(); store_posix(); posix(); }
 	catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " journal checks, " << failures << " failures\n";
 	return failures ? 1 : 0;

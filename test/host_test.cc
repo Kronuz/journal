@@ -25,14 +25,16 @@
 // name with no directory scan; a closed group reopened from the group table after retention
 // recycled every segment that held it; a group whose first turn was lost created again as a new
 // incarnation; a failed close that leaves the group open, in doubt: held by nothing until the
-// host reopens, under power loss too; a failed reopen that leaves it closed;
+// host reopens, under power loss too; a failed reopen's table commit that fails its driver;
 // two loops' table commits free of races under TSan; a close behind an acknowledged record
 // refused; a close with a sealed open record in flight fails its wait, never acknowledging it,
 // under power loss too; a second recovery on one host refused; one owner lock, the directory's
 // own; group views that keep their range however many dead views the host sweeps around them, in
 // a range table bounded by twice the live ids; a view taken while its group is closed, which
 // lists none of the closed incarnation's artifacts while the view held across the close keeps its;
-// and two loops that take views and commit their tables at once, free of races under TSan.
+// and two loops that take views and commit their tables at once, free of races under TSan;
+// idle groups parked, woken, created and re-partitioned under power loss at every step, and
+// parked groups that log damage never costs (journal-idle-groups A3).
 // `host_test [case]` runs one case.
 #include "completion/posix.h"
 #include "faultlab/faultfs.h"
@@ -335,29 +337,28 @@ void failed_close() {
 	check(node.recovered[7].bundle == "state" && node.host->entry(7)->incarnation == 1, "it recovers its checkpoint in its first incarnation");
 }
 
-// A recover of a closed group whose table commit fails after its shard's replace, then a
-// create in the same slot: the group stays closed in the live host and after a restart, and
-// recovers its checkpoint.
+// A recover of a closed group whose table commit, made before the turn carrying its restaged
+// record, fails at its directory sync: that turn never writes and the driver fails, as a failed
+// turn does. After a restart the group recovers its checkpoint, whichever shard the disk kept.
 void failed_reopen() {
 	fl::filesystem disk;
 	const std::uint64_t group = 7;
-	std::uint64_t neighbor = group + 1;
-	while (hd::slot(neighbor) != hd::slot(group)) { ++neighbor; }
 	{
 		Node node(disk);
 		node.append(group, "a1"); node.checkpoint(group, "bundle-a1");
 		node.store(group).close(); node.stores.erase(group);
+		const auto turns = node.turns(group).log().stats().turns;
 		node.io->sync_fails = true;
 		bool threw = false;
-		try { node.store(group); } catch (const std::system_error&) { threw = true; }
+		try { node.store(group); } catch (const std::exception&) { threw = true; }
 		node.stores.erase(group);
-		check(threw && !node.io->sync_fails, "the reopen's table commit fails at its directory sync");
-		check(node.host->status(group) == j::GroupStatus::closed, "the group stays closed in the live host");
-		node.store(neighbor);
-		check(node.host->status(group) == j::GroupStatus::closed, "and after a create in its slot");
+		check(threw && !node.io->sync_fails, "the wake's table commit fails at its directory sync");
+		check(node.turns(group).failed() && node.turns(group).log().stats().turns == turns, "and fails the driver before its turn writes");
 	}
+	disk.crash(0, sector_cut);
 	Node node(disk);
-	check(node.host->status(group) == j::GroupStatus::closed, "after a restart the group is closed");
+	const auto status = node.host->status(group);
+	check(status == j::GroupStatus::closed || status == j::GroupStatus::stored, "after a restart the group is closed, or open from its table record");
 	node.store(group);
 	check(node.recovered[group].bundle == "bundle-a1" && node.recovered[group].batches.empty(), "it recovers its checkpoint");
 }
@@ -460,7 +461,7 @@ void loop_slots() {
 		j::Host host(std::make_shared<j::PosixIO>(directory), host_identity, j::HostOptions{3, j::TurnLogOptions{64 * 1024, 1024, 1, 2, 4096}});
 		std::thread threads[2];
 		for (int loop = 0; loop < 2; ++loop) {
-			threads[loop] = std::thread([&, loop] { for (auto group : side[loop]) { host.create_group(group); } });
+			threads[loop] = std::thread([&, loop] { for (auto group : side[loop]) { host.create_group(group); } host.commit_transitions(static_cast<std::uint32_t>(loop)); });
 		}
 		for (auto& thread : threads) { thread.join(); }
 		bool open = true;
@@ -809,13 +810,167 @@ void lock() {
 }
 }  // namespace
 
+
+// journal-idle-groups A3 (docs/design/idle-groups.md "Crash at each step"). Groups 1-8 are
+// parked and 9-12 open on one loop; then a host at L = 2 re-partitions, creates 20-23, wakes
+// 1-4 (the table's record staged again, then a batch), appends to the woken and open groups,
+// checkpoints 1, 2, 9 and 10 and parks them, and a host at L = 3 re-partitions again. Power is
+// cut after every mutation; after the crash, three restarts at L = 3 each find every group at a
+// state it reached, no older than its last acknowledged one, and none lost.
+namespace idle {
+using Content = std::vector<std::string>;  // a group's checkpoint payload, then its batches
+struct Group { std::vector<Content> states{Content{}}; std::size_t acknowledged = 0; std::uint64_t sequence = 0; };
+const j::TurnLogOptions turns{16 * 1024, 1024, 1, 4, 4096};
+std::unique_ptr<j::Host> open(fl::filesystem& disk, std::uint32_t loops) { return std::make_unique<j::Host>(host_io(disk), host_identity, j::HostOptions{loops, turns}); }
+void commit(j::Host& host) { for (std::uint32_t l = 0; l < host.loops(); ++l) { while (!host.driver(l).idle()) { host.driver(l).commit(); } } }
+std::size_t park(j::Host& host) { std::size_t n = 0; for (std::uint32_t l = 0; l < host.loops(); ++l) { n += host.park(l); } return n; }
+// The group's content as recovery gives it; "lost" for a lost group.
+Content content(j::Host& host, std::uint64_t group) {
+	switch (host.status(group)) {
+	case j::GroupStatus::none: return {};
+	case j::GroupStatus::lost: return {"lost"};
+	case j::GroupStatus::closed: return {host.entry(group)->manifest};
+	case j::GroupStatus::stored: break;
+	}
+	auto& turns = host.driver_of(group);
+	if (!turns.has_group(group)) { return {host.entry(group)->manifest}; }
+	Content state;
+	for (const auto& record : turns.records(group)) { state.push_back(record.payload); }
+	return state;
+}
+struct Model {
+	std::map<std::uint64_t, Group> groups;
+	// Stages a record and the state it leads to; acknowledge() marks the states durable.
+	void stage(j::Host& host, std::uint64_t group, j::TurnRecordKind kind, const std::string& payload, std::uint64_t at = 0) {
+		auto& g = groups[group];
+		const auto covers = g.sequence;
+		g.sequence = at ? at : g.sequence + 1;
+		host.driver_of(group).stage(j::TurnRecord{group, g.sequence, kind, payload, covers});
+		auto next = kind == j::TurnRecordKind::Checkpoint ? Content{payload} : g.states.back();
+		if (kind == j::TurnRecordKind::Batch) { next.push_back(payload); }
+		if (kind != j::TurnRecordKind::Checkpoint || next != g.states.back()) { g.states.push_back(next); }
+	}
+	void acknowledge() { for (auto& [_, g] : groups) { g.acknowledged = g.states.size() - 1; } }
+	void verify(j::Host& host, const std::string& at) {
+		for (const auto& [group, g] : groups) {
+			const auto state = content(host, group);
+			const auto found = std::find(g.states.begin() + static_cast<std::ptrdiff_t>(g.acknowledged), g.states.end(), state);
+			check(found != g.states.end(), "group " + std::to_string(group) + " recovers a state it reached, no older than its acknowledged one: [" + join(state) + "] at " + at);
+		}
+	}
+};
+// The run up to the cut; the model of what it staged and acknowledged.
+void run(fl::filesystem& disk, Model& model) {
+	auto host = open(disk, 2);
+	for (std::uint64_t g : {20u, 21u, 22u, 23u}) { host->create_group(g); model.stage(*host, g, j::TurnRecordKind::Checkpoint, "c" + std::to_string(g)); }
+	commit(*host); model.acknowledge();
+	for (std::uint64_t g = 1; g <= 4; ++g) {
+		host->reopen_group(g);
+		const auto entry = host->entry(g);
+		model.groups[g].sequence = entry->base;
+		model.stage(*host, g, j::TurnRecordKind::Checkpoint, entry->manifest, std::max(entry->base, host->driver_of(g).retired(g)) + 1);
+		model.stage(*host, g, j::TurnRecordKind::Batch, "w" + std::to_string(g));
+	}
+	commit(*host); model.acknowledge();
+	for (std::uint64_t g : {1u, 2u, 3u, 9u, 10u, 11u, 20u}) { model.stage(*host, g, j::TurnRecordKind::Batch, "a" + std::to_string(g)); }
+	commit(*host); model.acknowledge();
+	for (std::uint64_t g : {1u, 2u, 9u, 10u}) { model.stage(*host, g, j::TurnRecordKind::Checkpoint, "k" + std::to_string(g)); }
+	commit(*host); model.acknowledge();
+	for (std::uint64_t g : {1u, 2u, 9u, 10u}) { host->hold(g); }  // held, then released
+	check(park(*host) == 5, "the checkpointed released groups park, and 12, idle since the open");
+	host.reset();
+	open(disk, 3);
+}
+}  // namespace idle
+bool idle_crash_run(const fl::filesystem& base, const idle::Model& prepared, std::uint64_t cut) {
+	fl::filesystem disk = base.snapshot();
+	idle::Model model = prepared;
+	bool reached = false;
+	const auto at = "cut " + std::to_string(cut);
+	disk.power_off_after(cut - 1);
+	try { idle::run(disk, model); reached = true; }
+	catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails the run, which threw " + std::string(error.what()) + ": " + at); }
+	disk.crash(cut, sector_cut);
+	for (int restart = 0; restart < 3; ++restart) {
+		try { auto host = idle::open(disk, 3); model.verify(*host, at + " restart " + std::to_string(restart)); }
+		catch (const std::exception& error) { check(false, at + " restart " + std::to_string(restart) + ": " + error.what()); }
+	}
+	return reached;
+}
+void idle_crash() {
+	fl::filesystem base;
+	idle::Model model;
+	{
+		auto host = idle::open(base, 1);
+		for (std::uint64_t g = 1; g <= 12; ++g) {
+			host->create_group(g);
+			model.stage(*host, g, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g));
+			model.stage(*host, g, j::TurnRecordKind::Batch, "b" + std::to_string(g));
+		}
+		idle::commit(*host);
+		for (std::uint64_t g = 1; g <= 12; ++g) { model.stage(*host, g, j::TurnRecordKind::Checkpoint, "q" + std::to_string(g)); }
+		idle::commit(*host); model.acknowledge();
+		for (std::uint64_t g = 1; g <= 8; ++g) { host->hold(g); }
+		check(idle::park(*host) == 8, "the released groups park");
+	}
+	std::uint64_t cut = 1;
+	while (!idle_crash_run(base, model, cut)) { ++cut; }
+	std::cout << "idle_crash: " << cut - 1 << " power cuts, every one of them recovered\n";
+}
+
+// journal-idle-groups A3, review F3: damage to two blocks of a woken group's batch costs no
+// parked group, and the woken group, whose only post-wake records were there, is reported lost
+// rather than read back as parked.
+void idle_damage() {
+	fl::filesystem disk;
+	const std::string marker(3000, 'Z');
+	{
+		auto host = idle::open(disk, 1);
+		auto& turns = host->driver(0);
+		for (std::uint64_t g = 1; g <= 6; ++g) {
+			host->create_group(g);
+			turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g)});
+		}
+		idle::commit(*host);
+		for (std::uint64_t g = 1; g <= 5; ++g) { host->hold(g); }
+		check(idle::park(*host) == 5, "five groups park");
+		host->reopen_group(1);
+		const auto at = std::max(host->entry(1)->base, turns.retired(1)) + 1;
+		turns.stage(j::TurnRecord{1, at, j::TurnRecordKind::Checkpoint, "p1", 1});
+		turns.stage(j::TurnRecord{1, at + 1, j::TurnRecordKind::Batch, marker});
+		idle::commit(*host);
+		for (std::uint64_t s = 2; s < 6; ++s) { turns.stage(j::TurnRecord{6, s, j::TurnRecordKind::Batch, "later" + std::to_string(s)}); idle::commit(*host); }
+	}
+	// The batch's first block holds its fragment header; the two after it are the batch alone.
+	std::string segment;
+	for (const auto& name : disk.list("host")) { if (name.starts_with("l") && disk.view("host/" + name).find(marker.substr(0, 900)) != std::string_view::npos) { segment = name; } }
+	check(!segment.empty(), "the woken group's batch is in the log");
+	const auto view = disk.view("host/" + segment);
+	const auto first = (view.find(marker.substr(0, 900)) / 1024 + 1) * 1024;
+	{
+		auto file = host_io(disk)->open_existing(segment);
+		// A byte of each of two blocks' payloads. (Damaging the second block's header instead, the
+		// manifest naming the first block's groups, loses acknowledged records silently on main too:
+		// a pre-existing recovery gap, reported to the lead, not this case's.)
+		for (std::uint64_t at : {first + 512, first + 1024 + 512}) { file->write_at(at, std::string(1, 'Y')); }
+		file->sync();
+	}
+	auto host = idle::open(disk, 1);
+	check(host->driver(0).recovered().damaged, "the log reads the damage");
+	check(host->status(1) == j::GroupStatus::lost, "the woken group whose post-wake records the damage took is lost");
+	for (std::uint64_t g = 2; g <= 5; ++g) { check(host->status(g) == j::GroupStatus::closed && host->entry(g)->manifest == "p" + std::to_string(g), "a parked group opens from its table record: group " + std::to_string(g)); }
+	// Group 6's later records share the block of the batch's last fragment, which the damage left
+	// orphaned, so that block's manifest may name it: it keeps every record or is lost, never fewer.
+	check(host->status(6) == j::GroupStatus::lost || host->driver(0).records(6).size() == 5, "the group that wrote after the damage keeps every record or is lost");
+}
+
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"close_in_doubt", close_in_doubt}, {"failed_close_crash", failed_close_crash}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
-		{"loop_views", loop_views}};
+		{"loop_views", loop_views}, {"idle_crash", idle_crash}, {"idle_damage", idle_damage}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

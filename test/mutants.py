@@ -43,7 +43,7 @@ MUTANTS = {
         "journal_placement_test", ["repartition_lost"]),
     # A re-partition that does not mark recovery's lost ids before it writes the new generation.
     "repartition-skips-mark": ("include/journal/host.h",
-        "\t\tmark_lost(lost);\n\t\tconst auto next = generation_ + 1;", "\t\tconst auto next = generation_ + 1;",
+        "\t\tmark_lost(lost);\n\t\thost_detail::replace_file", "\t\thost_detail::replace_file",
         "journal_placement_test", ["repartition_damaged"]),
     # An open that does not mark the lost ids: retention then forgets them.
     "open-skips-mark": ("include/journal/host.h",
@@ -99,6 +99,29 @@ MUTANTS = {
     "recover-twice-from-table": ("include/journal/journal.h",
         "if (turns_->holds(group_)) { throw", "if (false) { throw",
         "journal_host_test", ["second_recovery"]),
+    # journal-idle-groups: a parked (closed) group counted open, as D10 item 3 wrote it: any
+    # damage then loses every parked group (review F3).
+    "parked-as-open": ("include/journal/host.h",
+        "if (entry.state == GroupState::open) { loop.open.push_back(id); }", "loop.open.push_back(id);",
+        "journal_host_test", ["idle_damage"]),
+    # A wake whose table flip never commits before its turn: a crash then reads the group parked
+    # and drops its acknowledged post-wake records.
+    "wake-skips-commit": ("include/journal/host.h",
+        "\t\t\tdrivers_.back()->before_turn([this, loop] { commit_transitions(loop); });\n", "",
+        "journal_host_test", ["idle_crash"]),
+    # The same, under damage: the woken group reads back parked instead of lost.
+    "wake-skips-commit-damage": ("include/journal/host.h",
+        "\t\t\tdrivers_.back()->before_turn([this, loop] { commit_transitions(loop); });\n", "",
+        "journal_host_test", ["idle_damage"]),
+    # A create's first serial block, undurable until its first turn: an artifact named by it
+    # leaks once a crash loses the create.
+    "create-with-block": ("include/journal/host.h",
+        "entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, 0, 0, {}, 0};", "entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, host_detail::serial_block, 0, {}, 0};",
+        "journal_host_test", ["recreate"]),
+    # Park ignores the log: a parked group keeps its checkpoint live, so the log never shrinks.
+    "park-keeps-log": ("include/journal/host.h",
+        "\t\tfor (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); }\n", "",
+        "journal_journal_test", ["park_count"]),
 }
 
 def main():

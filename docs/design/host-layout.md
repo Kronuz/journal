@@ -48,8 +48,13 @@ A failed close may still have reached the disk, so it also leaves the entry in d
   serial is reused, and none is being created then, since a group prepares one artifact at a
   time.
 - **Create.** A new entry, or a new incarnation of one whose first turn never became durable
-  (the earlier incarnation's artifacts go first). Then the group's first checkpoint record is
-  staged, as before.
+  (the earlier incarnation's artifacts go first), with no serial block: the first artifact
+  reserves one. Then the group's first checkpoint record is staged. Create and reopen change the
+  entry in memory; the loop commits its changed slots before its next turn with records
+  (`TurnDriver::before_turn`), so the entry is durable before that record
+  ([idle-groups](idle-groups.md) D5).
+- **Park.** `Host::park(loop)` closes every idle released group of the loop, as close does, with
+  one commit ([idle-groups](idle-groups.md) D1-D3).
 - **Close.** The group's last record must be a durable checkpoint covering every batch. The
   table takes it as `base`; once that shard is durable the loop's log forgets the group
   (`TurnLog::forget`), and retention reclaims its records. A failed commit leaves the group open
@@ -84,16 +89,18 @@ A group's slot mixes its id (splitmix64's finalizer) into 4,096 slots; its loop 
 `(slot × L) >> 12`, so each loop owns a contiguous run of floor or ceil(4,096 / L) slots. When
 the host opens with an L other than the layout's:
 
-1. Read every log of the stored generation (`TurnLog::read`, which writes nothing), mark the ids
-   recovery calls lost in the table, and sync it, before anything else.
-2. Write each group's live records into its new loop's log of generation + 1, in turns of at
-   most a quarter segment; each turn is synced.
+1. Read each log of the stored generation in turn (`TurnLog::read`, which writes nothing) and
+   write its groups' live records into their new loops' logs of generation + 1, in turns of at
+   most a quarter segment; each turn is synced. Memory holds one old log's records and one turn
+   per new loop.
+2. Mark the ids recovery calls lost in the table, and sync it.
 3. Commit by replacing `layout` with (L, generation + 1), then remove the old generation's logs.
 
 Every open removes logs of any other generation than the layout's: an unfinished
 re-partition's, or the old generation's that a commit had not yet removed. A crash before step 3
 leaves the old generation authoritative and the next open starts again. The cost is one write of
-the live records and one barrier per turn of the new logs; the same L copies nothing.
+the live records and one barrier per turn of the new logs; the same L copies nothing, and a
+parked group copies nothing at any L.
 
 ## What the host holds
 

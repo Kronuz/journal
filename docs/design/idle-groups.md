@@ -155,7 +155,9 @@ grows from one loop's groups to the device's, as F2 says. With parking, that gro
 the device's active groups, not to its open indexes. A woken group is `open` in the table before
 its first record is written (D5). If that record sat in an unmanifested damaged block, recovery
 reports the group lost (`turn_log.h:690`) rather than reading it as parked. The A3 job's damage
-case checks both halves. A damaged shard file stays what it is today: the host refuses to open
+case checks both halves on damage a manifest attributes. Damage that also takes the block header
+holding that manifest loses acknowledged records silently on journal `main` (`1222e3b`), parked
+groups or not: a pre-existing recovery gap outside this design, reported to Detent's lead. A damaged shard file stays what it is today: the host refuses to open
 (`host.h:186`, Q3).
 
 **D8. Forward copies stay (review F5).** `forward_slice` (`turn_log.h:411-432`) still copies the
@@ -217,7 +219,7 @@ design is written against its quest file. Nothing here depends on how many logs 
 |---|---|
 | A1 | This note |
 | A2 | `host_test park_count`: N groups are created, checkpointed, released and parked (`JOURNAL_PARKED_GROUPS`, 1,000,000 in the job). It checks the heap slope per parked group (at most 1 B), that the log holds none of them and is back to its current segment, and a sample that wakes exactly |
-| A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: an unmanifested damaged block; parked groups open, and a woken group whose only post-wake records were there reports lost. Each fix runs with a mutant, `--fails-without` |
+| A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: two damaged blocks of a woken group's batch; parked groups open, and the woken group, whose only post-wake records were there, reports lost. Mutants in `test/mutants.py` (`parked-as-open`, `wake-skips-commit`, `wake-skips-commit-damage`, `create-with-block`, `park-keeps-log`), each `--fails-without` |
 | A4 | The suite and CI |
 
 ## Questions for the owner

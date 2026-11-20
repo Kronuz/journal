@@ -247,29 +247,25 @@ public:
 	// group is unparked. A record that does not read back as itself throws Corruption and
 	// changes nothing.
 	std::vector<TurnRecord> live(std::uint64_t group) {
-		std::vector<std::pair<std::uint64_t, Live>> positions;
-		const auto parked = parked_.find(group);
-		if (parked != parked_.end()) {
-			for (std::size_t i = 0; i < parked->second.live.size(); ++i) { positions.emplace_back(parked->second.first + i, parked->second.live[i]); }
-		} else if (auto found = index_.find(group); found != index_.end()) {
-			positions.assign(found->second.begin(), found->second.end());
-		}
-		std::vector<TurnRecord> records; records.reserve(positions.size());
-		for (const auto& [sequence, live] : positions) {
-			const auto bytes = framing::read_record(reader(live.segment), turn_log_detail::stream(identity_, options_.block_bytes, live.segment, live.epoch), live.offset);
-			std::string_view logical(bytes);
-			if (logical.size() < turn_log_detail::record_header || static_cast<std::uint8_t>(logical[0]) != static_cast<std::uint8_t>(live.kind)) { throw Corruption("a live record does not read back as itself"); }
-			logical.remove_prefix(1); get64(logical);  // the kind, then the turn
-			if (get64(logical) != group || get64(logical) != sequence) { throw Corruption("a live record does not read back as itself"); }
-			records.push_back({group, sequence, live.kind, std::string(logical)});
-		}
-		if (parked != parked_.end()) {
+		const auto positions = live_positions(group);
+		auto records = read_live(group, positions);
+		if (auto parked = parked_.find(group); parked != parked_.end()) {
 			auto& index = index_[group];
 			for (const auto& [sequence, live] : positions) { index.emplace(sequence, live); }
 			sequences_[group] = positions.back().first;
 			parked_.erase(parked);
 		}
 		return records;
+	}
+	// As live(), leaving a parked group parked.
+	std::vector<TurnRecord> peek(std::uint64_t group) { return read_live(group, live_positions(group)); }
+	// Groups whose only live record is a checkpoint, held or not: what Host::park may take into
+	// its table.
+	std::vector<std::uint64_t> idle() const {
+		std::vector<std::uint64_t> groups;
+		for (const auto& [group, records] : index_) { if (records.size() == 1 && records.begin()->second.kind == TurnRecordKind::Checkpoint) { groups.push_back(group); } }
+		for (const auto& [group, parked] : parked_) { if (parked.live.size() == 1 && parked.live[0].kind == TurnRecordKind::Checkpoint) { groups.push_back(group); } }
+		return groups;
 	}
 	// Preallocates spare segments; the host calls it off the turn.
 	void prepare() { while (spares_.size() < options_.spare_segments) { spares_.push_back(preallocate()); } }
@@ -395,6 +391,28 @@ private:
 	// A parked group's live records, consecutive from `first`.
 	struct Parked { std::uint64_t first = 0; std::vector<Live> live; };
 	void drop(const Live& live) { if (!--live_counts_[live.segment]) { live_counts_.erase(live.segment); } }
+	std::vector<std::pair<std::uint64_t, Live>> live_positions(std::uint64_t group) const {
+		std::vector<std::pair<std::uint64_t, Live>> positions;
+		if (auto parked = parked_.find(group); parked != parked_.end()) {
+			for (std::size_t i = 0; i < parked->second.live.size(); ++i) { positions.emplace_back(parked->second.first + i, parked->second.live[i]); }
+		} else if (auto found = index_.find(group); found != index_.end()) {
+			positions.assign(found->second.begin(), found->second.end());
+		}
+		return positions;
+	}
+	// Reads records back by position; one that does not read back as itself throws Corruption.
+	std::vector<TurnRecord> read_live(std::uint64_t group, const std::vector<std::pair<std::uint64_t, Live>>& positions) {
+		std::vector<TurnRecord> records; records.reserve(positions.size());
+		for (const auto& [sequence, live] : positions) {
+			const auto bytes = framing::read_record(reader(live.segment), turn_log_detail::stream(identity_, options_.block_bytes, live.segment, live.epoch), live.offset);
+			std::string_view logical(bytes);
+			if (logical.size() < turn_log_detail::record_header || static_cast<std::uint8_t>(logical[0]) != static_cast<std::uint8_t>(live.kind)) { throw Corruption("a live record does not read back as itself"); }
+			logical.remove_prefix(1); get64(logical);  // the kind, then the turn
+			if (get64(logical) != group || get64(logical) != sequence) { throw Corruption("a live record does not read back as itself"); }
+			records.push_back({group, sequence, live.kind, std::string(logical)});
+		}
+		return records;
+	}
 	// A checkpoint supersedes the group's earlier records; a copy only replaces its original.
 	void note(std::uint64_t group, std::uint64_t sequence, TurnRecordKind kind, std::uint64_t offset, bool copy = false) {
 		auto& records = index_[group];

@@ -52,6 +52,11 @@ The records stay live for retention: the per-segment live counts do not change, 
 updating its parked positions. `TurnLog::sequence` answers for a parked group from its entry, so
 `holds()` and `status()` still see it as stored. A parked group stages nothing; `live()` unparks it.
 
+`Host::park(loop)` takes the next step for a released group whose only live record is a
+checkpoint: it closes the group into the table, as `Store::close` would, so the log and memory
+forget it ([idle-groups](../design/idle-groups.md)). A released group with batches after its
+checkpoint stays in the log until a holder checkpoints it.
+
 A released group's table entry stays in memory while it is open: `next_artifact` and the serial
 range its views scan read it there.
 

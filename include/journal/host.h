@@ -394,21 +394,26 @@ public:
 			released_[at].insert(released_[at].end(), unsettled.begin(), unsettled.end());
 		}
 	}
-	// The shared Journal's table transitions (journal.h); each is durable when it returns.
-	// A new incarnation of the group, with its first serial block: a group the table does not
-	// hold, or one whose first turn never became durable, whose artifacts go first.
+	// The shared Journal's table transitions (journal.h). Create and reopen change the entry in
+	// memory and mark its slot: the slot commits before the next turn of the group's loop
+	// (TurnDriver::before_turn), so each is durable before the turn carrying the group's first
+	// record (docs/design/idle-groups.md D5). Close and park are durable when they return.
+	// A new incarnation of the group: a group the table does not hold, or one whose first turn
+	// never became durable, whose artifacts go first. Its first serial block is reserved by its
+	// first artifact (next_artifact), durably, so no artifact is named by an undurable block.
 	void create_group(std::uint64_t group) {
 		if (status(group) != GroupStatus::none) { throw std::logic_error("the group exists, is closed, or is lost"); }
-		update(group, [&](GroupEntry& entry) {
-			if (remove_artifacts(group, entry)) { io_->sync_directory(); }
-			entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, host_detail::serial_block, 0, {}, 0};
-		});
+		auto& entry = shards_[host_detail::slot(group)][group];
+		if (remove_artifacts(group, entry)) { io_->sync_directory(); }
+		entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, 0, 0, {}, 0};
+		dirty_[loop(group)].insert(host_detail::slot(group));
 		opened_[loop(group)].insert(group);
 	}
+	// A closed or parked group opens again; its table record is staged again by its holder.
 	void reopen_group(std::uint64_t group) {
 		if (!resident(group)) { if (auto closed = stored(group)) { shards_[host_detail::slot(group)].emplace(group, std::move(*closed)); } }
-		held(group, GroupState::closed);
-		update(group, [](GroupEntry& entry) { entry.state = GroupState::open; });
+		held(group, GroupState::closed).state = GroupState::open;
+		dirty_[loop(group)].insert(host_detail::slot(group));
 	}
 	// The table takes the group's last record, a checkpoint covering every batch; once that is
 	// durable the log forgets the group, so retention reclaims its records. As TurnLog's
@@ -423,12 +428,32 @@ public:
 		if (sequence < std::max(base, turns.sequence(group))) {
 			throw std::logic_error("a close behind the group's last acknowledged record");
 		}
-		try {
-			update(group, [&](GroupEntry& entry) {
-				settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
-			});
-		} catch (...) { shards_[host_detail::slot(group)].at(group).in_doubt = true; throw; }
-		turns.forget(group, sequence + 1);
+		std::vector<TurnRecord> closing{{group, sequence, TurnRecordKind::Checkpoint, std::move(manifest)}};
+		close_into_table(closing);
+	}
+	// Parks the loop's idle groups (docs/design/idle-groups.md D2): every group no Store holds or
+	// has opened, with nothing staged, no sealer, and one live record, a checkpoint, closes into
+	// the table as close_group does, with one commit for them all. On the loop, off the turn.
+	// Returns how many parked; a failed commit leaves each of them in doubt, as a failed close does.
+	std::size_t park(std::uint32_t at) {
+		settle(at);
+		auto& turns = driver(at);
+		std::vector<TurnRecord> parking;
+		for (auto group : turns.log().idle()) {
+			if (holding(group) || opened_[at].contains(group) || turns.staged(group) || turns.sealed(group)) { continue; }
+			const auto* found = resident(group);
+			if (!found || found->state != GroupState::open || found->in_doubt) { continue; }
+			auto records = turns.log().peek(group);
+			parking.push_back(std::move(records.front()));
+		}
+		if (!parking.empty()) { close_into_table(parking); }
+		return parking.size();
+	}
+	// Commits the loop's slots that a create or reopen changed: the hook every driver runs before
+	// a turn with records.
+	void commit_transitions(std::uint32_t at) {
+		if (dirty_.empty() || dirty_[at].empty()) { return; }
+		commit(std::set<std::uint32_t>(dirty_[at]));
 	}
 	// The group's next artifact identity; a used-up block reserves the next one in the table.
 	Identity next_artifact(std::uint64_t group) {
@@ -481,6 +506,28 @@ private:
 	void settle_mark(std::uint64_t group, GroupEntry& entry) {
 		while (entry.mark < entry.next && !io_->entry_footprint(host_detail::artifact_name(group, entry.incarnation, entry.mark))) { ++entry.mark; }
 	}
+	// Each record, a group's last and a checkpoint covering every batch, becomes its table entry's
+	// base; the slots commit once, then the log forgets each group, and the closed entries leave
+	// memory. A failed commit restores each entry open, in doubt.
+	void close_into_table(std::vector<TurnRecord>& records) {
+		std::set<std::uint32_t> slots; std::vector<GroupEntry> before; before.reserve(records.size());
+		for (auto& record : records) {
+			auto& entry = shards_[host_detail::slot(record.group)].at(record.group);
+			before.push_back(entry);
+			settle_mark(record.group, entry); entry.state = GroupState::closed; entry.base = record.sequence; entry.manifest = std::move(record.payload);
+			slots.insert(host_detail::slot(record.group));
+		}
+		try { commit(slots); }
+		catch (...) {
+			for (std::size_t i = 0; i < records.size(); ++i) {
+				auto& entry = shards_[host_detail::slot(records[i].group)].at(records[i].group);
+				entry = std::move(before[i]); entry.in_doubt = true;
+			}
+			throw;
+		}
+		for (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); }
+		for (auto slot : slots) { std::erase_if(shards_[slot], [](const auto& item) { return item.second.state == GroupState::closed; }); }
+	}
 	bool remove_artifacts(std::uint64_t group, GroupEntry& entry) {
 		bool removed = false;
 		for (auto serial = entry.mark; serial < entry.high; ++serial) {
@@ -506,18 +553,30 @@ private:
 		}
 		std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; });
 	}
-	// Replaces the shards, then syncs the directory once; the groups' views see their ranges.
-	// A shard holds the slot's entries in memory and the closed ones only its file holds.
+	// Replaces the shards: writes each `.pending`, syncs them all with one call, renames them,
+	// then syncs the directory once; the groups' views see their ranges. A shard holds the slot's
+	// entries in memory and the closed ones only its file holds. A committed slot is no longer dirty.
 	void commit(const std::set<std::uint32_t>& slots) {
+		std::vector<std::unique_ptr<File>> files; files.reserve(slots.size());
 		for (auto slot : slots) {
 			auto entries = stored_shard(slot);
 			std::erase_if(entries, [&](const auto& item) { return item.second.state != GroupState::closed || shards_[slot].contains(item.first); });
 			for (const auto& [id, entry] : shards_[slot]) { entries.insert_or_assign(id, entry); }
-			host_detail::replace_file(*io_, host_detail::shard_name(slot), host_detail::encode_shard(identity_, entries));
-			stored_[slot] = true;
+			const auto pending = host_detail::shard_name(slot) + ".pending";
+			io_->remove(pending);
+			files.push_back(io_->create_exclusive(pending));
+			detail::write_all(*files.back(), 0, host_detail::encode_shard(identity_, entries));
 		}
+		std::vector<File*> syncing; syncing.reserve(files.size());
+		for (auto& file : files) { syncing.push_back(file.get()); }
+		io_->sync_files(syncing);
+		files.clear();
+		for (auto slot : slots) { io_->replace(host_detail::shard_name(slot) + ".pending", host_detail::shard_name(slot)); stored_[slot] = true; }
 		io_->sync_directory();
-		for (auto slot : slots) { for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); } }
+		for (auto slot : slots) {
+			if (!dirty_.empty()) { dirty_[host_detail::loop(slot, loops_)].erase(slot); }
+			for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); }
+		}
 	}
 	void publish(std::uint64_t group, const GroupEntry& entry) {
 		if (ranges_.empty()) { return; }  // the open's commits: no view exists yet
@@ -596,13 +655,14 @@ private:
 		if (removed) { io_->sync_directory(); }
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
-		opened_.resize(loops_); released_.resize(loops_);
+		opened_.resize(loops_); released_.resize(loops_); dirty_.resize(loops_);
 		auto groups = known(loops_);
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
 			loop_views_.push_back(view);
 			drivers_.push_back(std::make_unique<TurnDriver>(*view, identity_, options_.turns, groups[loop]));
 			drivers_.back()->retire_with([this](std::uint64_t group) { return retired_floor(group); });
+			drivers_.back()->before_turn([this, loop] { commit_transitions(loop); });
 		}
 		std::set<std::uint64_t> lost;
 		for (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }
@@ -628,39 +688,43 @@ private:
 		if (removed) { io_->sync_directory(); }
 		if (!changed.empty()) { commit(changed); }
 	}
-	// L changed: (1) recover every log of the stored generation and mark its lost ids; (2)
-	// write each group's live records into its new loop's log of the next generation, each log
-	// synced; (3) commit by replacing the layout, then remove the old logs. Before (3) the old
-	// generation is authoritative and the next open starts again.
+	// L changed: (1) stream each log of the stored generation in turn into the next generation's
+	// L_new logs: its groups' records join their new loop's turn, written and synced once it holds
+	// a quarter segment, so memory holds one old log's live records and L_new turns; (2) mark the
+	// ids recovery calls lost, durably; (3) commit by replacing the layout, then remove the old
+	// logs. Before (3) the old generation is authoritative and the next open starts again. A group
+	// lives in one old log and reads back in sequence order, so none is lost or reordered.
 	void repartition() {
-		std::map<std::uint64_t, std::vector<TurnRecord>> records; std::set<std::uint64_t> lost;
+		std::set<std::uint64_t> lost;
 		auto groups = known(loops_);
+		const auto next = generation_ + 1;
+		// A turn never crosses a segment: a quarter of one, counting each record's framing.
+		const auto budget = options_.turns.segment_bytes / 4;
+		struct Target { std::shared_ptr<PrefixIO> view; std::unique_ptr<TurnLog> log; std::vector<TurnRecord> turn; std::uint64_t bytes = 0; };
+		std::vector<Target> targets(options_.loops);
+		for (std::uint32_t loop = 0; loop < options_.loops; ++loop) {
+			targets[loop].view = std::make_shared<PrefixIO>(io_, host_detail::log_prefix(next, loop), [] {
+				return std::make_unique<host_detail::NameCursor>([] { return std::optional<std::string>(); });
+			});
+			TurnRecovery fresh; targets[loop].log = std::make_unique<TurnLog>(*targets[loop].view, identity_, fresh, options_.turns);
+		}
+		auto flush = [](Target& target) { if (!target.turn.empty()) { target.log->append(target.turn); target.turn.clear(); target.bytes = 0; } };
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
 			auto recovered = TurnLog::read(*view, identity_, options_.turns, groups[loop]);
 			lost.insert(recovered.lost.begin(), recovered.lost.end());
-			for (auto& [id, kept] : recovered.groups) { if (!kept.empty()) { records[id] = std::move(kept); } }
-		}
-		mark_lost(lost);
-		const auto next = generation_ + 1;
-		// A turn never crosses a segment: a quarter of one, counting each record's framing.
-		const auto budget = options_.turns.segment_bytes / 4;
-		for (std::uint32_t loop = 0; loop < options_.loops; ++loop) {
-			auto view = std::make_shared<PrefixIO>(io_, host_detail::log_prefix(next, loop), [] {
-				return std::make_unique<host_detail::NameCursor>([] { return std::optional<std::string>(); });
-			});
-			TurnRecovery fresh; TurnLog log(*view, identity_, fresh, options_.turns);
-			std::vector<TurnRecord> turn; std::uint64_t bytes = 0;
-			for (const auto& [id, kept] : records) {
-				if (host_detail::loop(host_detail::slot(id), options_.loops) != loop) { continue; }
-				for (const auto& record : kept) {
+			for (auto& [id, kept] : recovered.groups) {
+				auto& target = targets[host_detail::loop(host_detail::slot(id), options_.loops)];
+				for (auto& record : kept) {
 					const auto size = record.payload.size() + 64;
-					if (!turn.empty() && bytes + size > budget) { log.append(turn); turn.clear(); bytes = 0; }
-					turn.push_back(record); bytes += size;
+					if (!target.turn.empty() && target.bytes + size > budget) { flush(target); }
+					target.bytes += size; target.turn.push_back(std::move(record));
 				}
 			}
-			if (!turn.empty()) { log.append(turn); }
 		}
+		for (auto& target : targets) { flush(target); }
+		targets.clear();
+		mark_lost(lost);
 		host_detail::replace_file(*io_, std::string(host_detail::layout_name), host_detail::encode_layout(identity_, options_.loops, next));
 		io_->sync_directory();
 		const auto old = generation_;
@@ -688,6 +752,7 @@ private:
 	mutable std::mutex holds_mutex_;
 	std::set<std::uint64_t> holds_;  // groups a live Store holds
 	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()
+	std::vector<std::set<std::uint32_t>> dirty_;  // per loop: slots a create or reopen changed, committed before its next turn
 	// Per loop: its groups' views' ranges. Loop l's table belongs to loop l's thread, the one that
 	// runs group_io and the table commits (publish) of l's groups, so no lock guards it; one shared
 	// table would race across loops. docs/mechanisms/host-ranges.md has the rule.

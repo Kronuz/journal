@@ -238,6 +238,10 @@ public:
 	// sequence + 1, so forget() keeps no entry per closed group. Called on the loop, maybe under
 	// the sealers' lock; it must not throw.
 	void retire_with(std::function<std::uint64_t(std::uint64_t)> floor) { retired_by_ = std::move(floor); }
+	// A host's table commit before each turn that has records, ahead of encoding: a group's
+	// create or wake is durable before the turn carrying its first record (docs/design/idle-groups.md
+	// D5). On the loop; one that throws fails the driver, as a failed turn does.
+	void before_turn(std::function<void()> hook) { before_turn_ = std::move(hook); }
 	bool failed() const noexcept { return log_failed_; }
 
 	// Stages a record for the next turn that has room for it; its operation, if any, completes
@@ -486,6 +490,13 @@ private:
 		const auto take = used <= whole_room() ? records.size() : log_.fitting(records);
 		for (std::size_t i = take; i < records.size(); ++i) { pending_[i].record = std::move(records[i]); }
 		records.resize(take);
+		if (before_turn_) {
+			try { before_turn_(); }
+			catch (...) {
+				for (std::size_t i = 0; i < take; ++i) { pending_[i].record = std::move(records[i]); }
+				fail(std::current_exception()); throw;
+			}
+		}
 		flight_.assign(std::make_move_iterator(pending_.begin()), std::make_move_iterator(pending_.begin() + static_cast<std::ptrdiff_t>(take)));
 		pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(take));
 		try { write_ = log_.stage(records); }
@@ -683,6 +694,7 @@ private:
 	std::map<std::uint64_t, Sealing> sealers_;
 	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten past its host's floor: retired()
 	std::function<std::uint64_t(std::uint64_t)> retired_by_;  // the host's floor: retire_with()
+	std::function<void()> before_turn_;  // the host's table commit: before_turn()
 	std::uint64_t kept(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
 	// A group whose record at `hole` no segment holds: its records from there through `last` failed.
 	struct Refusal { std::uint64_t hole = 0, last = 0; std::exception_ptr error; };

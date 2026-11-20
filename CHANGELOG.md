@@ -6,6 +6,31 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-20
+
+### Added
+
+- `Host::park(loop)` parks the loop's idle groups: every group no Store holds or has opened,
+  with nothing staged, no sealer, and one live record, a checkpoint, closes into the table with
+  one commit for them all. A parked group is a closed entry: no log record, no heap, 45 bytes plus
+  its checkpoint in its shard ([docs/design/idle-groups.md](docs/design/idle-groups.md)).
+- `TurnDriver::before_turn(hook)`: a host's table commit, run before each turn with records.
+- `TurnLog::peek(group)` reads a group's live records without unparking it; `TurnLog::idle()`
+  lists the groups whose only live record is a checkpoint.
+
+### Changed
+
+- `Host::create_group` and `Host::reopen_group` no longer commit their shard when they return:
+  the loop's changed slots commit before its next turn with records, so each transition is
+  durable before the turn carrying the group's first record, and a turn pays one batched file
+  sync and one directory sync for all of them. A failed commit there fails the driver, as a
+  failed turn does. A created group's first serial block is reserved, durably, by its first
+  artifact.
+- A table commit syncs every shard it replaces with one `sync_files` call, then renames them and
+  syncs the directory once.
+- A re-partition streams one old log at a time into the new generation, so its memory is one
+  log's live records and one turn per new loop, not every log's records.
+
 ## 2026-11-19
 
 ### Changed
