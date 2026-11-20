@@ -223,8 +223,9 @@ an open record gets it written, under `run()` or the blocking entry, with no sta
 new call: its watcher awaits `durable` for the open record.
 
 - `wake()` sets a flag `idle()` reads and posts to the loop of whoever holds the driver, which
-  `TurnDriver::Hold` names. Under `run()` the post resumes it. Under the blocking entry the post is
-  a no-op call on the entry's scheduler: it ends the entry's sleep toward a deadline at once, and
+  `TurnDriver::Hold` names. A `Hold` takes its loop as a required parameter and throws
+  `std::logic_error` on an empty one before it holds the driver, so no holder is deaf to `wake()`.
+  Under `run()` the post resumes it. Under the blocking entry the post is a no-op call on the entry's scheduler: it ends the entry's sleep toward a deadline at once, and
   the entry's next pass reads `idle()` and commits the turn. The post reaches the driver only
   while that `run()` lasts, so the owner may destroy the driver once `run()` returns with a wake
   still queued, and the entry's no-op touches no driver at all; the flag stays set for the next
@@ -255,7 +256,7 @@ new call: its watcher awaits `durable` for the open record.
 | `unseal_owner` | A second registration replaces the first; the first owner's `unseal` leaves it, its own removes it; `seal` returns the last staged sequence |
 | `lock_order` | A sealer holding its record mutex calls `wake()`, which asks for exactly one more turn |
 | `wake_threads` | Under TSan: a writer thread calls `wake()` under its record mutex at each record's first transaction; `run()` on another thread's loop makes every record durable with no waiter or staged record |
-| `wake_refused` | `run()` on a scheduler that declares no `post_call` throws before it holds the driver; the wake it could not carry stays asked for, and `run()` on a loop with `post_call` seals it |
+| `wake_refused` | `run()` on a scheduler that declares no `post_call` throws before it holds the driver; the wake it could not carry stays asked for, and `run()` on a loop with `post_call` seals it; also a `Hold` built without a loop does not compile, and one on an empty loop throws `std::logic_error` and leaves the driver free |
 | host_test `sealer_close` | The durability review's F1 probe: a close at the durable sequence with a sealed open record and its waiter fails the wait with `group_closed`; a record at the retired sequence is refused; neither the reopen checkpoint nor a later wait for that sequence acknowledges it; recovery has no trace of it |
 | host_test `sealer_close_crash` | Power cut at every I/O operation of rounds that commit the open record or close the group with it in flight and reopen: recovery keeps every acknowledged batch, at most the one in flight, and never a closed one |
 | `wake_after_run` | Under ASan: a wake still queued when `run()` returns reaches nothing once the owner destroys the driver on the loop |

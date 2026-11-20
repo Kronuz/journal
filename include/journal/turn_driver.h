@@ -365,12 +365,14 @@ public:
 	}
 
 	// Who drives the turns: none, run() (a reactor loop), or the blocking entry. Each refuses
-	// a driver the other holds. The holder's loop, which outlives the hold, is where wake() posts.
+	// a driver the other holds. The holder's loop, which outlives the hold, is where wake() posts: Hold
+	// requires it and throws std::logic_error on an empty one, before it holds the driver.
 	enum class Holder : std::uint8_t { none, driver, entry };
 	Holder holder() const noexcept { return holder_; }
 	struct Hold {
 		TurnDriver& turns;
-		Hold(TurnDriver& driver, Holder holder, task::scheduler_ref loop = {}) : turns(driver) {
+		Hold(TurnDriver& driver, Holder holder, task::scheduler_ref loop) : turns(driver) {
+			if (!loop) { throw std::logic_error("a Hold needs a loop"); }
 			if (turns.holder_ != Holder::none) { throw std::logic_error("the turn driver is held by another driver"); }
 			{ std::lock_guard hold(turns.loop_mutex_); turns.loop_ = loop; }
 			turns.holder_ = holder;

@@ -6,6 +6,7 @@
 #   covers    TurnLog drops the checkpoint guard (A7)
 #   close-behind      Host::close_group drops its acknowledged-record guard (journal-host-guards A1)
 #   run-any-scheduler TurnDriver::run drops its post_call check (journal-host-guards A2)
+#   hold-any-loop     TurnDriver::Hold accepts an empty loop (journal-hold-loop-required A1)
 #   bare-home TurnDriver::durable links a waiter whose scheduler declares no post_call (review F6)
 #   keep-waiters      TurnDriver::forget leaves the group's durable() waiters linked (review F1)
 #   reuse-sequence    TurnDriver::forget retires no sequence, so a reopen reuses them (review F1)
@@ -23,6 +24,7 @@ case "$1" in
 	covers) file=include/journal/turn_log.h; old='if (record.kind == TurnRecordKind::Checkpoint && record.covers < last) {' ;;
 	close-behind) file=include/journal/host.h; old='if (sequence < std::max(base, turns.sequence(group))) {' ;;
 	run-any-scheduler) file=include/journal/turn_driver.h; old='if (!detail::posts_calls(task::current())) {' ;;
+	hold-any-loop) file=include/journal/turn_driver.h; old='if (!loop) { throw std::logic_error("a Hold needs a loop"); }'; new='' ;;
 	bare-home) file=include/journal/turn_driver.h; old='if (!detail::posts_calls(waiter.home)) {'; new='if (!waiter.home) {' ;;
 	keep-waiters) file=include/journal/turn_driver.h; old='resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);'; new='' ;;
 	reuse-sequence) file=include/journal/turn_driver.h; old='return found == retired_.end() ? 0 : found->second;'; new='return 0;' ;;

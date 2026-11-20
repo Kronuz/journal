@@ -8,6 +8,13 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-19
 
+### Changed
+
+- `TurnDriver::Hold` takes its loop as a required parameter with no default, and throws
+  `std::logic_error` at construction when the loop is empty, before it holds the driver, as
+  `durable()` refuses a scheduler without `post_call`. A holder without a loop could not be
+  woken by `wake()`; code that built a `Hold` without one no longer compiles.
+
 ### Fixed
 
 - A `TurnDriver::durable()` wait cancelled from another thread no longer unlinks its waiter on
