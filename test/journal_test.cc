@@ -2253,6 +2253,17 @@ void park_count() {
 				const auto bytes = disk.view("host/" + name);
 				std::ofstream(directory / name, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 			}
+			// Opens over the copy, its files in the page cache: the table's reads and decodes, the log's
+			// recovery, and the open's syncs.
+			std::size_t files = 0;
+			for (const auto& name : disk.list("host")) { files += name.starts_with("groups-"); }
+			std::cout << "park_count: the host opens over " << ids << " parked groups in " << files << " table files on " << real << " in";
+			for (int open = 0; open < 3; ++open) {
+				const auto opening = std::chrono::steady_clock::now();
+				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory)), reopen_host, HostOptions{1, turns_options});
+				std::cout << " " << std::chrono::duration<double>(std::chrono::steady_clock::now() - opening).count() << " s";
+			}
+			std::cout << "\n";
 			{
 				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory)), reopen_host, HostOptions{1, turns_options});
 				transitions(copy, " on " + std::string(real), 100);  // each syncs for real
