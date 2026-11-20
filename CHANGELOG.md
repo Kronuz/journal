@@ -6,6 +6,18 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-20
+
+### Fixed
+
+- `TurnLog` recovery no longer drops acknowledged records silently when a damaged block is
+  followed by a block whose header, the damaged block's manifest, is damaged too. A header that
+  fails while a fragment of its segment starts in the same 512-byte sector is damage, which no
+  crash leaves: past the last kept turn it is reported instead of read as a torn tail. Damage
+  that no manifest names now costs every group, where it cost only those that wrote nothing
+  after it: a forwarded copy after the damage read as such a write and kept a group whose newer
+  records the damage held.
+
 ## 2026-11-19
 
 ### Changed

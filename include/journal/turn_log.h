@@ -65,9 +65,10 @@ struct TurnRecord {
 	}
 };
 // What recovery kept: each group's records from its latest checkpoint, in sequence order.
-// A group whose sequence has a gap, or that wrote nothing after damage that may have held
-// its records, is lost: it rejoins as a new incarnation (D11, D5). When damaged, a group
-// the host holds open (TurnLogGroups::open) that is in neither map is lost too.
+// A group whose sequence has a gap, or whose records damage may have held (every group, where
+// no manifest names the damaged block's), is lost: it rejoins as a new incarnation (D11, D5).
+// When damaged, a group the host holds open (TurnLogGroups::open) that is in neither map is
+// lost too.
 struct TurnRecovery {
 	std::uint64_t epoch = 0;      // the epoch this open started
 	std::uint64_t last_turn = 0;  // the last turn kept
@@ -138,6 +139,7 @@ inline std::optional<std::uint64_t> segment_number(std::string_view name) {
 // read back as current (unwritten, stale, or damaged).
 struct Item {
 	bool gap = false, tail = false;  // a tail: a segment's gap after its last record
+	bool damage = false;  // a gap holding a header no crash leaves: damaged_header
 	std::uint64_t epoch = 0;
 	std::uint8_t kind = 0;
 	std::uint64_t turn = 0, group = 0, sequence = 0;
@@ -147,6 +149,19 @@ struct Item {
 // Per described block: its groups' highest sequences, and where the header naming them is.
 struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0, epoch = 0; std::uint32_t block = 0; };
 using Manifests = std::map<std::pair<std::uint64_t, std::uint32_t>, BlockManifest>;
+// Whether a block whose header fails is damaged: a fragment of this segment starts in the
+// header's 512-byte sector. A crash leaves each sector old or new, and no earlier use of the
+// file holds this segment's fragments, so the sector is this segment's, whose header verified.
+inline bool damaged_header(std::string_view block, std::uint64_t offset, std::uint64_t segment) {
+	const auto sector = framing::sector_bytes - offset % framing::sector_bytes;  // the block's bytes in it
+	for (std::uint16_t count = 0; framing::header_bytes(count) < sector; ++count) {  // the count may be the damage
+		const auto size = framing::header_bytes(count);
+		if (size + framing::fragment_header > block.size()) { break; }
+		const auto at = block.substr(size);
+		if (framing::parse_fragment(at, block.size() - size, segment, framing::peek64(at.substr(16))).check == framing::Check::ok) { return true; }
+	}
+	return false;
+}
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
 	std::uint64_t here = 0;
 	auto gap = [&] { if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = here; items.push_back(std::move(item)); } };
@@ -157,7 +172,11 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		if (file.read_at(offset, block) != block.size()) { gap(); assembling = false; continue; }
 		std::string_view view(block);
 		const auto header = framing::parse_header(view, stream(identity, options.block_bytes, segment, 0), index);
-		if (header.check != framing::Check::ok) { gap(); assembling = false; continue; }
+		if (header.check != framing::Check::ok) {
+			gap(); assembling = false;
+			if (damaged_header(view, offset, segment)) { items.back().damage = true; }
+			continue;
+		}
 		const auto epoch = header.epoch; const auto count = header.count;
 		if (count != framing::no_manifest) {
 			auto& manifest = manifests[{framing::peek64(view.substr(44)), framing::peek32(view.substr(52))}];
@@ -556,16 +575,16 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	// Turns per epoch: contiguous from the open's kept turn, each complete when its
 	// end-of-turn record counts the records before it. Damage before a later complete turn
 	// (a gap, an incomplete turn, a missing one) costs the groups the next block's manifest
-	// names for the damaged block; where no manifest reads back, it costs every group that
-	// wrote nothing after it, which alone cannot show it lost nothing there.
+	// names for the damaged block; where no manifest reads back, it costs every group: a record
+	// after it may be a forwarded copy, which shows nothing of what its group wrote there.
 	struct Turn { std::vector<std::size_t> records; bool complete = false; std::size_t first = 0, end = 0; };
 	std::vector<std::size_t> kept_records; std::set<std::uint64_t> named; std::set<std::size_t> counted;
-	std::size_t unknown = items.size(); bool damaged = false;
+	bool unknown = false, damaged = false;  // unknown: damage whose groups no manifest names
 	auto gap_damage = [&](std::size_t g) {
 		if (!counted.insert(g).second) { return; }
 		damaged = true;
 		auto found = manifests.find({items[g].segment, static_cast<std::uint32_t>(items[g].offset / options_.block_bytes)});
-		if (found == manifests.end()) { unknown = std::min(unknown, g); return; }
+		if (found == manifests.end()) { unknown = true; return; }
 		for (const auto& [group, sequence] : found->second.groups) { if (!superseded(group, sequence)) { named.insert(group); } }
 	};
 	std::uint64_t last_turn = 0;
@@ -607,7 +626,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			for (auto [low, high] : {std::pair{prefer, to}, std::pair{from, prefer}}) {
 				for (auto g : tails) { if (!found && g >= low && g < high && written(g)) { gap_damage(g); found = true; } }
 			}
-			if (!found) { unknown = std::min(unknown, to); }
+			if (!found) { unknown = true; }
 		};
 		std::uint64_t expected = open.kept + 1; std::size_t previous_end = open.begin;  // first index after the previous turn
 		for (auto it = turns.begin(); it != turns.end(); ++it) {
@@ -629,6 +648,10 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			for (auto r : turn.records) { kept_records.push_back(r); }
 			last_turn = number; expected = number + 1; previous_end = turn.end + 1; keep_end(open.epoch, turn.end);
 		}
+		// Past the newest epoch's last kept turn, a damaged header may hide acknowledged turns
+		// that nothing after it shows, so it is damage: a torn tail never leaves one. In an
+		// earlier epoch, the next open names the turns it kept.
+		if (newest_epoch) { for (std::size_t i = previous_end; i < stop; ++i) { if (items[i].damage) { gap_damage(i); } } }
 		if (!newest_epoch && last_turn != limit && limit != std::numeric_limits<std::uint64_t>::max()) {
 			damaged = true; missing_between(previous_end, stop, previous_end);
 			last_turn = limit;
@@ -637,7 +660,6 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	// Per group: copies agree, sequences are contiguous from 1 or from a checkpoint, and a
 	// checkpoint supersedes what precedes it.
 	std::map<std::uint64_t, std::map<std::uint64_t, std::size_t>> by_group;
-	std::map<std::uint64_t, std::size_t> last_seen;
 	for (auto r : kept_records) {
 		const auto& item = items[r];
 		if (superseded(item.group, item.sequence)) { continue; }
@@ -647,11 +669,10 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			if (other.kind != item.kind || other.payload != item.payload) { result.lost.insert(item.group); }
 			it->second = r;  // the later copy is the live one
 		}
-		last_seen[item.group] = std::max(last_seen[item.group], r);
 	}
 	for (auto& [group, records] : by_group) {
 		if (result.lost.contains(group)) { continue; }
-		if (named.contains(group) || (unknown < items.size() && last_seen[group] < unknown)) { result.lost.insert(group); continue; }
+		if (named.contains(group) || unknown) { result.lost.insert(group); continue; }
 		auto start = records.end();
 		for (auto it = records.begin(); it != records.end(); ++it) {
 			if (items[it->second].kind == static_cast<std::uint8_t>(TurnRecordKind::Checkpoint)) { start = it; }
