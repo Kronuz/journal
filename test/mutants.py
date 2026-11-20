@@ -109,10 +109,6 @@ MUTANTS = {
     "wake-skips-commit": ("include/journal/host.h",
         "\t\t\tdrivers_.back()->before_turn([this, loop] { commit_transitions(loop); });\n", "",
         "journal_host_test", ["idle_crash"]),
-    # The same, under damage: the woken group reads back parked instead of lost.
-    "wake-skips-commit-damage": ("include/journal/host.h",
-        "\t\t\tdrivers_.back()->before_turn([this, loop] { commit_transitions(loop); });\n", "",
-        "journal_host_test", ["idle_damage"]),
     # A create's first serial block, undurable until its first turn: an artifact named by it
     # leaks once a crash loses the create.
     "create-with-block": ("include/journal/host.h",

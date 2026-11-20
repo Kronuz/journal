@@ -6,6 +6,18 @@
 
 # Idle groups leave the log
 
+## Names
+
+Two steps, two words, one owner: this quest's mechanism, `journal:idle-park`, is the only park
+mechanism; strata consumes it and defines none of its own.
+
+- **Evicted** (in memory): a released group's records stay live in the log, which keeps only
+  their positions (`TurnDriver::evict`, `TurnLog::evict`, run by `Host::settle`). Nothing on disk
+  changes; `live()` restores it.
+- **Parked** (durable): the table state that holds the group's last checkpoint record, with
+  nothing in the log or the heap (`Host::park`, `Host::close_group`). On disk it is the `closed`
+  entry state (D1); a parked group wakes by `reopen_group`.
+
 A host must hold millions of open indexes. Today every open group keeps its latest checkpoint
 record live in its loop's turn log until it closes (`turn_log.h:399-404`, `note()`), and its table
 entry, log index and sequence in memory. That record pins its segment until forwarded
@@ -74,7 +86,7 @@ Its checkpoint's live count leaves its segment. Once no other live record remain
 
 | Where | Bytes per parked group |
 |---|---|
-| Heap: host, driver, log | 0 (A2 measures the slope at 1M) |
+| Heap: host, driver, log | 0: measured -0.0006 B per group from 10k to 1M parked (`journal_test park_count`, job 261120-084841-834ac9 at journal:b55e34d) |
 | Turn log | 0 live; its old records are superseded and reclaimed with their segments |
 | Table shard `groups-<slot>` | 45 + payload: id 8, incarnation 8, state 1, mark 8, high 8, base 8, length 4, then the record |
 | Payload, journal `Store` | its manifest: 108 B, plus 28 per dependency, at most 332 (`journal.h:472-474`) |
@@ -82,7 +94,9 @@ Its checkpoint's live count leaves its segment. Once no other live record remain
 | Artifacts | the group's own files, unchanged |
 
 At 1M parked groups with 108-B payloads the table holds 153 MB in 4,096 shards, about 37 KB
-each. Reading a parked group back, through `status`, `entry` or a wake, reads its one shard
+each. The A2 job's 17-byte test payloads measured 62.0 B per group on disk, and the log back to
+one segment; creating and parking the million took 93 s on a memory disk, most of it rewriting
+shards (Q1). Reading a parked group back, through `status`, `entry` or a wake, reads its one shard
 (`host.h:448-457`).
 
 **D4. Wake rejoins through the table record.** A `Store`'s `recover` of a parked group takes the
@@ -219,7 +233,7 @@ design is written against its quest file. Nothing here depends on how many logs 
 |---|---|
 | A1 | This note |
 | A2 | `host_test park_count`: N groups are created, checkpointed, released and parked (`JOURNAL_PARKED_GROUPS`, 1,000,000 in the job). It checks the heap slope per parked group (at most 1 B), that the log holds none of them and is back to its current segment, and a sample that wakes exactly |
-| A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: two damaged blocks of a woken group's batch; parked groups open, and the woken group, whose only post-wake records were there, reports lost. Mutants in `test/mutants.py` (`parked-as-open`, `wake-skips-commit`, `wake-skips-commit-damage`, `create-with-block`, `park-keeps-log`), each `--fails-without` |
+| A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: two damaged blocks of a woken group's batch; parked groups open, and the woken group, whose only post-wake records were there, reports lost. Mutants in `test/mutants.py` (`parked-as-open`, `wake-skips-commit`, `create-with-block`, `park-keeps-log`), each `--fails-without` |
 | A4 | The suite and CI |
 
 ## Questions for the owner
@@ -249,7 +263,7 @@ design is written against its quest file. Nothing here depends on how many logs 
 1. `TurnDriver::before_turn` and D5's deferred `create_group` and `reopen_group`, with one batched
    commit (`sync_files`, then one directory sync). Fix `host_test failed_reopen` to the fail-stop
    contract.
-2. `TurnLog::peek` (read a live record without unparking it), then `Host::park(loop)` through the
+2. `TurnLog::peek` (read a live record without restoring an evicted group), then `Host::park(loop)` through the
    close path, and `host_test park_count`.
 3. D6's streaming re-partition (`placement_test remap` unchanged).
 4. `host_test idle_crash` and `idle_damage`, each with its mutants.

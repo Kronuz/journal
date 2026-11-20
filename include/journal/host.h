@@ -377,7 +377,7 @@ public:
 	}
 	bool holding(std::uint64_t group) const { std::lock_guard lock(holds_mutex_); return holds_.contains(group); }
 	// Releases the loop's groups whose holds ended and whose records are settled: each leaves
-	// memory but not the log (TurnDriver::park), so retention keeps every durable record and
+	// memory but not the log (TurnDriver::evict), so retention keeps every durable record and
 	// the next recover reads them back. On the loop; hold() runs it first.
 	void settle(std::uint32_t at) {
 		std::vector<std::uint64_t> ended;
@@ -387,7 +387,7 @@ public:
 		for (auto group : ended) {
 			if (holding(group)) { continue; }
 			if (turns.staged(group)) { unsettled.push_back(group); continue; }
-			turns.park(group); opened_[at].erase(group);
+			turns.evict(group); opened_[at].erase(group);
 		}
 		if (!unsettled.empty()) {
 			std::lock_guard lock(holds_mutex_);
@@ -408,12 +408,15 @@ public:
 		entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, 0, 0, {}, 0};
 		dirty_[loop(group)].insert(host_detail::slot(group));
 		opened_[loop(group)].insert(group);
+		publish(group, entry);  // its views name nothing until its first block
 	}
 	// A closed or parked group opens again; its table record is staged again by its holder.
 	void reopen_group(std::uint64_t group) {
 		if (!resident(group)) { if (auto closed = stored(group)) { shards_[host_detail::slot(group)].emplace(group, std::move(*closed)); } }
-		held(group, GroupState::closed).state = GroupState::open;
+		auto& entry = held(group, GroupState::closed);
+		entry.state = GroupState::open;
 		dirty_[loop(group)].insert(host_detail::slot(group));
+		publish(group, entry);  // its views list its incarnation's artifacts, as the census counts them
 	}
 	// The table takes the group's last record, a checkpoint covering every batch; once that is
 	// durable the log forgets the group, so retention reclaims its records. As TurnLog's

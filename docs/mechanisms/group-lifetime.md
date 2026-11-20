@@ -1,5 +1,5 @@
 > Status: CURRENT (2026-11-18) how a Host hands a group to one Store at a time and takes it back,
-> `Host::hold`, `Host::settle`, `TurnDriver::park` and `TurnLog::live` in `include/journal/`.
+> `Host::hold`, `Host::settle`, `TurnDriver::evict` and `TurnLog::live` in `include/journal/`.
 > Consumers: consensus's Driver (a group's Worker owns its Store) and Xapiand's index pool, which
 > evicts idle indexes and reopens them in the same process.
 > Format: unchanged (`RFTW0001`, `RJGT0001`); everything here is in memory.
@@ -38,7 +38,7 @@ durable, and without reopening the Host.
 
 A hold's end queues the group for its loop (`Host::unhold`, any thread, under the holds' mutex).
 `Host::settle(loop)`, run on the loop by every `hold()` and callable by the loop's owner, takes
-each queued group whose records settled and parks it (`TurnDriver::park`, `TurnLog::park`):
+each queued group whose records settled and evicts it (`TurnDriver::evict`, `TurnLog::evict`):
 
 - the turn log drops the group's sequence entry and its index map, and keeps one compact entry:
   its first live sequence and each live record's position (segment, epoch, offset, kind);
@@ -48,9 +48,9 @@ each queued group whose records settled and parks it (`TurnDriver::park`, `TurnL
 - the Host drops the group from its per-loop set of created or recovered groups.
 
 The records stay live for retention: the per-segment live counts do not change, and
-`forward_slice` copies a parked group's records out of the oldest segment like any other group's,
-updating its parked positions. `TurnLog::sequence` answers for a parked group from its entry, so
-`holds()` and `status()` still see it as stored. A parked group stages nothing; `live()` unparks it.
+`forward_slice` copies an evicted group's records out of the oldest segment like any other group's,
+updating its evicted positions. `TurnLog::sequence` answers for an evicted group from its entry, so
+`holds()` and `status()` still see it as stored. An evicted group stages nothing; `live()` restores it.
 
 `Host::park(loop)` takes the next step for a released group whose only live record is a
 checkpoint: it closes the group into the table, as `Store::close` would, so the log and memory

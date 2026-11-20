@@ -108,7 +108,7 @@ void host_table() {
 	expect(opened.direct + opened.direct_data, 0, "opening the host syncs no file past the seam");
 	check(opened.seam_data >= 1, "the turn log's open record flushes through the seam");
 	check(opened.seam >= 1, "the layout record's sync reaches the seam");
-	host.create_group(7);
+	host.create_group(7); host.commit_transitions(0);
 	expect(io->counts.seam - opened.seam, 1, "a table commit makes one seam sync");
 	expect(io->counts.direct - opened.direct, 0, "a table commit syncs no file past the seam");
 	expect(io->counts.directory - opened.directory, 1, "a table commit syncs the directory once");

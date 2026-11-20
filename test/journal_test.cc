@@ -1896,10 +1896,10 @@ struct Shared {
 		commit(); publication->result();
 	}
 };
-// Host::settle and TurnDriver::parked where they exist, so the cases also build at main.
+// Host::settle and TurnDriver::evicted where they exist, so the cases also build at main.
 template <class H> void settle(H& host) { if constexpr (requires { host.settle(0u); }) { host.settle(0u); } }
-template <class D> bool parked(D& turns, std::uint64_t group) {
-	if constexpr (requires { turns.parked(group); }) { return turns.parked(group); } else { return false; }
+template <class D> bool evicted(D& turns, std::uint64_t group) {
+	if constexpr (requires { turns.evicted(group); }) { return turns.evicted(group); } else { return false; }
 }
 // A recover of the group refused as busy, as a held owner lock is.
 bool busy(Shared& node, std::uint64_t group) {
@@ -2209,7 +2209,7 @@ void park_count() {
 			<< " B per group; log segments " << turns.log().data_segments().size() << "\n";
 		check(parked == ids, "every idle released group parks");
 		std::uint64_t in_log = 0, open = 0;
-		for (std::uint64_t group = 1; group <= ids; ++group) { in_log += turns.holds(group) || turns.parked(group); }
+		for (std::uint64_t group = 1; group <= ids; ++group) { in_log += turns.holds(group) || turns.evicted(group); }
 		for (std::uint64_t group = 1; group <= ids; group += ids / 97 + 1) { open += host.status(group) != GroupStatus::closed; }
 		check(in_log == 0 && open == 0, "a parked group is closed in the table and the log holds nothing of it");
 		check(turns.log().data_segments().size() <= turns_options.retain_segments, "the log keeps only the busy group's window: " + std::to_string(turns.log().data_segments().size()) + " segments");
@@ -2249,8 +2249,8 @@ void reopen_heap() {
 	settle(*node.host);
 	const auto settled = heap::bytes.load();
 	bool all = true;
-	for (std::uint64_t group = 1; group <= ids; ++group) { all &= parked(node.turns(), group); }
-	check(all, "settle parks every released group");
+	for (std::uint64_t group = 1; group <= ids; ++group) { all &= evicted(node.turns(), group); }
+	check(all, "settle evicts every released group");
 	const double before = double(held - empty) / ids, after = double(settled - empty) / ids;
 	std::cout << "reopen_heap: " << ids << " released groups, " << before << " B per group before settle, " << after << " B after\n";
 	if (heap::checked("reopen_heap")) { check(after < before && after < 400, "a released group keeps little of the host's heap"); }

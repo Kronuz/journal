@@ -496,7 +496,7 @@ void loop_views() {
 				for (std::size_t i = 0; i < viewed || done < 2; ++i) {
 					auto view = host.group_io(seen[loop][i % viewed]);
 					if (i % 4 == 0 && held[loop].size() < viewed) { held[loop].push_back(std::move(view)); }
-					if (i < created) { views[loop].push_back(host.group_io(made[loop][i])); host.create_group(made[loop][i]); }
+					if (i < created) { views[loop].push_back(host.group_io(made[loop][i])); host.create_group(made[loop][i]); host.next_artifact(made[loop][i]); }
 					if (i + 1 == created) { ++done; }
 				}
 			});
@@ -763,7 +763,7 @@ void view_sweep() {
 	}
 	check(largest <= bound && largest > live, "dead views gather and are swept within twice the live ids: " + std::to_string(largest));
 	const std::set<std::string> first{"artifact-" + hd::hex(1, 16) + hd::hex(0, 16)};
-	for (std::uint64_t g = 1; g <= live; ++g) { host.create_group(g); node.io->create_exclusive(hd::artifact_name(g, 1, 0)); }
+	for (std::uint64_t g = 1; g <= live; ++g) { host.create_group(g); host.next_artifact(g); node.io->create_exclusive(hd::artifact_name(g, 1, 0)); }
 	for (std::size_t i = 0; i < views.size(); ++i) {
 		check(listing(*views[i]) == first, "a held view lists its group's first artifact: group " + std::to_string(1 + i / 2));
 	}

@@ -15,11 +15,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   one commit for them all. A parked group is a closed entry: no log record, no heap, 45 bytes plus
   its checkpoint in its shard ([docs/design/idle-groups.md](docs/design/idle-groups.md)).
 - `TurnDriver::before_turn(hook)`: a host's table commit, run before each turn with records.
-- `TurnLog::peek(group)` reads a group's live records without unparking it; `TurnLog::idle()`
+- `TurnLog::peek(group)` reads a group's live records without restoring it; `TurnLog::idle()`
   lists the groups whose only live record is a checkpoint.
 
 ### Changed
 
+- The in-memory release step is renamed evict: `TurnDriver::evict`, `TurnDriver::evicted`,
+  `TurnLog::evict` and `TurnLog::evicted` replace `park` and `parked`, which now name the durable
+  table state alone (`Host::park`).
 - `Host::create_group` and `Host::reopen_group` no longer commit their shard when they return:
   the loop's changed slots commit before its next turn with records, so each transition is
   durable before the turn carrying the group's first record, and a turn pays one batched file
