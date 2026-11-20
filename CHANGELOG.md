@@ -10,6 +10,9 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Fixed
 
+- A `TurnDriver::wake()` from another thread ends the blocking entry's sleep toward a deadline
+  at once, as it resumes `run()`: the woken turn commits on the entry's next pass instead of when
+  the deadline fires. `TurnDriver::Hold` takes the holder's loop, where `wake()` posts.
 - A `Store::close` whose table commit fails no longer leaves its group appendable in the live
   Host while the shard on disk may say closed, which a later directory sync and a power cut
   turned into a lost group. The Store is fenced and the group is in doubt: `create` and `recover`
