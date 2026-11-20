@@ -37,6 +37,7 @@
 #include <mutex>
 #include <random>
 #include <thread>
+#include <type_traits>
 
 namespace j = kronuz::journal;
 namespace fl = kronuz::faultlab;
@@ -558,10 +559,32 @@ struct NoPostCall {
 		while (!ready.empty()) { auto h = ready.front(); ready.pop_front(); h.resume(); }
 	}
 };
+// journal-hold-loop-required A1 (D131). A Hold takes its loop: one built without it does not
+// compile, and an empty loop is refused before the driver is held.
+void hold_loop() {  // wake_refused runs it
+	fl::filesystem disk; fl::io io(disk);
+	j::TurnDriver driver(io, identity, options);
+	check(!std::is_constructible_v<j::TurnDriver::Hold, j::TurnDriver&, j::TurnDriver::Holder>, "a Hold without a loop does not compile");
+	for (auto holder : {j::TurnDriver::Holder::driver, j::TurnDriver::Holder::entry}) {
+		std::string error;
+		try { j::TurnDriver::Hold hold(driver, holder, task::scheduler_ref{}); }
+		catch (const std::logic_error& refused) { error = refused.what(); }
+		check(error == "a Hold needs a loop", "an empty loop is refused: " + error);
+		check(driver.holder() == j::TurnDriver::Holder::none, "the refused Hold leaves the driver free");
+	}
+	task::inline_scheduler loop;
+	{
+		j::TurnDriver::Hold hold(driver, j::TurnDriver::Holder::entry, task::scheduler_ref::of(loop));
+		check(driver.holder() == j::TurnDriver::Holder::entry, "a Hold with a loop holds the driver");
+	}
+	check(driver.holder() == j::TurnDriver::Holder::none, "the Hold releases the driver");
+}
+
 // journal-host-guards A2. run() refuses a loop whose scheduler declares no post_call, before it
 // holds the driver, so no wake() is refused while it serves; the wake it could not carry stays
 // asked for, and run() on a loop with post_call seals the woken record.
 void wake_refused() {
+	hold_loop();
 	fl::filesystem disk; fl::io io(disk);
 	j::TurnDriver driver(io, identity, options);
 	j::InlineCompletion inline_io; task::cancel_source stop;
