@@ -207,14 +207,15 @@ public:
 	}
 	bool sealed(std::uint64_t group) const { std::lock_guard hold(sealers_mutex_); return sealers_.contains(group); }
 	// Any thread, under any lock: an open record took its first transaction, so the next turn
-	// seals it. Takes only a lock no sealer call runs under; reaches run() through its loop's
-	// post_call, which run() requires, and the blocking entry at its next pass. From another
+	// seals it. Takes only a lock no sealer call runs under; posts to the holder's loop (Hold):
+	// run()'s, which it resumes, or the blocking entry's, whose sleep the post ends. From another
 	// thread, that post_call must be thread-safe: task's asio_scheduler and blocking_scheduler
 	// are; inline_scheduler is not.
 	void wake() noexcept {
 		if (woken_.exchange(true, std::memory_order_acq_rel)) { return; }
 		std::lock_guard hold(loop_mutex_);
-		if (!wakeup_) { return; }
+		if (!loop_) { return; }
+		if (!wakeup_) { loop_.post_call([](void*) {}, nullptr); return; }  // the entry reads idle() on its next pass
 		wakeup_->refs.fetch_add(1, std::memory_order_relaxed);
 		loop_.post_call(&TurnDriver::woken, wakeup_);  // never refused: run() checked its loop
 	}
@@ -309,17 +310,17 @@ public:
 	task::task<void> run(completion_ref io, task::cancel_token stop = {}) {
 		// scheduler_ref::post_call is refused only by a scheduler that declares none.
 		if (!task::current().post_call([](void*) {}, nullptr)) { throw std::logic_error("run() needs a loop whose scheduler declares post_call"); }
-		Hold hold(*this, Holder::driver);
+		Hold hold(*this, Holder::driver, task::current());
 		struct Loop {
 			TurnDriver& turns;
 			explicit Loop(TurnDriver& driver) : turns(driver) {
 				auto* wakeup = new Wakeup{&driver};
-				std::lock_guard hold(turns.loop_mutex_); turns.loop_ = task::current(); turns.wakeup_ = wakeup;
+				std::lock_guard hold(turns.loop_mutex_); turns.wakeup_ = wakeup;
 			}
 			// A wake still queued on the loop finds no driver: the owner may destroy it now.
 			~Loop() {
 				Wakeup* wakeup = nullptr;
-				{ std::lock_guard hold(turns.loop_mutex_); turns.loop_ = {}; wakeup = std::exchange(turns.wakeup_, nullptr); }
+				{ std::lock_guard hold(turns.loop_mutex_); wakeup = std::exchange(turns.wakeup_, nullptr); }
 				wakeup->driver.store(nullptr, std::memory_order_release);
 				Wakeup::release(wakeup);
 			}
@@ -360,18 +361,22 @@ public:
 	}
 
 	// Who drives the turns: none, run() (a reactor loop), or the blocking entry. Each refuses
-	// a driver the other holds.
+	// a driver the other holds. The holder's loop, which outlives the hold, is where wake() posts.
 	enum class Holder : std::uint8_t { none, driver, entry };
 	Holder holder() const noexcept { return holder_; }
 	struct Hold {
 		TurnDriver& turns;
-		Hold(TurnDriver& driver, Holder holder) : turns(driver) {
+		Hold(TurnDriver& driver, Holder holder, task::scheduler_ref loop = {}) : turns(driver) {
 			if (turns.holder_ != Holder::none) { throw std::logic_error("the turn driver is held by another driver"); }
+			{ std::lock_guard hold(turns.loop_mutex_); turns.loop_ = loop; }
 			turns.holder_ = holder;
 		}
 		Hold(const Hold&) = delete;
 		Hold& operator=(const Hold&) = delete;
-		~Hold() { turns.holder_ = Holder::none; }
+		~Hold() {
+			{ std::lock_guard hold(turns.loop_mutex_); turns.loop_ = {}; }
+			turns.holder_ = Holder::none;
+		}
 	};
 
 	TurnLog& log() noexcept { return log_; }
@@ -685,8 +690,8 @@ private:
 	std::uint64_t next_seal_ = 0;
 	bool sealing_ = false;
 	std::atomic<bool> woken_{false};
-	std::mutex loop_mutex_;  // guards loop_ for wake(); a leaf: nothing else is taken under it
-	task::scheduler_ref loop_;  // run()'s loop, while it runs
+	std::mutex loop_mutex_;  // guards loop_ and wakeup_ for wake(); only the loop's post is taken under it
+	task::scheduler_ref loop_;  // the holder's loop, while it holds the driver
 	Wakeup* wakeup_ = nullptr;  // run()'s, while it runs
 	std::optional<TurnLog::TurnWrite> write_;
 	detail::TurnWaiter* waiters_ = nullptr;
