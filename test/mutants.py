@@ -126,7 +126,7 @@ MUTANTS = {
     "split-keeps-parent": ("include/journal/host.h",
         "\tif (!rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {",
         "\tif (!stored && !rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {",
-        "journal_host_test", ["split_crash"]),
+        "journal_host_test", ["split_stale_node"]),
     # A split node removed before its children are durable: a crash loses its entries.
     "split-removes-early": ("include/journal/host.h",
         "\t\tio_->sync_directory();\n\t\tfor (auto slot : slots) { orphans_[slot].clear(); }\n\t\tfor (auto shard : split) {",

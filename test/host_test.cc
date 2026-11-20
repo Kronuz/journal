@@ -969,6 +969,43 @@ void split_crash() {
 	std::cout << "split_crash: " << cut - 1 << " power cuts, every one of them recovered\n";
 }
 
+// A split node's removal is durable only with a later directory sync: open() finds the node beside
+// the children that cover it, and the children, which are newer, win.
+void split_stale_node() {
+	fl::filesystem disk;
+	const auto ids = idle::slot_ids(7, 1, 160);
+	const std::string root = "groups-" + hd::hex(7, 3) + "-" + hd::hex(1, 9);
+	std::string stale;
+	{
+		auto host = idle::open(disk, 1);
+		auto& turns = host->driver(0);
+		for (std::size_t i = 0; i < 40; ++i) { host->create_group(ids[i]); turns.stage(j::TurnRecord{ids[i], 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(ids[i])}); }
+		idle::commit(*host);
+		for (std::size_t i = 0; i < 40; ++i) { host->hold(ids[i]); }
+		idle::park(*host);
+		stale = std::string(disk.view("host/" + root));
+		for (std::size_t i = 40; i < 160; ++i) { host->create_group(ids[i]); turns.stage(j::TurnRecord{ids[i], 1, j::TurnRecordKind::Checkpoint, "s" + std::to_string(ids[i])}); }
+		idle::commit(*host);
+		for (std::size_t i = 40; i < 160; i += 2) { host->hold(ids[i]); }
+		idle::park(*host);
+	}
+	check(idle::shard_files(disk, 7) > 1 && !host_io(disk)->entry_footprint(root), "the slot's root split");
+	{
+		auto file = host_io(disk)->create_exclusive(root);
+		file->write_at(0, stale); file->sync();
+		host_io(disk)->sync_directory();
+	}
+	auto host = idle::open(disk, 1);
+	check(!host_io(disk)->entry_footprint(root), "open drops the node its children cover");
+	for (std::size_t i = 0; i < 160; ++i) {
+		const auto g = ids[i];
+		const bool parked = i < 40 || i % 2 == 0;
+		const auto name = (i < 40 ? "p" : "s") + std::to_string(g);
+		if (parked) { check(host->status(g) == j::GroupStatus::closed && host->entry(g)->manifest == name, "a parked group reads from the split's children: " + std::to_string(i)); }
+		else { check(host->status(g) == j::GroupStatus::stored && host->driver(0).records(g).size() == 1, "an open group keeps its entry: " + std::to_string(i)); }
+	}
+}
+
 // journal-idle-groups Q3: a damaged table shard fails only the groups it holds. The host opens;
 // every id of that shard, parked, open or never created, is lost; every other group recovers.
 void table_damage() {
@@ -1134,7 +1171,7 @@ int main(int argc, char** argv) {
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"close_in_doubt", close_in_doubt}, {"failed_close_crash", failed_close_crash}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
 		{"loop_views", loop_views}, {"idle_crash", idle_crash}, {"idle_damage", idle_damage},
-		{"split_crash", split_crash}, {"table_damage", table_damage}, {"park_mid_turn", park_mid_turn}};
+		{"split_crash", split_crash}, {"table_damage", table_damage}, {"park_mid_turn", park_mid_turn}, {"split_stale_node", split_stale_node}};
 	// Pending another quest's fix: run by name only.
 	const std::vector<std::pair<std::string, void (*)()>> pending{{"idle_unmanifested", idle_unmanifested}};
 	for (const auto& [name, run] : pending) {

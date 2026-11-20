@@ -2221,9 +2221,10 @@ void park_count() {
 		// One transition at a time at full size: a sample woken (one turn each), then parked again
 		// (one park each). The table bytes each transition writes, and its time; with
 		// JOURNAL_DISK_DIR, again over a copy of the host's directory on that real filesystem.
-		auto transitions = [&](Host& on, const std::string& where) {
+		auto transitions = [&](Host& on, const std::string& where, std::uint64_t most) {
 			auto& driver = on.driver(0);
-			const std::uint64_t sample = std::max<std::uint64_t>(1, std::min<std::uint64_t>(ids / 4, 1000)), step = ids / sample;
+			on.park(0);  // a reopened copy's idle busy group, off the clock
+			const std::uint64_t sample = std::max<std::uint64_t>(1, std::min<std::uint64_t>(ids / 4, most)), step = ids / sample;
 			const auto bytes = table_bytes, files = table_files;
 			const auto began = std::chrono::steady_clock::now();
 			std::uint64_t woken = 0, again = 0;
@@ -2244,7 +2245,7 @@ void park_count() {
 				<< " table B and " << double(table_files - files) / count << " table files written per transition, " << 1e6 * elapsed / count << " us each\n";
 			check(again == woken, "every woken sample parks again" + where);
 		};
-		transitions(host, "");
+		transitions(host, "", 1000);
 		if (const char* real = std::getenv("JOURNAL_DISK_DIR")) {
 			const std::filesystem::path directory = std::filesystem::path(real) / "park_count";
 			std::filesystem::remove_all(directory); std::filesystem::create_directories(directory);
@@ -2254,7 +2255,7 @@ void park_count() {
 			}
 			{
 				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory)), reopen_host, HostOptions{1, turns_options});
-				transitions(copy, " on " + std::string(real));
+				transitions(copy, " on " + std::string(real), 100);  // each syncs for real
 			}
 			std::filesystem::remove_all(directory);
 		}
