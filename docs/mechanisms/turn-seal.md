@@ -219,12 +219,13 @@ waiter is linked with `s` above the group's last staged sequence. That is how a 
 an open record gets it written, under `run()` or the blocking entry, with no staged record and no
 new call: its watcher awaits `durable` for the open record.
 
-- `wake()` sets a flag `idle()` reads and, while `run()` serves the driver, posts to its loop to
-  resume it. The blocking entry sees it at its next pass; `wake()` posts nothing there, so a wake
-  from another thread reaches `journal::run` only while that entry sleeps toward a deadline, when
-  the deadline or another post ends the sleep. The
-  post reaches the driver only while that `run()` lasts, so the owner may destroy the driver once
-  `run()` returns with a wake still queued; that wake's flag stays set for the next turn.
+- `wake()` sets a flag `idle()` reads and posts to the loop of whoever holds the driver, which
+  `TurnDriver::Hold` names. Under `run()` the post resumes it. Under the blocking entry the post is
+  a no-op call on the entry's scheduler: it ends the entry's sleep toward a deadline at once, and
+  the entry's next pass reads `idle()` and commits the turn. The post reaches the driver only
+  while that `run()` lasts, so the owner may destroy the driver once `run()` returns with a wake
+  still queued, and the entry's no-op touches no driver at all; the flag stays set for the next
+  turn.
 - A sealer that returns nothing when offered the whole room, the turn's first with nothing pending,
   goes quiet: it owes no turn until a
   waiter links on its group again. `run()` then sleeps instead of spinning, and the blocking entry

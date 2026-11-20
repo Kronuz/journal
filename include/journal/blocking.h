@@ -83,12 +83,12 @@ template <class T> EntryRoot entry_root(task::task<T> work, EntryResult<T>& resu
 // holds is refused). Each pass runs the scheduler until its queue is empty; staged records
 // are then committed inline; a finished task returns only once nothing is staged; otherwise,
 // with an operation deadline armed it sleeps toward it (a post from another thread, such as a
-// cancel's hop, cuts the sleep short), and with none it throws `stalled`. A turn that fails
+// cancel's hop or a wake(), cuts the sleep short), and with none it throws `stalled`. A turn that fails
 // is the task's to see; if the task succeeds anyway, the entry throws the turn's failure.
 // After `stalled`, the scheduler may still queue a cancel's hop into the destroyed task: the
 // caller drops it and never drives it again.
 template <class T> T run(TurnDriver& turns, task::blocking_scheduler& scheduler, task::task<T> work) {
-	TurnDriver::Hold hold(turns, TurnDriver::Holder::entry);
+	TurnDriver::Hold hold(turns, TurnDriver::Holder::entry, task::scheduler_ref::of(scheduler));
 	detail::EntryResult<T> result;
 	auto root = detail::entry_root(std::move(work), result);
 	struct Destroy { std::coroutine_handle<> handle; ~Destroy() { handle.destroy(); } } destroy{root.handle};
