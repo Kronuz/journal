@@ -11,12 +11,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 ### Fixed
 
 - `TurnLog` recovery no longer drops acknowledged records silently when a damaged block is
-  followed by a block whose header, the damaged block's manifest, is damaged too. A header that
-  fails while a fragment of its segment starts in the same 512-byte sector is damage, which no
-  crash leaves: past the last kept turn it is reported instead of read as a torn tail. Damage
-  that no manifest names now costs every group, where it cost only those that wrote nothing
-  after it: a forwarded copy after the damage read as such a write and kept a group whose newer
-  records the damage held.
+  followed by a block whose header, the damaged block's manifest, is damaged too. A header or
+  fragment that fails while its 512-byte sector holds bytes bound to its segment is damage,
+  which no crash leaves: past the last kept turn it is reported instead of read as a torn tail,
+  and the turns dropped there cost every group with a record in them. Damage that no manifest
+  names now costs every group, where it cost only those that wrote nothing after it: a
+  forwarded copy after the damage read as such a write and kept a group whose newer records the
+  damage held. A byte-granular cut inside a sector, which the sector crash model never leaves,
+  now reads as damage.
 
 ## 2026-11-19
 

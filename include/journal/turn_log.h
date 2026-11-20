@@ -139,7 +139,7 @@ inline std::optional<std::uint64_t> segment_number(std::string_view name) {
 // read back as current (unwritten, stale, or damaged).
 struct Item {
 	bool gap = false, tail = false;  // a tail: a segment's gap after its last record
-	bool damage = false;  // a gap holding a header no crash leaves: damaged_header
+	bool damage = false;  // a gap holding damage no crash leaves: damaged_header, damaged_fragment
 	std::uint64_t epoch = 0;
 	std::uint8_t kind = 0;
 	std::uint64_t turn = 0, group = 0, sequence = 0;
@@ -149,18 +149,36 @@ struct Item {
 // Per described block: its groups' highest sequences, and where the header naming them is.
 struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0, epoch = 0; std::uint32_t block = 0; };
 using Manifests = std::map<std::pair<std::uint64_t, std::uint32_t>, BlockManifest>;
-// Whether a block whose header fails is damaged: a fragment of this segment starts in the
-// header's 512-byte sector. A crash leaves each sector old or new, and no earlier use of the
-// file holds this segment's fragments, so the sector is this segment's, whose header verified.
-inline bool damaged_header(std::string_view block, std::uint64_t offset, std::uint64_t segment) {
-	const auto sector = framing::sector_bytes - offset % framing::sector_bytes;  // the block's bytes in it
-	for (std::uint16_t count = 0; framing::header_bytes(count) < sector; ++count) {  // the count may be the damage
-		const auto size = framing::header_bytes(count);
-		if (size + framing::fragment_header > block.size()) { break; }
-		const auto at = block.substr(size);
-		if (framing::parse_fragment(at, block.size() - size, segment, framing::peek64(at.substr(16))).check == framing::Check::ok) { return true; }
+// Damage no crash leaves, found where a block's header or a fragment fails to verify. A crash
+// leaves each 512-byte sector old or new, and no earlier use of a recycled file holds bytes
+// bound to this segment, so a sector holding them is this segment's: what it holds of the log
+// verified, unless a sector boundary cuts it.
+inline bool verifies_in_sector(std::string_view block, std::size_t from, std::size_t end, std::uint64_t segment) {
+	for (auto p = from; p < end && p + framing::fragment_header <= block.size(); ++p) {
+		const auto at = block.substr(p);
+		if (framing::parse_fragment(at, block.size() - p, segment, framing::peek64(at.substr(16))).check == framing::Check::ok) { return true; }
 	}
 	return false;
+}
+inline std::size_t sector_end(std::string_view block, std::uint64_t offset, std::size_t at) {
+	return std::min<std::size_t>(block.size(), at + framing::sector_bytes - (offset + at) % framing::sector_bytes);
+}
+// A header that fails while a fragment of this segment starts in its sector.
+inline bool damaged_header(std::string_view block, std::uint64_t offset, std::uint64_t segment) {
+	return verifies_in_sector(block, framing::header_bytes(0), sector_end(block, offset, 0), segment);
+}
+// A fragment at `at` that fails while its sector is this segment's: its header names this
+// segment and epoch, or a later fragment of the segment starts there. Whole in its sector, or
+// with a header no writer emits, it is damage.
+inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch) {
+	const auto end = sector_end(block, offset, at);
+	if (verifies_in_sector(block, at + 1, end, segment)) { return true; }
+	if (at + framing::fragment_header > end) { return false; }
+	const auto bytes = block.substr(at);
+	if (framing::peek64(bytes.substr(8)) != segment || framing::peek64(bytes.substr(16)) != epoch) { return false; }
+	const std::size_t length = framing::get16(bytes.substr(4)); const auto type = static_cast<std::uint8_t>(bytes[6]);
+	if (!length || framing::fragment_header + length > block.size() - at || type < framing::Full || type > framing::Last || bytes[7]) { return true; }
+	return at + framing::fragment_header + length <= end;
 }
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
 	std::uint64_t here = 0;
@@ -187,7 +205,11 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		std::size_t position = header.size;
 		while (options.block_bytes - position >= framing::fragment_header + 1) {
 			const auto fragment = framing::parse_fragment(view.substr(position), options.block_bytes - position, segment, epoch);
-			if (fragment.check != framing::Check::ok) { gap(); assembling = false; break; }
+			if (fragment.check != framing::Check::ok) {
+				gap(); assembling = false;
+				if (damaged_fragment(view, offset, position, segment, epoch)) { items.back().damage = true; }
+				break;
+			}
 			const auto type = fragment.type; const auto payload = fragment.payload; const auto length = payload.size();
 			position += framing::fragment_header + length;
 			if (type == framing::Full || type == framing::First) {
@@ -648,10 +670,18 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			for (auto r : turn.records) { kept_records.push_back(r); }
 			last_turn = number; expected = number + 1; previous_end = turn.end + 1; keep_end(open.epoch, turn.end);
 		}
-		// Past the newest epoch's last kept turn, a damaged header may hide acknowledged turns
-		// that nothing after it shows, so it is damage: a torn tail never leaves one. In an
-		// earlier epoch, the next open names the turns it kept.
-		if (newest_epoch) { for (std::size_t i = previous_end; i < stop; ++i) { if (items[i].damage) { gap_damage(i); } } }
+		// Past the newest epoch's last kept turn, damage no crash leaves may hide acknowledged
+		// turns that nothing after it shows: it costs what any gap costs, and the turns dropped
+		// there cost every group with a record in them. In an earlier epoch, the next open names
+		// the turns it kept.
+		if (newest_epoch) {
+			bool hidden = false;
+			for (std::size_t i = previous_end; i < stop; ++i) { if (items[i].damage) { gap_damage(i); hidden = true; } }
+			for (std::size_t i = previous_end; hidden && i < stop; ++i) {
+				const auto& item = items[i];
+				if (!item.gap && item.group && item.epoch == open.epoch && item.turn > last_turn && !superseded(item.group, item.sequence)) { named.insert(item.group); }
+			}
+		}
 		if (!newest_epoch && last_turn != limit && limit != std::numeric_limits<std::uint64_t>::max()) {
 			damaged = true; missing_between(previous_end, stop, previous_end);
 			last_turn = limit;
