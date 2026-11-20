@@ -28,6 +28,7 @@
 #include "journal/store.h"
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -341,6 +342,33 @@ void cancel_hops() {
 	loop.run();
 	check(wait.done && throws<task::cancelled>(wait.error) && core.turns->waiting_groups().empty(), "the loop's hop unlinks it and resumes it cancelled");
 }
+// A scheduler that declares post and now only, no post_call; one thread drives it with run().
+struct NoPostCall {
+	std::deque<std::coroutine_handle<>> ready;
+	void post(std::coroutine_handle<> h) { ready.push_back(h); }
+	std::uint64_t now() const noexcept { return 0; }
+	void run() {
+		task::running_on scope(task::scheduler_ref::of(*this));
+		while (!ready.empty()) { auto h = ready.front(); ready.pop_front(); h.resume(); }
+	}
+};
+// Review F6: cancel_hops on a scheduler that declares no post_call. A cancel from another
+// thread between drives must still leave the waiter linked for the loop, its thread joined.
+void cancel_bare_home() {
+	Core core;
+	core.store(15);
+	NoPostCall bare;
+	task::cancel_source caller;
+	Outcome<int> wait;
+	task::spawn(task::scheduler_ref::of(bare), capture(wait, [&]() -> task::task<int> { co_await core.turns->durable(15, 2, caller.token()); co_return 0; }));
+	bare.run();
+	check(!wait.done && core.turns->waiting_groups() == std::vector<std::uint64_t>{15}, "the waiter is linked");
+	std::thread other([&] { caller.request(); });
+	other.join();
+	check(core.turns->waiting_groups() == std::vector<std::uint64_t>{15}, "the cancelling thread leaves the waiter linked for the loop");
+	bare.run();
+	check(wait.done && throws<task::cancelled>(wait.error) && core.turns->waiting_groups().empty(), "the waiter resumes cancelled, unlinked");
+}
 // A cancel from another thread while the loop links and unlinks other waiters: the callback
 // only claims and hops, so the loop alone touches the driver's waiters (run under TSan).
 void entry_threads_busy() {
@@ -423,7 +451,7 @@ int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"runner", runner}, {"cancel_waiting", cancel_waiting}, {"cancel_races_barrier", cancel_races_barrier}, {"failed_turn", failed_turn},
 		{"entry_append", entry_append}, {"entry_lost_wake", entry_lost_wake}, {"entry_live_token", entry_live_token},
-		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy}, {"cancel_hops", cancel_hops},
+		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy}, {"cancel_hops", cancel_hops}, {"cancel_bare_home", cancel_bare_home},
 		{"entry_wake_threads", entry_wake_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
