@@ -2186,6 +2186,11 @@ void park_count() {
 		Shared node(disk, turns_options);
 		auto& host = *node.host;
 		auto& turns = node.turns();
+		// A held group whose record starts in the first segment: the forward scan runs whenever its
+		// segment is the oldest past retention.
+		const std::uint64_t anchor = ids + 2;
+		host.create_group(anchor);
+		turns.stage(TurnRecord{anchor, 1, TurnRecordKind::Checkpoint, "anchor"});
 		for (std::uint64_t low = 1; low <= ids; low += batch) {
 			const auto high = std::min(ids + 1, low + batch);
 			for (auto group = low; group < high; ++group) {
@@ -2202,7 +2207,12 @@ void park_count() {
 		host.create_group(busy);
 		turns.stage(TurnRecord{busy, 1, TurnRecordKind::Checkpoint, "busy"});
 		node.commit();
-		for (std::uint64_t s = 2; s < 2 + 64; ++s) { turns.stage(TurnRecord{busy, s, TurnRecordKind::Checkpoint, std::string(128u << 10, 'b'), s - 1}); node.commit(); }
+		const auto scanned = turns.log().stats().forward_scanned, forwarding = turns.log().stats().turns, forwarded = turns.log().stats().forwarded_records;
+		for (std::uint64_t s = 2; s < 2 + 192; ++s) { turns.stage(TurnRecord{busy, s, TurnRecordKind::Checkpoint, std::string(128u << 10, 'b'), s - 1}); node.commit(); }
+		// The forward scan walks the log's live records each turn: none of a parked group's.
+		const double per_turn = double(turns.log().stats().forward_scanned - scanned) / double(turns.log().stats().turns - forwarding);
+		std::cout << "park_count: the forward scan visits " << per_turn << " live records per turn over " << ids << " parked groups (" << turns.log().stats().forwarded_records - forwarded << " forwarded)\n";
+		check(turns.log().stats().forward_scanned > scanned && per_turn <= 2, "the forward scan runs and skips parked groups: " + std::to_string(per_turn) + " records per turn");
 		const auto last = heap::bytes.load();
 		const double slope = ids > batch ? double(last - first) / double(ids - batch) : 0;
 		std::uint64_t table = 0;

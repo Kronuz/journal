@@ -87,6 +87,7 @@ struct TurnLogGroups {
 struct TurnLogStats {
 	std::uint64_t turns = 0, barriers = 0, bytes_appended = 0, bytes_written = 0, segments_prepared = 0, prepared_inline = 0;
 	std::uint64_t forwarded_records = 0, forwarded_bytes = 0, segments_recycled = 0, segments_removed = 0;
+	std::uint64_t forward_scanned = 0;  // live records forward_slice visited: grows with the groups in the log
 };
 
 namespace turn_log_detail {
@@ -435,6 +436,7 @@ private:
 		std::size_t bytes = 0;
 		// Copies one live record of the oldest segment; true once the slice is full.
 		auto forward = [&](std::uint64_t group, std::uint64_t sequence, const Live& live) {
+			++stats_.forward_scanned;
 			if (live.segment != oldest) { return false; }
 			auto record = framing::read_record(reader(oldest), turn_log_detail::stream(identity_, options_.block_bytes, oldest, live.epoch), live.offset);
 			std::string_view logical = record; logical.remove_prefix(turn_log_detail::record_header);
