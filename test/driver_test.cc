@@ -30,6 +30,7 @@
 #include <chrono>
 #include <functional>
 #include <iostream>
+#include <mutex>
 #include <thread>
 
 namespace j = kronuz::journal;
@@ -374,6 +375,48 @@ void entry_threads_busy() {
 	}
 	check(cancelled == rounds, "every cancel lands while the loop is busy (" + std::to_string(cancelled) + " of " + std::to_string(rounds) + ")");
 }
+// A wake() from another thread ends the entry's sleep toward a 10 s deadline at once: the
+// sealer's quiet group gets its open record written and the waiter returns, round after round
+// (run under TSan). An entry deaf to the wake sleeps out the deadline and the round fails.
+void entry_wake_threads() {
+	constexpr int rounds = 100;
+	fl::filesystem disk; fl::io io(disk);
+	j::TurnDriver driver(io, log_identity, options);
+	struct Open { std::mutex mutex; std::string payload; std::uint64_t sequence = 0; } open;
+	driver.seal(1, [&](std::uint64_t, bool) -> std::optional<j::TurnRecord> {
+		std::lock_guard hold(open.mutex);
+		if (open.payload.empty()) { return std::nullopt; }
+		return j::TurnRecord{1, open.sequence, j::TurnRecordKind::Batch, std::exchange(open.payload, {})};
+	});
+	int durable = 0;
+	auto slowest = std::chrono::steady_clock::duration::zero();
+	for (int round = 0; round < rounds; ++round) {
+		const auto sequence = driver.sequence(1) + 1;
+		task::blocking_scheduler scheduler;
+		std::atomic<bool> waiting{false};
+		auto work = [&]() -> task::task<void> {
+			task::deadline<task::blocking_scheduler> limit(scheduler, std::chrono::steady_clock::now() + std::chrono::seconds(10));
+			waiting.store(true, std::memory_order_release);
+			co_await driver.durable(1, sequence, limit.token());  // the sealer has nothing: the entry sleeps
+		};
+		std::thread writer([&] {
+			while (!waiting.load(std::memory_order_acquire)) { std::this_thread::yield(); }
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+			std::lock_guard hold(open.mutex);
+			open.sequence = sequence; open.payload = "w";
+			driver.wake();  // the record's first transaction, under its mutex
+		});
+		const auto started = std::chrono::steady_clock::now();
+		bool woken = true;
+		try { j::run(driver, scheduler, work()); ++durable; } catch (const std::exception& error) { woken = false; check(false, std::string("a woken round threw: ") + error.what()); }
+		writer.join();
+		slowest = std::max(slowest, std::chrono::steady_clock::now() - started);
+		if (!woken) { break; }  // one deadline slept out is the failure; the rest would repeat it
+	}
+	check(durable == rounds && driver.sequence(1) == rounds, "every woken record is durable (" + std::to_string(durable) + " of " + std::to_string(rounds) + ")");
+	check(slowest < std::chrono::seconds(5), "no round waits for its deadline");
+	std::cout << "entry_wake_threads: slowest round " << std::chrono::duration_cast<std::chrono::microseconds>(slowest).count() << " us\n";
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -381,6 +424,7 @@ int main(int argc, char** argv) {
 		{"runner", runner}, {"cancel_waiting", cancel_waiting}, {"cancel_races_barrier", cancel_races_barrier}, {"failed_turn", failed_turn},
 		{"entry_append", entry_append}, {"entry_lost_wake", entry_lost_wake}, {"entry_live_token", entry_live_token},
 		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy}, {"cancel_hops", cancel_hops},
+		{"entry_wake_threads", entry_wake_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	for (const auto& [name, run] : cases) {
