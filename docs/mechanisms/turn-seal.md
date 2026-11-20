@@ -27,15 +27,16 @@ void TurnDriver::wake() noexcept;  // any thread
   lower sequence.
 - **Repeat calls.** A sealer that returns a record is called again at once, with the room left,
   until it returns nothing or less than `record_cost(0)` is left; then the next group's sealer is
-  called. A sealer holding several closed records hands them over one per call, each in sequence. The driver is loop-confined like the rest of `TurnDriver`: `seal`, `forget` and the
-  sealers run on the loop's thread; `unseal()` and `wake()` may come from any thread.
+  called. A sealer holding several closed records hands them over one per call, each in sequence. The driver is loop-confined like the rest of `TurnDriver`: `seal`, `forget`, `durable()` and
+  the sealers run on the loop's thread; `unseal()` and `wake()` may come from any thread.
 - **The loop's scheduler.** `wake()` reaches `run()` through its loop's `post_call`, so `run()`
   throws `std::logic_error` before it holds the driver when that scheduler declares none: no
   wake is ever refused while it serves. A `wake()` from another thread needs that `post_call` to
   be thread-safe, as task's `asio_scheduler` and `blocking_scheduler` are; `inline_scheduler`'s is
   not, so on it only the loop's own thread calls `wake()`. A `durable()` wait that suspends needs
-  the same of its caller's scheduler, where its token's callback hops to unlink it: on one that
-  declares none, it throws `std::logic_error` before it links.
+  its caller's scheduler, not `run()`'s loop, to declare `post_call`, where its token's callback
+  hops to unlink it: on one that declares none, it throws `std::logic_error` before it links,
+  whatever its token.
 - **Lock order: the turn, then the group's record mutex.** The turn is the loop's own context; the
   driver holds no lock of its own while a sealer runs, so a sealer takes its record mutex freely.
   The sealer table has its own mutex, taken only around table reads and writes, never across a

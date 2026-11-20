@@ -11,9 +11,9 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 ### Fixed
 
 - A `TurnDriver::durable()` wait cancelled from another thread no longer unlinks its waiter on
-  the cancelling thread, racing the loop's list, when the caller's scheduler declares no
-  `post_call`: such a wait throws `std::logic_error` before it links, and the token's callback
-  always hops to the caller's loop.
+  the cancelling thread, racing the loop's list. Any `durable()` wait that suspends on a
+  scheduler that declares no `post_call` now throws `std::logic_error` before it links, whatever
+  its token, even none; the token's callback always hops to the caller's loop.
 - A `TurnDriver::wake()` from another thread ends the blocking entry's sleep toward a deadline
   at once, as it resumes `run()`: the woken turn commits on the entry's next pass instead of when
   the deadline fires. `TurnDriver::Hold` takes the holder's loop, where `wake()` posts.
