@@ -26,6 +26,7 @@
 #include <set>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -2218,8 +2219,10 @@ void park_count() {
 		check(turns.log().data_segments().size() <= turns_options.retain_segments, "the log keeps only the busy group's window: " + std::to_string(turns.log().data_segments().size()) + " segments");
 		if (heap::checked("park_count") && ids > batch) { check(slope <= 1, "a parked group costs the host no heap: " + std::to_string(slope) + " B per group"); }
 		// One transition at a time at full size: a sample woken (one turn each), then parked again
-		// (one park each). The table bytes each transition writes, and its time.
-		{
+		// (one park each). The table bytes each transition writes, and its time; with
+		// JOURNAL_DISK_DIR, again over a copy of the host's directory on that real filesystem.
+		auto transitions = [&](Host& on, const std::string& where) {
+			auto& driver = on.driver(0);
 			const std::uint64_t sample = std::max<std::uint64_t>(1, std::min<std::uint64_t>(ids / 4, 1000)), step = ids / sample;
 			const auto bytes = table_bytes, files = table_files;
 			const auto began = std::chrono::steady_clock::now();
@@ -2227,19 +2230,33 @@ void park_count() {
 			for (std::uint64_t i = 0; i < sample; ++i) {
 				const auto group = 2 + i * step;  // never 1, ids / 2 or ids: the groups checked below
 				if (group == ids / 2 || group >= ids) { continue; }
-				const auto entry = host.entry(group);
-				host.reopen_group(group);
-				const auto at = std::max(entry->base, turns.retired(group)) + 1;
-				turns.stage(TurnRecord{group, at, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
-				node.commit();
-				host.hold(group);
-				again += host.park(0); ++woken;
+				const auto entry = on.entry(group);
+				on.reopen_group(group);
+				const auto at = std::max(entry->base, driver.retired(group)) + 1;
+				driver.stage(TurnRecord{group, at, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
+				while (!driver.idle()) { driver.commit(); }
+				on.hold(group);
+				again += on.park(0); ++woken;
 			}
 			const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
-			const auto transitions = double(2 * std::max<std::uint64_t>(woken, 1));
-			std::cout << "park_count: " << 2 * woken << " single transitions (wake, park) at " << ids << " groups: " << double(table_bytes - bytes) / transitions
-				<< " table B and " << double(table_files - files) / transitions << " table files written per transition, " << 1e6 * elapsed / transitions << " us each\n";
-			check(again == woken, "every woken sample parks again");
+			const auto count = double(2 * std::max<std::uint64_t>(woken, 1));
+			std::cout << "park_count: " << 2 * woken << " single transitions (wake, park) at " << ids << " groups" << where << ": " << double(table_bytes - bytes) / count
+				<< " table B and " << double(table_files - files) / count << " table files written per transition, " << 1e6 * elapsed / count << " us each\n";
+			check(again == woken, "every woken sample parks again" + where);
+		};
+		transitions(host, "");
+		if (const char* real = std::getenv("JOURNAL_DISK_DIR")) {
+			const std::filesystem::path directory = std::filesystem::path(real) / "park_count";
+			std::filesystem::remove_all(directory); std::filesystem::create_directories(directory);
+			for (const auto& name : disk.list("host")) {
+				const auto bytes = disk.view("host/" + name);
+				std::ofstream(directory / name, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+			}
+			{
+				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory)), reopen_host, HostOptions{1, turns_options});
+				transitions(copy, " on " + std::string(real));
+			}
+			std::filesystem::remove_all(directory);
 		}
 		// Waking a sample: the table's record staged again, then a batch, in one turn.
 		for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {

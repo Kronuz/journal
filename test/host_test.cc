@@ -1018,6 +1018,30 @@ void table_damage() {
 	}
 }
 
+// Q2: Host::park called mid-turn, between a turn's begin() and completed(): the groups of the
+// turn in flight stay, other idle groups park, and both survive a restart.
+void park_mid_turn() {
+	fl::filesystem disk;
+	{
+		auto host = idle::open(disk, 1);
+		auto& turns = host->driver(0);
+		for (std::uint64_t g = 1; g <= 3; ++g) { host->create_group(g); turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g)}); }
+		idle::commit(*host);
+		auto holder = host->hold(1);
+		host->hold(2);  // held, then released
+		turns.stage(j::TurnRecord{1, 2, j::TurnRecordKind::Batch, "b1"});
+		const auto& write = turns.begin();
+		holder.reset();  // released with its batch in flight
+		check(host->park(0) == 1 && host->status(2) == j::GroupStatus::closed, "mid-turn, the released group outside the turn parks");
+		check(host->status(1) == j::GroupStatus::stored, "the group in the turn in flight stays");
+		write.file->write_at(write.offset, write.bytes); write.file->sync_data(); turns.completed();
+		check(host->park(0) == 0, "after the turn, the group holds a batch: it does not park");
+	}
+	auto host = idle::open(disk, 1);
+	check(host->status(2) == j::GroupStatus::closed && host->entry(2)->manifest == "p2", "the group parked mid-turn stays parked");
+	check(host->driver(0).records(1).size() == 2 && host->driver(0).records(3).size() == 1, "the turn's group and the held one recover their records");
+}
+
 // Review F3, pending journal-double-damage: as idle_damage, with the second block's header
 // damaged too, the case main reads as no damage at all. Once recovery reports that damage, the
 // woken group, whose table entry is open before its turn (D5), is lost rather than read back as
@@ -1110,7 +1134,7 @@ int main(int argc, char** argv) {
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"close_in_doubt", close_in_doubt}, {"failed_close_crash", failed_close_crash}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
 		{"loop_views", loop_views}, {"idle_crash", idle_crash}, {"idle_damage", idle_damage},
-		{"split_crash", split_crash}, {"table_damage", table_damage}};
+		{"split_crash", split_crash}, {"table_damage", table_damage}, {"park_mid_turn", park_mid_turn}};
 	// Pending another quest's fix: run by name only.
 	const std::vector<std::pair<std::string, void (*)()>> pending{{"idle_unmanifested", idle_unmanifested}};
 	for (const auto& [name, run] : pending) {

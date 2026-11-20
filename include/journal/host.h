@@ -506,7 +506,8 @@ public:
 	}
 	// Parks the loop's idle groups (docs/design/idle-groups.md D2): every group no Store holds or
 	// has opened, with nothing staged, no sealer, and one live record, a checkpoint, closes into
-	// the table as close_group does, with one commit for them all. On the loop, off the turn.
+	// the table as close_group does, with one commit for them all (each touched shard, one file
+	// sync, one directory sync). On the loop's thread; mid-turn it skips the turn's groups (D10).
 	// Returns how many parked; a failed commit leaves each of them in doubt, as a failed close does.
 	std::size_t park(std::uint32_t at) {
 		settle(at);
