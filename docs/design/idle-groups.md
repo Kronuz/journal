@@ -181,6 +181,16 @@ checkpoint. Parking removes a group's records from the live set, so its segment 
 without a copy (`turn_log.h:436-450`). The A2 test checks that the log returns to its current
 segment once its groups park.
 
+`forward_slice` walks the log's index and its evicted set on each turn whose oldest segment, past
+retention, still holds live records. That makes the walk grow with the groups the log holds,
+and quadratically over a setup that adds them. A parked group is in neither the index nor the
+evicted set, so parking takes it out of the walk. `TurnLogStats::forward_scanned` counts the
+records visited. Over 20,000 parked groups the walk visits 0.01 records per turn; with the
+`park-keeps-log` mutant, which keeps parked groups in the log, it visits 193 per turn
+(261120-113449-d2ae31). The 1M job is 261120-113445-21c05a. Held and evicted groups that are not
+parked still cost the walk; indexing live records by segment would remove that, outside this
+quest.
+
 **D9. Bounded table shards: a transition writes one file of at most 4 KiB (lead ruling Q1).** A
 slot's table is a binary trie whose leaves are shard files, `groups-<slot:3x>-<node:9x>`: node 1
 is the root, `2n` and `2n + 1` are `n`'s children, and a group's path is its mixed id's bits below
