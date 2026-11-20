@@ -115,6 +115,9 @@ struct TurnWaiter {
 	TurnWaiter *prev = nullptr, *next = nullptr;
 	std::uint64_t group = 0, sequence = 0;
 };
+// Queues a no-op on `loop`: true when its scheduler declares post_call, where wake() and a
+// cancel's hop reach it.
+inline bool posts_calls(task::scheduler_ref loop) { return loop.post_call([](void*) {}, nullptr); }
 }  // namespace detail
 
 class TurnDriver {
@@ -308,8 +311,7 @@ public:
 	// loop's scheduler must declare post_call, where wake() reaches it: on one that declares
 	// none, run() throws std::logic_error before it holds the driver.
 	task::task<void> run(completion_ref io, task::cancel_token stop = {}) {
-		// scheduler_ref::post_call is refused only by a scheduler that declares none.
-		if (!task::current().post_call([](void*) {}, nullptr)) { throw std::logic_error("run() needs a loop whose scheduler declares post_call"); }
+		if (!detail::posts_calls(task::current())) { throw std::logic_error("run() needs a loop whose scheduler declares post_call"); }
 		Hold hold(*this, Holder::driver, task::current());
 		struct Loop {
 			TurnDriver& turns;
@@ -346,7 +348,9 @@ public:
 	// Resumes once the group's records through `sequence` are durable. Throws the turn
 	// driver's failure, group_closed when the group closes first or `sequence` is retired, or
 	// task::cancelled when `token` is requested first; a cancelled wait leaves its record
-	// staged, written with its turn.
+	// staged, written with its turn. A wait that suspends needs the caller's scheduler to
+	// declare post_call, where the token's callback hops: on one that declares none, it throws
+	// std::logic_error before it links.
 	task::task<void> durable(std::uint64_t group, std::uint64_t sequence, task::cancel_token token = {}) {
 		if (!group) { throw std::invalid_argument("group 0 is reserved"); }
 		co_await Wait(*this, group, sequence, token);
@@ -398,7 +402,7 @@ private:
 		}
 		void await_suspend(std::coroutine_handle<> handle) {
 			waiter.handle = handle; waiter.home = task::current();
-			if (!waiter.home) { throw std::logic_error("waiting on a turn driver needs a running scheduler"); }
+			if (!detail::posts_calls(waiter.home)) { throw std::logic_error("waiting on a turn driver needs a running scheduler that declares post_call"); }
 			turns.link(waiter);
 			callback.emplace(token, Cancel{&waiter});
 		}
@@ -414,7 +418,7 @@ private:
 			detail::TurnWaiter* waiter;
 			void operator()() const noexcept {
 				if (!waiter->claim(detail::TurnWaiter::cancelled)) { return; }
-				if (!waiter->home.post_call(&hop, waiter)) { hop(waiter); }
+				waiter->home.post_call(&hop, waiter);  // never refused: await_suspend checked the home
 			}
 			// On the waiter's loop: unlinks it if the driver has not, then resumes it.
 			static void hop(void* raw) {

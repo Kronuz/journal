@@ -352,9 +352,9 @@ struct NoPostCall {
 		while (!ready.empty()) { auto h = ready.front(); ready.pop_front(); h.resume(); }
 	}
 };
-// Review F6: cancel_hops on a scheduler that declares no post_call. A cancel from another
-// thread between drives must still leave the waiter linked for the loop, its thread joined.
-void cancel_bare_home() {
+// Review F6: durable() on a scheduler that declares no post_call throws std::logic_error before
+// it links, so no cancel's hop runs off the loop (cancel_hops shows the hop where it is declared).
+void bare_home_refused() {
 	Core core;
 	core.store(15);
 	NoPostCall bare;
@@ -362,12 +362,8 @@ void cancel_bare_home() {
 	Outcome<int> wait;
 	task::spawn(task::scheduler_ref::of(bare), capture(wait, [&]() -> task::task<int> { co_await core.turns->durable(15, 2, caller.token()); co_return 0; }));
 	bare.run();
-	check(!wait.done && core.turns->waiting_groups() == std::vector<std::uint64_t>{15}, "the waiter is linked");
-	std::thread other([&] { caller.request(); });
-	other.join();
-	check(core.turns->waiting_groups() == std::vector<std::uint64_t>{15}, "the cancelling thread leaves the waiter linked for the loop");
-	bare.run();
-	check(wait.done && throws<task::cancelled>(wait.error) && core.turns->waiting_groups().empty(), "the waiter resumes cancelled, unlinked");
+	check(wait.done && throws<std::logic_error>(wait.error), "durable() on a scheduler without post_call throws std::logic_error");
+	check(core.turns->waiting_groups().empty(), "the refused wait links no waiter");
 }
 // A cancel from another thread while the loop links and unlinks other waiters: the callback
 // only claims and hops, so the loop alone touches the driver's waiters (run under TSan).
@@ -451,7 +447,7 @@ int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
 		{"runner", runner}, {"cancel_waiting", cancel_waiting}, {"cancel_races_barrier", cancel_races_barrier}, {"failed_turn", failed_turn},
 		{"entry_append", entry_append}, {"entry_lost_wake", entry_lost_wake}, {"entry_live_token", entry_live_token},
-		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy}, {"cancel_hops", cancel_hops}, {"cancel_bare_home", cancel_bare_home},
+		{"entry_staged_cancelled", entry_staged_cancelled}, {"entry_holder", entry_holder}, {"entry_threads", entry_threads}, {"entry_threads_busy", entry_threads_busy}, {"cancel_hops", cancel_hops}, {"bare_home_refused", bare_home_refused},
 		{"entry_wake_threads", entry_wake_threads},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
