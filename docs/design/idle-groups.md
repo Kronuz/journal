@@ -2,7 +2,8 @@
 > `docs/design/rocksdb-parity.md` D10 items 2, 3 and 5, at strata:0d93765c).
 > Code cited at journal `1222e3b` (`main`). Answers the turn-log-parity design review's F2, F3 and
 > F5 (Xapiand `.campaign/xapiand/reviews/turn-log-parity-design.md`).
-> Format: `RJGT0001` and `RFTW0001` unchanged; one host API contract changes (Contracts).
+> Format: `RJGT0001` entries and `RFTW0001` unchanged; the table's files are renamed and bounded
+> (D9); one host API contract changes (Contracts). The lead's rulings on Q1-Q3 are D9-D11.
 
 # Idle groups leave the log
 
@@ -88,16 +89,16 @@ Its checkpoint's live count leaves its segment. Once no other live record remain
 |---|---|
 | Heap: host, driver, log | 0: measured -0.0006 B per group from 10k to 1M parked (`journal_test park_count`, job 261120-084841-834ac9 at journal:b55e34d) |
 | Turn log | 0 live; its old records are superseded and reclaimed with their segments |
-| Table shard `groups-<slot>` | 45 + payload: id 8, incarnation 8, state 1, mark 8, high 8, base 8, length 4, then the record |
+| Table shard `groups-<slot>-<node>` | 45 + payload: id 8, incarnation 8, state 1, mark 8, high 8, base 8, length 4, then the record |
+| Heap: the shard index (D9) | 8 B per shard file, about 0.2 B per group: measured 0.24 B per group at 1M (job 261120-092916-3cb2bf at journal:48df21b) |
 | Payload, journal `Store` | its manifest: 108 B, plus 28 per dependency, at most 332 (`journal.h:472-474`) |
 | Payload, consensus | its checkpoint record, which carries consensus-quiescence A5's closed-state hard state inside it, opaque to journal |
 | Artifacts | the group's own files, unchanged |
 
-At 1M parked groups with 108-B payloads the table holds 153 MB in 4,096 shards, about 37 KB
-each. The A2 job's 17-byte test payloads measured 62.0 B per group on disk, and the log back to
-one segment; creating and parking the million took 93 s on a memory disk, most of it rewriting
-shards (Q1). Reading a parked group back, through `status`, `entry` or a wake, reads its one shard
-(`host.h:448-457`).
+At 1M parked groups with 108-B payloads the table holds 153 MB. With 4,096 whole-slot shards that
+was about 37 KB per shard, rewritten by every transition; D9 bounds each shard file at 4 KiB. The
+A2 job's 17-byte test payloads measured 62.6 B per group on disk and the log back to one segment.
+Reading a parked group back, through `status`, `entry` or a wake, reads its one shard file.
 
 **D4. Wake rejoins through the table record.** A `Store`'s `recover` of a parked group takes the
 path a closed group takes today (`journal.h:599-608`): restore from the table's record, then stage
@@ -111,9 +112,9 @@ The flip from closed to open is no longer committed on its own (D5).
   costs one record's bytes in a turn the group is writing anyway.
 
 **D5. Create and wake join the turn.** `create_group` and `reopen_group` change the entry in
-memory and mark its slot dirty, with no commit. `TurnDriver` calls a host hook
+memory and mark the group dirty, with no commit. `TurnDriver` calls a host hook
 (`TurnDriver::before_turn`) in `start()` once a turn has records and before `TurnLog::stage`.
-The host's hook commits the loop's dirty slots:
+The host's hook commits the shards of the loop's dirty groups (D9):
 
 1. Each shard's `.pending` is written.
 2. All of them are synced in one `sync_files` call, then renamed.
@@ -130,16 +131,16 @@ transition pays two of its own.
 - A failed hook commit fails the driver, as a failed turn does (fail-stop): the shards may hold
   either version, and nothing staged after them is written. The host recovers whichever state
   the disk kept when it reopens.
-- A slot committed early (by a park, a close or a block reservation in the same slot) writes its
-  deferred transitions too. Being ahead of the log is safe (crash table below).
+- A shard committed early (by a park, a close or a block reservation in the same shard) writes
+  its deferred transitions too. Being ahead of the log is safe (crash table below).
 - *Lost: transitions as records in the turn log.* A wake's evidence would sit in the same blocks
   as its data. A damaged block with no readable manifest would then hide both, and recovery
   would read the stale `closed` and silently drop acknowledged records (review F3's second
   half).
 - *Lost, for now: a separate table log* (RocksDB's MANIFEST shape: append each transition and
   compact the shards off the turn). It writes about 150 B per transition instead of one shard
-  (Q1). It is a new file, format and recovery path. This design keeps the shard rewrite and
-  states its cost.
+  file, at the price of a new file, format and recovery path; D9's bounded shards bring a
+  transition to one 4 KiB file without one.
 
 **D6. Re-partition streams one old log at a time.** `Host::repartition` (`host.h:635-675`) holds
 every log's live records in one map. It changes to:
@@ -171,8 +172,7 @@ its first record is written (D5). If that record sat in an unmanifested damaged 
 reports the group lost (`turn_log.h:690`) rather than reading it as parked. The A3 job's damage
 case checks both halves on damage a manifest attributes. Damage that also takes the block header
 holding that manifest loses acknowledged records silently on journal `main` (`1222e3b`), parked
-groups or not: a pre-existing recovery gap outside this design, reported to Detent's lead. A damaged shard file stays what it is today: the host refuses to open
-(`host.h:186`, Q3).
+groups or not: a pre-existing recovery gap outside this design, reported to Detent's lead. A damaged shard file costs only its own groups (D11).
 
 **D8. Forward copies stay (review F5).** `forward_slice` (`turn_log.h:411-432`) still copies the
 oldest segment's live records past `retain_segments`. It is the fallback for every record that no
@@ -180,6 +180,95 @@ checkpoint or park releases: held idle groups, and released groups with batches 
 checkpoint. Parking removes a group's records from the live set, so its segment is reclaimed
 without a copy (`turn_log.h:436-450`). The A2 test checks that the log returns to its current
 segment once its groups park.
+
+**D9. Bounded table shards: a transition writes one file of at most 4 KiB (lead ruling Q1).** A
+slot's table is a binary trie whose leaves are shard files, `groups-<slot:3x>-<node:9x>`: node 1
+is the root, `2n` and `2n + 1` are `n`'s children, and a group's path is its mixed id's bits below
+the 12 slot bits (`host_detail::node_at`). A commit rewrites only the shards its groups fall in.
+One whose entries pass `leaf_bytes` (4 KiB) splits by the next bit until each part fits, holds one
+entry, or sits at depth 32. Both children of a split are written, so a slot's files always cover
+every path. The host keeps each slot's nodes, 8 B per file, prefix-free and in path order.
+
+- A split renames its children, syncs the directory, then removes the split node. The removal is
+  durable with a later directory sync; until then `open()` drops a node whose children cover it.
+  Children that do not cover their node are an unfinished split's: the node stands, or, under a
+  slot's unstored root, nothing there was durable (`host_detail::resolve`).
+- A commit that fails after renaming children leaves orphans. The next commit of their slot
+  removes them and syncs the directory before it renames anything, so no orphan shadows a later
+  version of its node.
+- Shards never merge: table entries are never removed (lost and closed ids stay).
+
+Before and after at 1M parked groups (`journal_test park_count`, strict jobs). Each sample is a
+wake (one turn) then a park (one call). The memory disk samples 2,000 transitions. The real
+filesystem (`JOURNAL_DISK_DIR`: the host's directory copied to APFS, PosixIO, real syncs) samples
+200. Two pairs ran. The second pair's before is journal:a0944ca (7129c53 with 893fd77's test) and
+its after is journal:893fd77.
+
+| | Before | After |
+|---|---|---|
+| Table bytes per transition | 15,192 (memory), 15,132 (APFS) | 3,143 (memory), 3,131 (APFS) |
+| Table files per transition | 1 | 1 |
+| APFS time per transition | 59.6 ms (261120-095112-ec7b19) | 61.7 ms (261120-095115-033c33) |
+| Memory disk time per transition | 646 us, 1,268 us | 1,749 us, 596 us |
+| Create and park 1M (batches of 10k) | 73.8 s, 126.7 s | 84.8 s, 48.5 s |
+| Host open over 1M parked (memory disk) | 1.13 s, 1.70 s | 3.72 s, 1.70 s |
+| Heap per parked group | -0.0006 B | 0.24 B |
+
+First pair: 261120-092423-3fc8cc at journal:7129c53 and 261120-092916-3cb2bf at journal:48df21b.
+Second pair: the APFS jobs.
+
+The bytes a transition writes fall by a factor of 4.8, and they no longer grow with the host's
+groups. On a real disk a transition costs its syncs, and their count does not change: the hook
+commit's file and directory syncs and the turn's barrier for a wake, and one file sync and one
+directory sync for a park. So the time is the same within noise, about 30 ms per transition
+under macOS's full syncs. The memory-disk times move both ways between pairs, by more than the
+change. faultfs walks every inode at each ordering point, so its per-operation cost grows with the
+file count, about 20,000 files after (62.6 MB at 3.1 KB each) against 4,096 before. Those times measure the model, not the
+mechanism.
+
+- *Lost: the transition carried in the turn record that precedes the group's first record.* It
+  writes no table bytes and adds no sync. But the wake's only evidence would sit in the blocks
+  that carry the group's records, which is D5's lost alternative. A turn whose blocks and
+  manifests are all damaged would read back as the stale `closed` entry: acknowledged records
+  lost without a report, unless recovery calls every parked group lost on any damage (F2's blast
+  radius). `host_test idle_unmanifested` is that case. It is pending journal-double-damage, which
+  makes recovery report such damage; with D5 the woken group is then `open` in the table and
+  reported lost.
+- *Lost: 65,536 fixed shards.* That gives 16 times fewer bytes than 4,096, but it is not bounded:
+  the bytes still grow with the host's groups.
+- *Lost: an epoch per shard file, the newest winning at each hash point at open.* It orders
+  versions after a failed commit as the orphan rule does, but `open()` must then read every file
+  before it can tell which stand. The cover rule decides from the names alone.
+
+**D10. The park call contract (lead ruling Q2).** The mechanism is journal's and the policy the
+consumer's: Xapiand calls `Host::park(loop)` from its idle policy, as strata does from its own.
+
+- **Thread:** the loop's thread, the one that runs the loop's turns and its groups' `group_io`
+  (`docs/mechanisms/host-ranges.md`).
+- **Cost:** one table commit for every group it parks: each touched shard file rewritten (at most
+  4 KiB, D9), one multi-file sync and one directory sync. Finding the groups walks the loop's log
+  index once (`TurnLog::idle`), O(groups the log holds).
+- **Mid-turn:** between a turn's `begin()` and `completed()`, or from a waiter that turn resumes,
+  `park` is safe. A group with records in the turn in flight is staged and not parked. A forwarded
+  copy of a parked group's checkpoint riding that turn is dropped at `completed()`, because the
+  log no longer indexes the group, and recovery ignores it, because the table's `base` supersedes
+  it. `host_test park_mid_turn` checks the first half across a restart.
+- A failed commit leaves each group it would have parked `open` and in doubt, as a failed close
+  does (D2).
+
+**D11. A damaged shard fails only its own groups (lead ruling Q3).** `open()` reads each shard
+file; one that fails its CRC or its checks is damaged, and the host still opens:
+
+- Every id the shard could hold (the ids on its path) is `lost`, parked, open or never created,
+  because the shard's ids are unknown. `create_group` refuses them.
+- The shard is never rewritten: a commit that touches it throws `Corruption`, and `mark_lost`
+  skips its ids, so the damage stays visible across restarts.
+- The log forgets the groups it holds of that shard: their incarnation and serials, which name
+  their artifacts, were the shard's.
+- Other shards' groups recover as before. The blast radius is one shard file, at most 4 KiB of
+  entries (D9), about 45 groups at 1M with 17-B payloads, where it was the whole host.
+
+`host_test table_damage` damages one shard and checks all of this across two restarts.
 
 ## Crash at each step
 
@@ -196,6 +285,8 @@ Acknowledged means the call returned: a turn's barrier, a close's commit or a pa
 | Park: shard commit | old shard (open, checkpoint live in the log), or new (`closed`, `base`) | from the log's checkpoint, or from the table, which supersedes it: the same record |
 | Park: forget, then reclamation | segment removed or not | superseded records ignored; the table wins |
 | Re-partition | unchanged protocol: `layout` is the commit point | old generation authoritative until `layout` is replaced |
+| Split: children renamed, before the directory sync | the node, and none, some or all of its children | children that cover the node win; otherwise the node, and the commit was never acknowledged |
+| Split: node removed, before a later directory sync | the node and all its children | the children: the node is dropped at open |
 
 A failed park commit leaves every group in it `open` and in doubt, as a failed close does
 (`host.h:430`). A failed hook commit fails the driver (D5).
@@ -222,10 +313,12 @@ design is written against its quest file. Nothing here depends on how many logs 
   and `reopen`. That holds only at its journal pin, so moving the pin to this change moves the
   promise to "once the group's first record is durable". Xapiand's group-core consumes
   `journal:driver`: its lead hears this before landing.
-- New: `Host::park(loop)`, which returns how many groups it parked, and
+- New: `Host::park(loop)`, which returns how many groups it parked (call contract in D10), and
   `TurnDriver::before_turn(std::function<void()>)`.
+- The table's files are `groups-<slot:3x>-<node:9x>`, each at most 4 KiB unless it holds one
+  entry (D9). A damaged one no longer fails the host's open (D11).
 - A create's first serial block moves from the create to the first `next_artifact`.
-- No byte changes in `RJGT0001` or `RFTW0001`.
+- No byte changes in an `RJGT0001` entry or in `RFTW0001`.
 
 ## Checks
 
@@ -233,30 +326,19 @@ design is written against its quest file. Nothing here depends on how many logs 
 |---|---|
 | A1 | This note |
 | A2 | `host_test park_count`: N groups are created, checkpointed, released and parked (`JOURNAL_PARKED_GROUPS`, 1,000,000 in the job). It checks the heap slope per parked group (at most 1 B), that the log holds none of them and is back to its current segment, and a sample that wakes exactly |
-| A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: two damaged blocks of a woken group's batch; parked groups open, and the woken group, whose only post-wake records were there, reports lost. Mutants in `test/mutants.py` (`parked-as-open`, `wake-skips-commit`, `create-with-block`, `park-keeps-log`), each `--fails-without` |
+| A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: two damaged blocks of a woken group's batch; parked groups open, and the woken group, whose only post-wake records were there, reports lost. `host_test split_crash`: power cut after every mutation of commits that split one slot's shard. Mutants in `test/mutants.py` (`parked-as-open`, `wake-skips-commit`, `create-with-block`, `park-keeps-log`, `split-keeps-parent`, `split-removes-early`), each `--fails-without` |
+| Q2 | `host_test park_mid_turn` |
+| Q3 | `host_test table_damage`; mutant `damaged-shard-fails-open` |
+| F3, pending journal-double-damage | `host_test idle_unmanifested`, run by name only |
 | A4 | The suite and CI |
 
-## Questions for the owner
+## Rulings
 
-- **Q1. Table transition cost.** A hook commit rewrites each dirty slot's whole shard. At N groups
-  that is N/4,096 entries × (45 + payload) per slot: about 37 KB at 1M groups with 108-B payloads.
-  Creating 1M groups in turns of k writes about N² × entry / (2k) bytes of shards. The options:
-  1. Keep it, with the cost stated.
-  2. Use 65,536 table shards, a different key from placement's 4,096 slots, for 16× fewer bytes
-     per transition and 16× more files.
-  3. Add a table log (MANIFEST shape) with off-turn compaction, about 150 B per transition.
+The lead ruled on the three questions this note raised:
 
-  Recommendation: (1) now, then (3) if the many-indexes workload measures the bytes as a loss.
-- **Q2. Park policy.** Who calls `Host::park` and how often. Recommendation: the loop's owner
-  calls it when idle, as it prepares spares, with no idle window inside journal. Callers that
-  want a window keep the group held.
-- **Q3. A damaged shard.** Today it fails the host's open (`host.h:186`). With millions of parked
-  groups that is the host's whole blast radius from one 37-KB file. The options:
-  1. Keep it.
-  2. Write two copies of each shard.
-  3. Call that shard's groups lost.
-
-  Recommendation: (3), as the log's damage rule does, in a later quest.
+- **Q1.** A whole-shard rewrite per transition is not acceptable at 1M groups: D9.
+- **Q2.** The policy is the consumer's; the call contract is D10.
+- **Q3.** A damaged shard fails only its own groups: D11.
 
 ## First buildable steps
 
@@ -267,3 +349,5 @@ design is written against its quest file. Nothing here depends on how many logs 
    close path, and `host_test park_count`.
 3. D6's streaming re-partition (`placement_test remap` unchanged).
 4. `host_test idle_crash` and `idle_damage`, each with its mutants.
+5. D9's bounded shards and D11's damaged shard, with `split_crash`, `table_damage` and
+   `park_mid_turn`.

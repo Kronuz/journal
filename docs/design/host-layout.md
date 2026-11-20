@@ -10,7 +10,7 @@ per host", summarizes it.
 ```
 <host>/
   layout                                            RJHL0001: L and the log generation
-  groups-<slot:3x>                                  RJGT0001: the group table's entries of one slot
+  groups-<slot:3x>-<node:9x>                        RJGT0001: the group table's entries under one node of its slot's trie
   l<generation:16x>-<loop:4x>-turns-<segment:16x>   a loop's RFTW0001 segment
   g<group:16x>-artifact-<incarnation:16x><serial:16x>   a group's artifact
 ```
@@ -35,9 +35,11 @@ per host", summarizes it.
 
 One entry per group: incarnation, state (open, closed, lost), the serial range `[mark, high)`,
 and, once the group has closed, its last checkpoint record (`base`, its sequence, and the
-manifest bytes). The table is sharded by slot, each shard replaced whole (`groups-<slot>.pending`,
-synced, renamed, then the directory synced); at a million groups a shard holds about 244 entries.
-It is read once when the host opens. Every transition writes its shard before anything acts on
+manifest bytes). Each slot's table is a binary trie of shard files, each replaced whole
+(`groups-<slot>-<node>.pending`, synced, renamed, then the directory synced) and split by the
+group's mixed-id bits once it passes 4 KiB, so a transition rewrites at most 4 KiB however many
+groups the host holds ([idle-groups.md](idle-groups.md) D9). A damaged shard costs only its own
+groups, which are lost (D11). The table is read once when the host opens. Every transition writes its shard before anything acts on
 it; a failed write restores the entry in memory, so the table there never runs ahead of the disk.
 A failed close may still have reached the disk, so it also leaves the entry in doubt (below).
 

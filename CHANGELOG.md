@@ -17,9 +17,17 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 - `TurnDriver::before_turn(hook)`: a host's table commit, run before each turn with records.
 - `TurnLog::peek(group)` reads a group's live records without restoring it; `TurnLog::idle()`
   lists the groups whose only live record is a checkpoint.
+- `host_test split_crash`, `table_damage`, `park_mid_turn`, and `idle_unmanifested` (run by
+  name, pending the double-damage recovery fix).
 
 ### Changed
 
+- The group table is bounded: each slot's table is a trie of shard files
+  `groups-<slot:3x>-<node:9x>`, split once one passes 4 KiB, so a create, wake, park or block
+  reservation rewrites one file of at most 4 KiB instead of its whole slot (15 KB at 1M groups).
+  The old `groups-<slot:3x>` files are not read.
+- A damaged table shard no longer fails the host's open: every id it could hold is lost, the
+  shard is never rewritten, and the log forgets its groups.
 - The in-memory release step is renamed evict: `TurnDriver::evict`, `TurnDriver::evicted`,
   `TurnLog::evict` and `TurnLog::evicted` replace `park` and `parked`, which now name the durable
   table state alone (`Host::park`).
