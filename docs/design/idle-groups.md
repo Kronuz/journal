@@ -169,10 +169,10 @@ With D2, those are the groups active within the park interval. With one log per 
 grows from one loop's groups to the device's, as F2 says. With parking, that growth applies to
 the device's active groups, not to its open indexes. A woken group is `open` in the table before
 its first record is written (D5). If that record sat in an unmanifested damaged block, recovery
-reports the group lost (`turn_log.h:690`) rather than reading it as parked. The A3 job's damage
-case checks both halves on damage a manifest attributes. Damage that also takes the block header
-holding that manifest loses acknowledged records silently on journal `main` (`1222e3b`), parked
-groups or not: a pre-existing recovery gap outside this design, reported to Detent's lead. A damaged shard file costs only its own groups (D11).
+reports the group lost rather than reading it as parked. `idle_damage` checks both halves on
+damage a manifest attributes; `idle_unmanifested` checks them when the block header holding that
+manifest is damaged too, which recovery reports since journal-double-damage (journal:178030b).
+A damaged shard file costs only its own groups (D11).
 
 **D8. Forward copies stay (review F5).** `forward_slice` (`turn_log.h:411-432`) still copies the
 oldest segment's live records past `retain_segments`. It is the fallback for every record that no
@@ -185,9 +185,9 @@ segment once its groups park.
 retention, still holds live records. That makes the walk grow with the groups the log holds,
 and quadratically over a setup that adds them. A parked group is in neither the index nor the
 evicted set, so parking takes it out of the walk. `TurnLogStats::forward_scanned` counts the
-records visited. Over 20,000 parked groups the walk visits 0.01 records per turn; with the
-`park-keeps-log` mutant, which keeps parked groups in the log, it visits 193 per turn
-(261120-113449-d2ae31). The 1M job is 261120-113445-21c05a. Held and evicted groups that are not
+records visited. Over 1M parked groups the walk visits 0.02 records per turn (261120-113445-21c05a,
+strict), and 0.01 over 20,000; with the `park-keeps-log` mutant, which keeps parked groups in the
+log, it visits 193 per turn over 20,000 (261120-113449-d2ae31). Held and evicted groups that are not
 parked still cost the walk; indexing live records by segment would remove that, outside this
 quest.
 
@@ -250,9 +250,8 @@ next step if a host's open time matters.
   that carry the group's records, which is D5's lost alternative. A turn whose blocks and
   manifests are all damaged would read back as the stale `closed` entry: acknowledged records
   lost without a report, unless recovery calls every parked group lost on any damage (F2's blast
-  radius). `host_test idle_unmanifested` is that case. It is pending journal-double-damage, which
-  makes recovery report such damage; with D5 the woken group is then `open` in the table and
-  reported lost.
+  radius). `host_test idle_unmanifested` is that case: recovery reports the damage
+  (journal-double-damage), and with D5 the woken group is `open` in the table and reported lost.
 - *Lost: 65,536 fixed shards.* That gives 16 times fewer bytes than 4,096, but it is not bounded:
   the bytes still grow with the host's groups.
 - *Lost: an epoch per shard file, the newest winning at each hash point at open.* It orders
@@ -348,7 +347,7 @@ design is written against its quest file. Nothing here depends on how many logs 
 | A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: two damaged blocks of a woken group's batch; parked groups open, and the woken group, whose only post-wake records were there, reports lost. `host_test split_crash`: power cut after every mutation of commits that split one slot's shard. Mutants in `test/mutants.py` (`parked-as-open`, `wake-skips-commit`, `create-with-block`, `park-keeps-log`, `split-keeps-parent`, `split-removes-early`), each `--fails-without` |
 | Q2 | `host_test park_mid_turn` |
 | Q3 | `host_test table_damage`; mutant `damaged-shard-fails-open` |
-| F3, pending journal-double-damage | `host_test idle_unmanifested`, run by name only |
+| F3, unmanifested damage | `host_test idle_unmanifested` |
 | A4 | The suite and CI |
 
 ## Rulings

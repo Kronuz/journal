@@ -1079,10 +1079,9 @@ void park_mid_turn() {
 	check(host->driver(0).records(1).size() == 2 && host->driver(0).records(3).size() == 1, "the turn's group and the held one recover their records");
 }
 
-// Review F3, pending journal-double-damage: as idle_damage, with the second block's header
-// damaged too, the case main reads as no damage at all. Once recovery reports that damage, the
-// woken group, whose table entry is open before its turn (D5), is lost rather than read back as
-// parked. Run by name: `journal_host_test idle_unmanifested`.
+// Review F3: as idle_damage, with the second block's header damaged too, so no manifest names
+// the damaged block's groups. Recovery reports the damage, and the woken group, whose table
+// entry is open before its turn (D5), is lost rather than read back as parked.
 void idle_unmanifested() {
 	fl::filesystem disk;
 	const std::string marker(3000, 'Z');
@@ -1149,9 +1148,7 @@ void idle_damage() {
 	const auto first = (view.find(marker.substr(0, 900)) / 1024 + 1) * 1024;
 	{
 		auto file = host_io(disk)->open_existing(segment);
-		// A byte of each of two blocks' payloads. (Damaging the second block's header instead, the
-		// manifest naming the first block's groups, loses acknowledged records silently on main too:
-		// a pre-existing recovery gap, reported to the lead, not this case's.)
+		// A byte of each of two blocks' payloads; idle_unmanifested damages the second's header too.
 		for (std::uint64_t at : {first + 512, first + 1024 + 512}) { file->write_at(at, std::string(1, 'Y')); }
 		file->sync();
 	}
@@ -1171,13 +1168,8 @@ int main(int argc, char** argv) {
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"close_in_doubt", close_in_doubt}, {"failed_close_crash", failed_close_crash}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
 		{"loop_views", loop_views}, {"idle_crash", idle_crash}, {"idle_damage", idle_damage},
-		{"split_crash", split_crash}, {"table_damage", table_damage}, {"park_mid_turn", park_mid_turn}, {"split_stale_node", split_stale_node}};
-	// Pending another quest's fix: run by name only.
-	const std::vector<std::pair<std::string, void (*)()>> pending{{"idle_unmanifested", idle_unmanifested}};
-	for (const auto& [name, run] : pending) {
-		if (only != name) { continue; }
-		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }
-	}
+		{"split_crash", split_crash}, {"table_damage", table_damage}, {"park_mid_turn", park_mid_turn}, {"split_stale_node", split_stale_node},
+		{"idle_unmanifested", idle_unmanifested}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

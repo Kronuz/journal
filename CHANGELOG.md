@@ -17,8 +17,9 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 - `TurnDriver::before_turn(hook)`: a host's table commit, run before each turn with records.
 - `TurnLog::peek(group)` reads a group's live records without restoring it; `TurnLog::idle()`
   lists the groups whose only live record is a checkpoint.
-- `host_test split_crash`, `table_damage`, `park_mid_turn`, and `idle_unmanifested` (run by
-  name, pending the double-damage recovery fix).
+- `host_test split_crash`, `split_stale_node`, `table_damage`, `park_mid_turn`, and
+  `idle_unmanifested` (review F3's unmanifested damage of a woken group's turn).
+- `TurnLogStats::forward_scanned` counts the live records `forward_slice` visits.
 
 ### Changed
 
@@ -41,6 +42,18 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   syncs the directory once.
 - A re-partition streams one old log at a time into the new generation, so its memory is one
   log's live records and one turn per new loop, not every log's records.
+
+### Fixed
+
+- `TurnLog` recovery no longer drops acknowledged records silently when a damaged block is
+  followed by a block whose header, the damaged block's manifest, is damaged too. A header or
+  fragment that fails while its 512-byte sector holds bytes bound to its segment is damage,
+  which no crash leaves: past the last kept turn it is reported instead of read as a torn tail,
+  and the turns dropped there cost every group with a record in them. Damage that no manifest
+  names now costs every group, where it cost only those that wrote nothing after it: a
+  forwarded copy after the damage read as such a write and kept a group whose newer records the
+  damage held. A byte-granular cut inside a sector, which the sector crash model never leaves,
+  now reads as damage.
 
 ## 2026-11-19
 
