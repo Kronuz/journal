@@ -1812,18 +1812,21 @@ bool prefix(const std::vector<std::string>& shorter, const std::vector<std::stri
 }
 std::string text(const std::vector<std::string>& batches) { return "[" + join(batches) + "]"; }
 
+// Bytes and files the host writes to its group table, for park_count's cost per transition.
+std::uint64_t table_bytes = 0, table_files = 0;
 // The memory disk's files and calls, kept off the heap reading.
 class MeteredFile final : public File {
 public:
-	explicit MeteredFile(std::unique_ptr<File> file) : file_(std::move(file)) {}
+	explicit MeteredFile(std::unique_ptr<File> file, bool table = false) : file_(std::move(file)), table_(table) { table_files += table; }
 	~MeteredFile() override { heap::Off off; file_.reset(); }
 	std::uint64_t size() override { heap::Off off; return file_->size(); }
 	std::size_t read_at(std::uint64_t offset, std::span<char> bytes) override { heap::Off off; return file_->read_at(offset, bytes); }
-	std::size_t write_at(std::uint64_t offset, std::string_view bytes) override { heap::Off off; return file_->write_at(offset, bytes); }
+	std::size_t write_at(std::uint64_t offset, std::string_view bytes) override { heap::Off off; if (table_) { table_bytes += bytes.size(); } return file_->write_at(offset, bytes); }
 	void truncate(std::uint64_t size) override { heap::Off off; file_->truncate(size); }
 	void sync() override { heap::Off off; file_->sync(); }
 private:
 	std::unique_ptr<File> file_;
+	bool table_;
 };
 class MeteredIO final : public IO {
 public:
@@ -1834,7 +1837,7 @@ public:
 	std::unique_ptr<File> open_reclaim_candidate_read_only(std::string_view name) override { return wrap([&] { return io_->open_reclaim_candidate_read_only(name); }); }
 	std::unique_ptr<File> open_existing(std::string_view name) override { return wrap([&] { return io_->open_existing(name); }); }
 	std::unique_ptr<File> open_existing_read_only(std::string_view name) override { return wrap([&] { return io_->open_existing_read_only(name); }); }
-	std::unique_ptr<File> create_exclusive(std::string_view name) override { return wrap([&] { return io_->create_exclusive(name); }); }
+	std::unique_ptr<File> create_exclusive(std::string_view name) override { return wrap([&] { return io_->create_exclusive(name); }, name.starts_with("groups-")); }
 	void replace(std::string_view source, std::string_view destination) override { heap::Off off; unordered_ = true; io_->replace(source, destination); }
 	void remove(std::string_view name) override { heap::Off off; unordered_ = true; io_->remove(name); }
 	std::unique_ptr<DirectoryCursor> scan_directory() override { heap::Off off; return io_->scan_directory(); }
@@ -1845,10 +1848,10 @@ public:
 protected:
 	std::unique_ptr<OwnerLock> lock_owner(const OwnerLockOptions& options) override { heap::Off off; return io_->acquire_owner(options); }
 private:
-	template <class Open> std::unique_ptr<File> wrap(Open&& open) {
+	template <class Open> std::unique_ptr<File> wrap(Open&& open, bool table = false) {
 		std::unique_ptr<File> file;
 		{ heap::Off off; file = open(); }
-		return file ? std::make_unique<MeteredFile>(std::move(file)) : nullptr;
+		return file ? std::make_unique<MeteredFile>(std::move(file), table) : nullptr;
 	}
 	std::shared_ptr<IO> io_;
 	bool unordered_ = false;
@@ -2214,6 +2217,28 @@ void park_count() {
 		check(in_log == 0 && open == 0, "a parked group is closed in the table and the log holds nothing of it");
 		check(turns.log().data_segments().size() <= turns_options.retain_segments, "the log keeps only the busy group's window: " + std::to_string(turns.log().data_segments().size()) + " segments");
 		if (heap::checked("park_count") && ids > batch) { check(slope <= 1, "a parked group costs the host no heap: " + std::to_string(slope) + " B per group"); }
+		// One transition at a time at full size: a sample woken (one turn each), then parked again
+		// (one park each). The table bytes each transition writes, and its time.
+		{
+			const std::uint64_t sample = std::min<std::uint64_t>(ids, 1000);
+			const auto bytes = table_bytes, files = table_files;
+			const auto began = std::chrono::steady_clock::now();
+			std::uint64_t again = 0;
+			for (std::uint64_t i = 0; i < sample; ++i) {
+				const auto group = 1 + i * (ids / sample);
+				const auto entry = host.entry(group);
+				host.reopen_group(group);
+				const auto at = std::max(entry->base, turns.retired(group)) + 1;
+				turns.stage(TurnRecord{group, at, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
+				node.commit();
+				host.hold(group);
+				again += host.park(0);
+			}
+			const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+			std::cout << "park_count: " << 2 * sample << " single transitions (wake, park) at " << ids << " groups: " << double(table_bytes - bytes) / double(2 * sample)
+				<< " table B and " << double(table_files - files) / double(2 * sample) << " table files written per transition, " << 1e6 * elapsed / double(2 * sample) << " us each\n";
+			check(again == sample, "every woken sample parks again");
+		}
 		// Waking a sample: the table's record staged again, then a batch, in one turn.
 		for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {
 			const auto entry = host.entry(group);
@@ -2225,7 +2250,9 @@ void park_count() {
 		}
 		node.commit();
 	}
+	const auto opening = std::chrono::steady_clock::now();
 	Shared again(disk, turns_options);
+	std::cout << "park_count: the host opens over " << ids << " parked groups in " << std::chrono::duration<double>(std::chrono::steady_clock::now() - opening).count() << " s\n";
 	for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {
 		const auto& records = again.turns().records(group);
 		check(records.size() == 2 && records[0].payload == payload(group) && records[1].payload == "woken", "a woken group recovers its checkpoint and its batch");
