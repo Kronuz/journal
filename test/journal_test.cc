@@ -2220,29 +2220,31 @@ void park_count() {
 		// One transition at a time at full size: a sample woken (one turn each), then parked again
 		// (one park each). The table bytes each transition writes, and its time.
 		{
-			const std::uint64_t sample = std::min<std::uint64_t>(ids, 1000);
+			const std::uint64_t sample = std::max<std::uint64_t>(1, std::min<std::uint64_t>(ids / 4, 1000)), step = ids / sample;
 			const auto bytes = table_bytes, files = table_files;
 			const auto began = std::chrono::steady_clock::now();
-			std::uint64_t again = 0;
+			std::uint64_t woken = 0, again = 0;
 			for (std::uint64_t i = 0; i < sample; ++i) {
-				const auto group = 1 + i * (ids / sample);
+				const auto group = 2 + i * step;  // never 1, ids / 2 or ids: the groups checked below
+				if (group == ids / 2 || group >= ids) { continue; }
 				const auto entry = host.entry(group);
 				host.reopen_group(group);
 				const auto at = std::max(entry->base, turns.retired(group)) + 1;
 				turns.stage(TurnRecord{group, at, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
 				node.commit();
 				host.hold(group);
-				again += host.park(0);
+				again += host.park(0); ++woken;
 			}
 			const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
-			std::cout << "park_count: " << 2 * sample << " single transitions (wake, park) at " << ids << " groups: " << double(table_bytes - bytes) / double(2 * sample)
-				<< " table B and " << double(table_files - files) / double(2 * sample) << " table files written per transition, " << 1e6 * elapsed / double(2 * sample) << " us each\n";
-			check(again == sample, "every woken sample parks again");
+			const auto transitions = double(2 * std::max<std::uint64_t>(woken, 1));
+			std::cout << "park_count: " << 2 * woken << " single transitions (wake, park) at " << ids << " groups: " << double(table_bytes - bytes) / transitions
+				<< " table B and " << double(table_files - files) / transitions << " table files written per transition, " << 1e6 * elapsed / transitions << " us each\n";
+			check(again == woken, "every woken sample parks again");
 		}
 		// Waking a sample: the table's record staged again, then a batch, in one turn.
 		for (std::uint64_t group : {std::uint64_t{1}, ids / 2, ids}) {
 			const auto entry = host.entry(group);
-			check(entry && entry->manifest == payload(group) && entry->base == 1, "the table holds the parked group's checkpoint");
+			check(entry && entry->manifest == payload(group) && entry->base == 1, "the table holds the parked group's checkpoint: group " + std::to_string(group));
 			host.reopen_group(group);
 			const auto at = std::max(entry->base, turns.retired(group)) + 1;
 			turns.stage(TurnRecord{group, at, TurnRecordKind::Checkpoint, entry->manifest, entry->base});
