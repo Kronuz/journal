@@ -206,6 +206,66 @@ void corrupted_blocks(std::uint64_t seed, std::uint64_t& blocks) {
 		} catch (const std::exception& error) { check(false, at + ": " + error.what()); }
 	}
 }
+
+// Double damage at every block boundary: a byte past a written block's header and one in the
+// next block's header, which names the first block's groups. Recovery reports the damage, the
+// last turn's blocks included, and every group it does not call lost keeps its acknowledged records.
+void double_damage(std::uint64_t seed, std::uint64_t& pairs) {
+	namespace d = j::turn_log_detail; namespace f = j::framing;
+	fl::filesystem clean; fl::io clean_io(clean); Workload work(seed); j::TurnRecovery recovered;
+	{ j::TurnLog log(clean_io, identity, recovered, options); for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); } }
+	clean.crash(seed, sector_cut);  // everything acknowledged is durable
+	// Each written block's header size, by segment and block.
+	std::map<std::pair<std::uint64_t, std::uint64_t>, std::size_t> headers;
+	{
+		auto cursor = clean_io.scan_directory();
+		while (auto name = cursor->next()) {
+			auto number = d::segment_number(*name); if (!number) { continue; }
+			auto file = clean_io.open_existing(*name); std::string block(options.block_bytes, '\0');
+			for (std::uint64_t b = 0; b * options.block_bytes < options.segment_bytes; ++b) {
+				if (file->read_at(b * options.block_bytes, block) != block.size()) { break; }
+				auto header = f::parse_header(block, d::stream(identity, options.block_bytes, *number, 0), b);
+				if (header.check == f::Check::ok) { headers[{*number, b}] = header.size; }
+			}
+		}
+	}
+	for (const auto& [where, size] : headers) {
+		const auto next = headers.find({where.first, where.second + 1});
+		if (next == headers.end()) { continue; }
+		fl::filesystem disk = clean.snapshot(); fl::io io(disk); ++pairs;
+		std::mt19937_64 random(seed * 137 + where.first * 4099 + where.second);
+		const auto payload = where.second * options.block_bytes + size + random() % (options.block_bytes - size);
+		const auto header = next->first.second * options.block_bytes + random() % next->second;
+		{
+			auto file = io.open_existing(d::segment_name(where.first));
+			for (auto offset : {payload, header}) {
+				char byte = 0; file->read_at(offset, std::span<char>(&byte, 1));
+				byte = static_cast<char>(byte ^ 0x5a); file->write_at(offset, std::string_view(&byte, 1));
+			}
+			file->sync();
+		}
+		const auto at = "seed " + std::to_string(seed) + " segment " + std::to_string(where.first) + " block " + std::to_string(where.second);
+		try {
+			j::TurnLogGroups known;  // the host holds every group open: a damaged log loses those it holds nothing of
+			for (const auto& [group, _] : work.acknowledged) { known.open.push_back(group); }
+			j::TurnLog log(io, identity, recovered, options, known);
+			bool kept = true;
+			for (const auto& [group, records] : work.acknowledged) { if (!recovered.lost.contains(group) && recovered.groups[group] != records) { kept = false; } }
+			check(recovered.damaged, "double damage is reported: " + at);
+			check(kept, "a group not lost keeps every acknowledged record: " + at);
+			if (!kept && std::getenv("T9_DEBUG")) {
+				std::cerr << "  payload " << payload << " header " << header << " lost:"; for (auto g : recovered.lost) std::cerr << ' ' << g; std::cerr << '\n';
+				for (const auto& [group, records] : work.acknowledged) {
+					if (recovered.lost.contains(group) || recovered.groups[group] == records) { continue; }
+					auto& got = recovered.groups[group];
+					std::cerr << "  group " << group << " acked [" << records.front().sequence << ".." << records.back().sequence << "] got " << got.size();
+					if (!got.empty()) { std::cerr << " [" << got.front().sequence << ".." << got.back().sequence << "]"; }
+					std::cerr << '\n';
+				}
+			}
+		} catch (const std::exception& error) { check(false, at + ": " + error.what()); }
+	}
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -227,7 +287,9 @@ int main(int argc, char** argv) {
 	}
 	std::uint64_t blocks = 0;
 	for (std::uint64_t seed = 1; seed <= seeds; ++seed) { corrupted_blocks(seed, blocks); }
-	std::cout << blocks << " corrupted blocks; ";
+	std::uint64_t pairs = 0;
+	for (std::uint64_t seed = 1; seed <= seeds; ++seed) { double_damage(seed, pairs); }
+	std::cout << blocks << " corrupted blocks, " << pairs << " doubly damaged boundaries; ";
 	std::cout << points << " crash points (" << seconds << " with a second loss in recovery), " << checks << " checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
 }
