@@ -212,6 +212,7 @@ its after is journal:893fd77.
 | Memory disk time per transition | 646 us, 1,268 us | 1,749 us, 596 us |
 | Create and park 1M (batches of 10k) | 73.8 s, 126.7 s | 84.8 s, 48.5 s |
 | Host open over 1M parked (memory disk) | 1.13 s, 1.70 s | 3.72 s, 1.70 s |
+| Host open over 1M parked (APFS, warm cache, three opens) | 3.65, 3.32, 2.96 s over 4,096 files (261120-100752-65e1de) | 1.92, 1.88, 1.72 s over 20,958 files (261120-100755-5948a1) |
 | Heap per parked group | -0.0006 B | 0.24 B |
 
 First pair: 261120-092423-3fc8cc at journal:7129c53 and 261120-092916-3cb2bf at journal:48df21b.
@@ -225,6 +226,14 @@ under macOS's full syncs. The memory-disk times move both ways between pairs, by
 change. faultfs walks every inode at each ordering point, so its per-operation cost grows with the
 file count, about 20,000 files after (62.6 MB at 3.1 KB each) against 4,096 before. Those times measure the model, not the
 mechanism.
+
+Opening is no slower with five times the files. Over APFS with the files in the page cache, the
+open is 1.7-1.9 s against 3.0-3.6 s before (journal:0c56d21 against journal:61d2a42, which is
+7129c53 with the same test). These jobs do not isolate why the whole-slot open is slower. A cold
+cache adds about 17,000 more file reads than before; this machine cannot drop its page cache
+without root, so that cost is not measured. Open still reads every entry. Reading only the
+entries the open needs (open and lost ones, and the bases of groups the log still holds) is the
+next step if a host's open time matters.
 
 - *Lost: the transition carried in the turn record that precedes the group's first record.* It
   writes no table bytes and adds no sync. But the wake's only evidence would sit in the blocks
