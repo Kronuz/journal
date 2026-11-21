@@ -1298,10 +1298,13 @@ int main(int argc, char** argv) {
 		{"split_crash", split_crash}, {"table_damage", table_damage}, {"park_mid_turn", park_mid_turn}, {"split_stale_node", split_stale_node},
 		{"idle_unmanifested", idle_unmanifested}, {"split_orphan", split_orphan}, {"missing_shard", missing_shard}, {"first_split_crash", first_split_crash},
 		{"park_unheld", park_unheld}};
+	bool ran = false;
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
+		ran = true;
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }
 	}
+	check(ran, "a host case named " + only);
 	std::cout << checks << " host checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
 }
