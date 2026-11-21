@@ -629,27 +629,6 @@ private:
 		}
 		if (resume_at) { next_seal_ = *resume_at; }
 	}
-	// After a turn completes: hands each sealed record's payload, cleared, to the recycler of the
-	// sealer that sealed it while that sealer is registered; otherwise the payload is freed.
-	void recycle(std::vector<Pending>& items) {
-		Calling calling(sealing_);
-		for (auto& item : items) {
-			if (!item.sealer) { continue; }
-			const auto group = item.record.group;
-			std::shared_ptr<Recycler> fn;
-			{
-				std::lock_guard hold(sealers_mutex_);
-				auto found = sealers_.find(group);
-				if (found == sealers_.end() || found->second.fn != item.sealer || !found->second.recycle) { continue; }  // unsealed, replaced or none
-				fn = found->second.recycle; running_ = item.sealer; running_group_ = group; running_owner_ = found->second.owner;
-				running_thread_ = std::this_thread::get_id(); running_forgotten_ = false;
-			}
-			Running running{*this};
-			item.record.payload.clear();
-			try { (*fn)(std::move(item.record.payload)); }
-			catch (...) { if (!deferred_) { deferred_ = std::current_exception(); } }
-		}
-	}
 	// A sealer or recycler call is under way: no record may be staged.
 	struct Calling { bool& flag; explicit Calling(bool& value) : flag(value) { flag = true; } ~Calling() { flag = false; } };
 	// Clears running_ once a group's calls end, however they end.
@@ -707,6 +686,28 @@ private:
 		pending_.clear();
 		for (auto& item : flight) { settle(item, error); }
 		resume([](const detail::TurnWaiter& waiter) { return waiter.group != 0; }, detail::TurnWaiter::failed);
+	}
+
+	// After a turn completes: hands each sealed record's payload, cleared, to the recycler of the
+	// sealer that sealed it while that sealer is registered; otherwise the payload is freed.
+	void recycle(std::vector<Pending>& items) {
+		Calling calling(sealing_);
+		for (auto& item : items) {
+			if (!item.sealer) { continue; }
+			const auto group = item.record.group;
+			std::shared_ptr<Recycler> fn;
+			{
+				std::lock_guard hold(sealers_mutex_);
+				auto found = sealers_.find(group);
+				if (found == sealers_.end() || found->second.fn != item.sealer || !found->second.recycle) { continue; }  // unsealed, replaced or none
+				fn = found->second.recycle; running_ = item.sealer; running_group_ = group; running_owner_ = found->second.owner;
+				running_thread_ = std::this_thread::get_id(); running_forgotten_ = false;
+			}
+			Running running{*this};
+			item.record.payload.clear();
+			try { (*fn)(std::move(item.record.payload)); }
+			catch (...) { if (!deferred_) { deferred_ = std::current_exception(); } }
+		}
 	}
 
 	IO& io_;
