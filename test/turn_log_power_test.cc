@@ -295,6 +295,117 @@ void boundary_damage(std::uint64_t seed, Damage damage, std::uint64_t& cases) {
 		} catch (const std::exception& error) { check(false, at + ": " + error.what()); }
 	}
 }
+
+std::uint64_t sector_of(std::uint64_t offset) { return offset / j::framing::sector_bytes; }
+// A clean log's written blocks: header size, epoch, bytes, and each fragment's [start, end) and
+// whether a header of its write starts before it in its sector, as scan_segment's `written`.
+struct Fragment { std::size_t start = 0, end = 0; bool written = false; };
+struct Written { std::size_t header = 0; std::uint64_t epoch = 0; std::string bytes; std::vector<Fragment> fragments; };
+std::map<std::pair<std::uint64_t, std::uint64_t>, Written> written_blocks(j::IO& io) {
+	namespace d = j::turn_log_detail; namespace f = j::framing;
+	std::map<std::pair<std::uint64_t, std::uint64_t>, Written> result;
+	auto cursor = io.scan_directory();
+	while (auto name = cursor->next()) {
+		auto number = d::segment_number(*name); if (!number) { continue; }
+		auto file = io.open_existing(*name); std::string bytes(options.block_bytes, '\0');
+		std::uint8_t kind = 0;  // the kind of the record the last First fragment began
+		for (std::uint64_t b = 0; (b + 1) * options.block_bytes <= options.segment_bytes; ++b) {
+			if (file->read_at(b * options.block_bytes, bytes) != bytes.size()) { break; }
+			const auto header = f::parse_header(bytes, d::stream(identity, options.block_bytes, *number, 0), b);
+			if (header.check != f::Check::ok) { continue; }
+			Written block{header.size, header.epoch, bytes, {}};
+			std::optional<std::size_t> in_write = 0;  // a block's header is written with its first fragment
+			for (std::size_t p = header.size; options.block_bytes - p >= f::fragment_header + 1;) {
+				const auto fragment = f::parse_fragment(std::string_view(bytes).substr(p), options.block_bytes - p, *number, header.epoch);
+				if (fragment.check != f::Check::ok) { break; }
+				const auto end = p + f::fragment_header + fragment.payload.size();
+				const std::uint64_t start = b * options.block_bytes;
+				block.fragments.push_back({p, end, in_write && sector_of(start + *in_write) == sector_of(start + p)});
+				if (fragment.type == f::Full || fragment.type == f::First) { kind = static_cast<std::uint8_t>(fragment.payload[0]); }
+				const bool ends = (fragment.type == f::Full || fragment.type == f::Last) && (kind == d::end_of_turn || kind == d::open_record);
+				in_write = ends ? std::nullopt : std::optional{p}; p = end;
+			}
+			result[{*number, b}] = std::move(block);
+		}
+	}
+	return result;
+}
+
+// A byte in the second sector of a fragment that spans two, where the next fragment starts and
+// verifies (the review's P1), in every block, the newest tail included. Where a whole header of
+// its write proves its first sector, the damage is reported and every group not lost keeps its
+// records; the others, whose header the boundary cuts, are only counted (`unproven`).
+void crossing_damage(std::uint64_t seed, std::uint64_t& cases, std::uint64_t& unproven) {
+	namespace d = j::turn_log_detail;
+	fl::filesystem clean; fl::io clean_io(clean); Workload work(seed); j::TurnRecovery recovered;
+	{ j::TurnLog log(clean_io, identity, recovered, options); for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); } }
+	clean.crash(seed, sector_cut);  // everything acknowledged is durable
+	for (const auto& [where, block] : written_blocks(clean_io)) {
+		const std::uint64_t start = where.second * options.block_bytes;
+		std::mt19937_64 random(seed * 139 + where.first * 4099 + where.second);
+		for (std::size_t i = 0; i + 1 < block.fragments.size(); ++i) {
+			const auto [p, end, written] = block.fragments[i];
+			const auto second = sector_of(start + end - 1);
+			if (sector_of(start + p) + 1 != second || sector_of(start + block.fragments[i + 1].start) != second) { continue; }
+			if (!written && sector_of(start + p + j::framing::fragment_header - 1) == second) { ++unproven; continue; }
+			const auto boundary = second * j::framing::sector_bytes - start;
+			const auto offset = start + boundary + random() % (end - boundary);
+			fl::filesystem disk = clean.snapshot(); fl::io io(disk); ++cases;
+			{
+				auto file = io.open_existing(d::segment_name(where.first)); char byte = 0;
+				file->read_at(offset, std::span<char>(&byte, 1));
+				byte = static_cast<char>(byte ^ 0x5a); file->write_at(offset, std::string_view(&byte, 1)); file->sync();
+			}
+			const auto at = "crossing block_bytes " + std::to_string(options.block_bytes) + " seed " + std::to_string(seed) + " segment " + std::to_string(where.first) + " block " + std::to_string(where.second) + " offset " + std::to_string(offset - start);
+			try {
+				j::TurnLogGroups known; for (const auto& [group, _] : work.acknowledged) { known.open.push_back(group); }
+				j::TurnLog log(io, identity, recovered, options, known);
+				bool kept = true;
+				for (const auto& [group, records] : work.acknowledged) { if (!recovered.lost.contains(group) && recovered.groups[group] != records) { kept = false; } }
+				check(recovered.damaged, "the damage is reported: " + at);
+				check(kept, "a group not lost keeps every acknowledged record: " + at);
+			} catch (const std::exception& error) { check(false, at + ": " + error.what()); }
+		}
+	}
+}
+
+// Real tears of every fragment that crosses its sector (the review's P6), read with its scan's
+// `written` and, where the tear is past its first sector, with its first sector proven too: the
+// sectors after its first read zeros, random bytes or another segment's; only the sectors it fills
+// read so, the later ones as written; or, with no header of its write before it, its first sector
+// reads so. None is damage.
+void simulated_tears(std::uint64_t seed, std::uint64_t& tears) {
+	namespace d = j::turn_log_detail; namespace f = j::framing;
+	fl::filesystem clean; fl::io clean_io(clean); Workload work(seed); j::TurnRecovery recovered;
+	{ j::TurnLog log(clean_io, identity, recovered, options); for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); } }
+	clean.crash(seed, sector_cut);
+	const auto blocks = written_blocks(clean_io);
+	for (const auto& [where, block] : blocks) {
+		const std::uint64_t start = where.second * options.block_bytes;
+		const Written* stale = nullptr;  // a block of another segment: bytes no fragment of this one verifies in
+		for (const auto& [other, candidate] : blocks) { if (other.first != where.first) { stale = &candidate; break; } }
+		std::mt19937_64 random(seed * 149 + where.first * 4099 + where.second);
+		for (const auto& [p, end, written] : block.fragments) {
+			const auto first = sector_of(start + p), last = sector_of(start + end - 1);
+			if (first == last) { continue; }
+			const std::size_t next = (first + 1) * f::sector_bytes - start;
+			// Old bytes over [from, to): after the first sector, over the filled sectors, or over the first.
+			const std::pair<std::size_t, std::size_t> spans[] = {{next, block.bytes.size()}, {next, last * f::sector_bytes - start}, {p, next}};
+			for (std::size_t span = 0; span < 3; ++span) {
+				const auto [from, to] = spans[span];
+				if (to <= from || (span == 2 && written)) { continue; }
+				for (int fill = 0; fill < 3; ++fill) {
+					if (fill == 2 && !stale) { continue; }
+					std::string torn = block.bytes;
+					for (auto k = from; k < to; ++k) { torn[k] = fill == 0 ? '\0' : fill == 1 ? static_cast<char>(random()) : stale->bytes[k]; }
+					const auto at = "seed " + std::to_string(seed) + " block_bytes " + std::to_string(options.block_bytes) + " segment " + std::to_string(where.first) + " block " + std::to_string(where.second) + " fragment " + std::to_string(p) + " span " + std::to_string(span) + " fill " + std::to_string(fill);
+					++tears; check(!d::damaged_fragment(torn, start, p, where.first, block.epoch, written), "a torn fragment reads as a tear: " + at);
+					if (!written && span != 2) { ++tears; check(!d::damaged_fragment(torn, start, p, where.first, block.epoch, true), "a torn fragment reads as a tear with its first sector proven: " + at); }
+				}
+			}
+		}
+	}
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -326,12 +437,14 @@ int main(int argc, char** argv) {
 		}
 		std::cout << "block " << block << ": " << points << " crash points (" << seconds << " with a second loss in recovery)";
 		if (block % j::framing::sector_bytes == 0 || j::framing::sector_bytes % block == 0) {
-			std::uint64_t corrupted = 0, both = 0, header = 0, last = 0;
+			std::uint64_t corrupted = 0, both = 0, header = 0, last = 0, crossing = 0, unproven = 0, tears = 0;
 			for (std::uint64_t seed = first; seed < first + seeds; ++seed) {
 				corrupted_blocks(seed, corrupted);
 				boundary_damage(seed, Damage::both, both); boundary_damage(seed, Damage::header, header); boundary_damage(seed, Damage::last, last);
+				crossing_damage(seed, crossing, unproven); simulated_tears(seed, tears);
 			}
 			std::cout << ", " << corrupted << " corrupted blocks, " << both << " doubly damaged boundaries, " << header << " damaged headers, " << last << " damaged last blocks";
+			std::cout << ", " << crossing << " damaged crossing fragments (" << unproven << " more with a cut header), " << tears << " simulated tears";
 		}
 		std::cout << ", " << failures - before << " failures\n";
 	}

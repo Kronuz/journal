@@ -6,6 +6,18 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-21
+
+### Fixed
+
+- `TurnLog` recovery reports damage in a fragment that crosses into a sector where a later
+  fragment of its segment verifies, when its own header, or a header of its write before it,
+  proves its first sector. Both sectors are then written, so the failure is damage, not a torn
+  tail: a damaged byte in such a fragment's second sector, in the last turn, no longer drops
+  that acknowledged turn unreported. A fragment that fills the next sector, is the last written
+  there, or has a header the sector boundary cuts with no header of its write before it still
+  reads as a tear ([docs/mechanisms/turn-log-damage.md](docs/mechanisms/turn-log-damage.md)).
+
 ## 2026-11-20
 
 ### Added

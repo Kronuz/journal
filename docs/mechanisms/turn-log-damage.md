@@ -8,15 +8,24 @@ dropping acknowledged records as a torn tail. The code is `scan_segment`, `damag
 
 A crash leaves each 512-byte sector old or new. Every open writes a fresh segment number, and
 segment numbers are never reused, so no stale sector holds bytes bound to this segment. The log
-writes each segment once, in order, so an old sector holds nothing of the segment past the last
-durable turn. A sector that holds a fragment of this segment that verifies therefore holds as
-written everything the log wrote in it up to that fragment, and whatever there fails to verify is
-damage. A crash cannot leave that.
+writes each segment once, in order, one write per turn and one for the open record, so an old
+sector holds nothing of a write that was not durable. A sector is therefore proven, for the bytes
+of a fragment in it, when it holds any of these:
 
-A header that names this segment and epoch proves its fragment's first sector the same way: the
-sector is new, or the fragment was durable. A fragment is as written in every sector proven this
-way. A sector the fragment fills from start to end holds nothing else that could prove it, so
-that sector may be old.
+- A later fragment of this segment that verifies. The sector holds as written everything the log
+  wrote in it before that fragment.
+- The fragment's own header, naming this segment and epoch. The sector is new, or the fragment was
+  durable.
+- A header of the fragment's own write that starts in the sector before it and verifies: the
+  block's header, or the fragment before it, when that one does not end its write. Only the last
+  fragment of a turn's end-of-turn record, or of the open record, ends a write. That header names
+  this segment there, so the sector is new or the write was durable.
+
+Bytes that verify prove a sector only through a header the sector holds whole. A payload byte
+proves nothing, since the old sector may hold the same byte: zeros, or a stale record's payload.
+A fragment is as written in every sector proven this way, so if it fails there, that is damage,
+which a crash cannot leave. A sector the fragment fills from start to end holds nothing else that
+could prove it, so that sector may be old.
 
 ## The rules
 
@@ -29,12 +38,14 @@ that sector may be old.
      - Its sector holds it whole.
      - Its checksum verifies at a length its sector holds whole. A damaged length makes such a
        fragment look as if it crossed into the next sector.
-     - A fragment of this segment verifies in the next sector. Both sectors are then proven, so a
-       fragment that ends in the next sector is as written there. One that runs on past it fills
-       that sector, so no fragment starts there. This holds whatever length the header reads.
+   - Its first sector is proven, by its header or by a header of its write before it, and a fragment
+     of this segment verifies in the next sector, which proves that sector too. The fragment ends
+     there, since one that ran on past it would fill it and leave no room for another to start.
+     This holds whatever its header reads, so it covers a header that the sector boundary cuts.
 
-   Otherwise, a fragment that crosses its sector reads as a tear, because a sector after its first
-   may be old. Such a fragment fills the next sector, or it is the last fragment written there.
+   Otherwise, a fragment that crosses its sector reads as a tear, because a sector it spans may be
+   old. Such a fragment fills the next sector, is the last fragment written there, or has a header
+   that the sector boundary cuts and no header of its write before it in its sector.
 3. **A gap that holds damage** costs the groups that its first block's manifest names. That manifest
    is in the next block's header. When no manifest reads back, the gap costs every group, and the
    damage is reported.
@@ -49,9 +60,10 @@ that sector may be old.
 - A block whose size is not a multiple of 512 can start mid-sector. The rules then cannot see many
   of its headers.
 - A damaged payload byte in a fragment that crosses its sector, in the last turn, reads as a torn
-  tail when no fragment of the segment verifies in the next sector. In that case the fragment
-  fills the next sector, or it is the last fragment written there. Only a per-sector checksum
-  could tell this damage from a tear.
+  tail when rule 2 cannot prove the sectors it spans: it fills the next sector, it is the last
+  fragment written there, or it has a header that the sector boundary cuts and no header of its
+  write before it in its sector.
+  Only a per-sector checksum could tell this damage from a tear.
 - A tear inside a sector, as on pmem without BTT, is outside the model: it reads as damage.
 
 ## Evidence

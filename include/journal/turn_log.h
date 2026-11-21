@@ -168,19 +168,26 @@ inline std::size_t sector_end(std::string_view block, std::uint64_t offset, std:
 inline bool damaged_header(std::string_view block, std::uint64_t offset, std::uint64_t segment) {
 	return verifies_in_sector(block, framing::header_bytes(0), sector_end(block, offset, 0), segment);
 }
-// A fragment at `at` that fails while its sector is this segment's: its header names this
-// segment and epoch, or a later fragment of the segment starts there. Whole in its sector, with
-// a header no writer emits, or verifying at a length its sector holds whole, it is damage.
-inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch) {
+// A failing fragment is damage when a later fragment of its segment starts in its sector; when its
+// header names its segment and epoch and it is whole there, has a header no writer emits, or verifies
+// at a length its sector holds whole; or when its header, or a header of its write before it in its
+// sector (`written`), proves that sector and a fragment of the segment verifies in the next sector
+// (docs/mechanisms/turn-log-damage.md).
+inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch, bool written) {
 	const auto end = sector_end(block, offset, at);
 	if (verifies_in_sector(block, at + 1, end, segment)) { return true; }
-	if (at + framing::fragment_header > end) { return false; }
 	const auto bytes = block.substr(at);
-	if (framing::peek64(bytes.substr(8)) != segment || framing::peek64(bytes.substr(16)) != epoch) { return false; }
-	const std::size_t length = framing::get16(bytes.substr(4)); const auto type = static_cast<std::uint8_t>(bytes[6]);
-	if (!length || framing::fragment_header + length > block.size() - at || type < framing::Full || type > framing::Last || bytes[7]) { return true; }
-	if (at + framing::fragment_header + length <= end) { return true; }
-	// Crossing its sector, it reads as a tear unless its length is what was damaged.
+	const bool named = at + framing::fragment_header <= end && framing::peek64(bytes.substr(8)) == segment && framing::peek64(bytes.substr(16)) == epoch;
+	const std::size_t length = framing::get16(bytes.substr(4));
+	if (named) {
+		const auto type = static_cast<std::uint8_t>(bytes[6]);
+		if (!length || framing::fragment_header + length > block.size() - at || type < framing::Full || type > framing::Last || bytes[7]) { return true; }
+		if (at + framing::fragment_header + length <= end) { return true; }
+	}
+	// Crossing its sector: a fragment verifying in the next sector proves that sector too.
+	if ((named || written) && end < block.size() && verifies_in_sector(block, end, sector_end(block, offset, end), segment)) { return true; }
+	if (!named) { return false; }
+	// Otherwise it reads as a tear unless its length is what was damaged.
 	std::string header(bytes.substr(4, framing::fragment_header - 4));
 	for (std::size_t whole = 1; at + framing::fragment_header + whole <= end; ++whole) {
 		header[0] = static_cast<char>(whole); header[1] = static_cast<char>(whole >> 8);
@@ -193,6 +200,8 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 	std::uint64_t here = 0;
 	auto gap = [&] { if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = here; items.push_back(std::move(item)); } };
 	std::string block(options.block_bytes, '\0'), partial; bool assembling = false; std::uint64_t partial_epoch = 0, partial_offset = 0;
+	// Where the last header or fragment that verified starts, while it does not end its write.
+	std::optional<std::size_t> in_write;
 	const auto size = std::min(file.size(), options.segment_bytes);
 	for (std::uint64_t offset = 0, index = 0; offset + options.block_bytes <= size; offset += options.block_bytes, ++index) {
 		here = offset;
@@ -204,7 +213,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			if (damaged_header(view, offset, segment)) { items.back().damage = true; }
 			continue;
 		}
-		const auto epoch = header.epoch; const auto count = header.count;
+		const auto epoch = header.epoch; const auto count = header.count; in_write = 0;
 		if (count != framing::no_manifest) {
 			auto& manifest = manifests[{framing::peek64(view.substr(44)), framing::peek32(view.substr(52))}];
 			manifest.segment = segment; manifest.block = static_cast<std::uint32_t>(index); manifest.epoch = epoch;
@@ -216,11 +225,13 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			const auto fragment = framing::parse_fragment(view.substr(position), options.block_bytes - position, segment, epoch);
 			if (fragment.check != framing::Check::ok) {
 				gap(); assembling = false;
-				if (damaged_fragment(view, offset, position, segment, epoch)) { items.back().damage = true; }
+				const bool written = in_write && (offset + *in_write) / framing::sector_bytes == (offset + position) / framing::sector_bytes;
+				if (damaged_fragment(view, offset, position, segment, epoch, written)) { items.back().damage = true; }
 				break;
 			}
 			const auto type = fragment.type; const auto payload = fragment.payload; const auto length = payload.size();
-			position += framing::fragment_header + length;
+			const auto start = position; position += framing::fragment_header + length;
+			in_write = type == framing::First || type == framing::Middle ? std::optional{start} : std::nullopt;
 			if (type == framing::Full || type == framing::First) {
 				if (assembling) { gap(); }
 				partial.assign(payload); partial_epoch = epoch; partial_offset = offset + position - framing::fragment_header - length; assembling = type == framing::First;
@@ -235,6 +246,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			std::string_view record(partial);
 			Item item; item.epoch = epoch; item.segment = segment; item.offset = partial_offset; item.kind = static_cast<std::uint8_t>(record[0]); record.remove_prefix(1);
 			item.turn = get64(record); item.group = get64(record); item.sequence = get64(record); item.payload.assign(record);
+			if (item.kind != end_of_turn && item.kind != open_record) { in_write = start; }
 			items.push_back(std::move(item));
 		}
 	}
