@@ -43,7 +43,7 @@ MUTANTS = {
         "journal_placement_test", ["repartition_lost"]),
     # A re-partition that does not mark recovery's lost ids before it writes the new generation.
     "repartition-skips-mark": ("include/journal/host.h",
-        "\t\tmark_lost(lost);\n\t\tconst auto next = generation_ + 1;", "\t\tconst auto next = generation_ + 1;",
+        "\t\tmark_lost(lost);\n\t\thost_detail::replace_file", "\t\thost_detail::replace_file",
         "journal_placement_test", ["repartition_damaged"]),
     # An open that does not mark the lost ids: retention then forgets them.
     "open-skips-mark": ("include/journal/host.h",
@@ -99,6 +99,68 @@ MUTANTS = {
     "recover-twice-from-table": ("include/journal/journal.h",
         "if (turns_->holds(group_)) { throw", "if (false) { throw",
         "journal_host_test", ["second_recovery"]),
+    # journal-idle-groups: a parked (closed) group counted open, as D10 item 3 wrote it: any
+    # damage then loses every parked group (review F3).
+    "parked-as-open": ("include/journal/host.h",
+        "if (entry.state == GroupState::open) { loop.open.push_back(id); }", "loop.open.push_back(id);",
+        "journal_host_test", ["idle_damage"]),
+    # A wake whose table flip never commits before its turn: a crash then reads the group parked
+    # and drops its acknowledged post-wake records.
+    "wake-skips-commit": ("include/journal/host.h",
+        "\t\t\tdrivers_.back()->before_turn([this, loop] { commit_transitions(loop); });\n", "",
+        "journal_host_test", ["idle_crash"]),
+    # A create's first serial block, undurable until its first turn: an artifact named by it
+    # leaks once a crash loses the create.
+    "create-with-block": ("include/journal/host.h",
+        "entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, 0, 0, {}, 0};", "entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, host_detail::serial_block, 0, {}, 0};",
+        "journal_host_test", ["recreate"]),
+    # Park ignores the log: a parked group keeps its checkpoint live, so the log never shrinks.
+    "park-keeps-log": ("include/journal/host.h",
+        "{ driver_of(record.group).forget(record.group, record.sequence + 1); opened_", "{ opened_",
+        "journal_journal_test", ["park_count"]),
+    # A damaged table shard fails the host's open instead of its own groups.
+    "damaged-shard-fails-open": ("include/journal/host.h",
+        "} catch (const Corruption&) { damaged_[slot].push_back(node); }", "} catch (const Corruption&) { throw; }",
+        "journal_host_test", ["table_damage"]),
+    # A split node whose children cover it wins at open: the split's changes revert.
+    "split-keeps-parent": ("include/journal/host.h",
+        "\tif (!rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {",
+        "\tif (!stored && !rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {",
+        "journal_host_test", ["split_stale_node"]),
+    # A split node removed before its children are durable: a crash loses its entries.
+    "split-removes-early": ("include/journal/host.h",
+        "\t\tio_->sync_directory();\n\t\tfor (auto slot : slots) { orphans_[slot].clear(); }\n\t\tfor (auto shard : split) {",
+        "\t\tfor (auto slot : slots) { orphans_[slot].clear(); }\n\t\tfor (auto shard : split) {",
+        "journal_host_test", ["split_crash"]),
+    # Review F1: a failed split's children are never removed: they cover their node at open
+    # and shadow the slot's later commits, so an acknowledged create reads none.
+    "no-orphans": ("include/journal/host.h",
+        "\t\tremove_orphans(slots);\n", "",
+        "journal_host_test", ["split_orphan"]),
+    # Review F2: open deletes a slot's shards when one file is missing: their groups read none.
+    "missing-shard-stale": ("include/journal/host.h",
+        "\tif (rest.empty() || depth(node) == max_depth) { kept.push_back(node); missing.push_back(node); return; }\n\tresolve(rest.first(split), 2 * node, kept, stale, missing);\n\tresolve(rest.subspan(split), 2 * node + 1, kept, stale, missing);\n}",
+        "\tstale.insert(stale.end(), rest.begin(), rest.end());\n}",
+        "journal_host_test", ["missing_shard"]),
+    # Review F2: a slot's first commit splits its unstored root: a power cut then leaves children
+    # that do not cover it, which open reads as a missing shard, so unacknowledged creates are lost.
+    "split-unstored": ("include/journal/host.h",
+        "if (stored(shard)) { host_detail::partition(", "if (true) { host_detail::partition(",
+        "journal_host_test", ["first_split_crash"]),
+    # Review F3: park skips the groups a consumer created or attached without a hold (strata's).
+    "park-skips-opened": ("include/journal/host.h",
+        "if (holding(group) || turns.staged(group) || turns.sealed(group)) { continue; }",
+        "if (holding(group) || opened_[at].contains(group) || turns.staged(group) || turns.sealed(group)) { continue; }",
+        "journal_host_test", ["park_unheld"]),
+    # Review F3: a closed or parked group keeps its opened_ entry: heap per closed group.
+    "close-keeps-opened": ("include/journal/host.h",
+        " opened_[loop(record.group)].erase(record.group); }", " }",
+        "journal_host_test", ["park_unheld"]),
+    # Review F3: park takes a group whose consumer has it open by its sealer (strata's index).
+    "park-ignores-sealer": ("include/journal/host.h",
+        "if (holding(group) || turns.staged(group) || turns.sealed(group)) { continue; }",
+        "if (holding(group) || turns.staged(group)) { continue; }",
+        "journal_host_test", ["park_unheld"]),
 }
 
 def main():

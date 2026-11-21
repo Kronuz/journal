@@ -14,6 +14,42 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   serializes the loop itself, as strata's `turn_sealer` does under its turn mutex. Debug builds
   check a table's calls against one owner thread; after the handoff they check against the
   adopting thread, so a close on a thread other than the first no longer aborts.
+- `Host::park(loop)` parks the loop's idle groups: every group no consumer has open (no hold,
+  no sealer), with nothing staged and one live record, a checkpoint, closes into the table with
+  one commit for them all. A parked group is a closed entry: no log record, no heap, 45 bytes plus
+  its checkpoint in its shard ([docs/design/idle-groups.md](docs/design/idle-groups.md)).
+- `TurnDriver::before_turn(hook)`: a host's table commit, run before each turn with records.
+- `TurnLog::peek(group)` reads a group's live records without restoring it; `TurnLog::idle()`
+  lists the groups whose only live record is a checkpoint.
+- `host_test split_crash`, `split_stale_node`, `table_damage`, `park_mid_turn`,
+  `idle_unmanifested` (review F3's unmanifested damage of a woken group's turn), `split_orphan`,
+  `missing_shard`, `first_split_crash` and `park_unheld`.
+- `TurnLogStats::forward_scanned` counts the live records `forward_slice` visits.
+
+### Changed
+
+- The group table is bounded: each slot's table is a trie of shard files
+  `groups-<slot:3x>-<node:9x>`, split once one passes 4 KiB, so a create, wake, park or block
+  reservation rewrites one file of at most 4 KiB instead of its whole slot (15 KB at 1M groups).
+  The old `groups-<slot:3x>` files are not read.
+- A damaged or missing table shard no longer fails the host's open: every id it could hold is
+  lost, the shard is never rewritten, and the log forgets its groups. A slot's first commit
+  writes its root whole; only a stored shard splits.
+- A closed or parked group leaves the host's record of groups a consumer opened, so strata's
+  groups, which take no hold, cost no heap once closed.
+- The in-memory release step is renamed evict: `TurnDriver::evict`, `TurnDriver::evicted`,
+  `TurnLog::evict` and `TurnLog::evicted` replace `park` and `parked`, which now name the durable
+  table state alone (`Host::park`).
+- `Host::create_group` and `Host::reopen_group` no longer commit their shard when they return:
+  the loop's changed slots commit before its next turn with records, so each transition is
+  durable before the turn carrying the group's first record, and a turn pays one batched file
+  sync and one directory sync for all of them. A failed commit there fails the driver, as a
+  failed turn does. A created group's first serial block is reserved, durably, by its first
+  artifact.
+- A table commit syncs every shard it replaces with one `sync_files` call, then renames them and
+  syncs the directory once.
+- A re-partition streams one old log at a time into the new generation, so its memory is one
+  log's live records and one turn per new loop, not every log's records.
 
 ### Fixed
 
