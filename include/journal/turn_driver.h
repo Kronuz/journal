@@ -288,11 +288,12 @@ public:
 		// safe: a durable record reported failed is merely unacknowledged.
 		try { log_.completed(); } catch (...) { log_.failed(); write_.reset(); fail(std::current_exception()); throw; }
 		write_.reset();
-		auto flight = std::exchange(flight_, std::move(spare_flight_));  // flight_ takes the spare's capacity
+		auto flight = std::move(flight_); flight_.clear();
 		for (auto& item : flight) { finish(item, nullptr); }
 		resume([this](const detail::TurnWaiter& waiter) { return waiter.group && log_.sequence(waiter.group) >= waiter.sequence; });
 		recycle(flight);
-		flight.clear(); spare_flight_ = std::move(flight);
+		// The next turn reuses this one's buffer, unless a turn begun meanwhile took one.
+		flight.clear(); if (!flight_.capacity()) { flight_ = std::move(flight); }
 		// A repeat sealer call failed while sealing this turn: its records are acknowledged above,
 		// then the driver fails with that call's error.
 		if (deferred_) { auto error = std::exchange(deferred_, nullptr); fail(error); std::rethrow_exception(error); }
@@ -726,7 +727,6 @@ private:
 	TurnRecovery recovered_;
 	TurnLog log_;
 	std::vector<Pending> pending_, flight_;
-	std::vector<Pending> spare_flight_;  // the last completed turn's, emptied: flight_'s next buffer
 	std::vector<TurnRecord> records_;  // start()'s, emptied between turns
 	std::vector<std::uint64_t> order_;  // seal_turn()'s, emptied between turns
 	mutable std::mutex sealers_mutex_;  // the sealer table and running_; never held while a sealer runs

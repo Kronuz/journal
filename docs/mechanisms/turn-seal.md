@@ -249,9 +249,10 @@ A sealed body is copied once, into the turn's bytes (strata `docs/design/rocksdb
   nothing back. A staged record's payload is freed once `stage()` has framed it, as before.
   An unsealed sealer's function and recycler, with their captures, stay alive until the turn in
   flight completes: an owner that `unseal()`s must not count on its captures being released then.
-- **The driver's own buffers.** Its pending, in-flight and spare in-flight vectors, the turn's
-  record list and the sealing order keep their capacity across turns, so a warm turn through the
-  driver allocates nothing in `begin()` or `completed()`.
+- **The driver's own buffers.** Its pending and in-flight vectors, the turn's record list and
+  the sealing order keep their capacity across turns, one buffer each, so a warm turn through the
+  driver allocates nothing in `begin()` or `completed()`. What they keep is sized by the largest
+  turn, never by the groups a host has held: a parked group costs the host no heap.
 
 Measured (`test/turn_buffers_probe.cc`, the same source built against journal:178030b and this
 code, faultfs, one `strict` job, 261120-201407-998e89, three alternations): a warm turn of 32
