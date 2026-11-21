@@ -7,9 +7,16 @@ dropping acknowledged records as a torn tail. The code is `scan_segment`, `damag
 ## The crash model
 
 A crash leaves each 512-byte sector old or new. Every open writes a fresh segment number, and
-segment numbers are never reused, so no stale sector holds bytes bound to this segment. A sector
-that holds a fragment of this segment that verifies is therefore new, and whatever else in it fails
-to verify is damage. A crash cannot leave that.
+segment numbers are never reused, so no stale sector holds bytes bound to this segment. The log
+writes each segment once, in order, so an old sector holds nothing of the segment past the last
+durable turn. A sector that holds a fragment of this segment that verifies therefore holds as
+written everything the log wrote in it up to that fragment, and whatever there fails to verify is
+damage. A crash cannot leave that.
+
+A header that names this segment and epoch proves its fragment's first sector the same way: the
+sector is new, or the fragment was durable. A fragment is as written in every sector proven this
+way. A sector the fragment fills from start to end holds nothing else that could prove it, so
+that sector may be old.
 
 ## The rules
 
@@ -22,9 +29,12 @@ to verify is damage. A crash cannot leave that.
      - Its sector holds it whole.
      - Its checksum verifies at a length its sector holds whole. A damaged length makes such a
        fragment look as if it crossed into the next sector.
+     - A fragment of this segment verifies in the next sector. Both sectors are then proven, so a
+       fragment that ends in the next sector is as written there. One that runs on past it fills
+       that sector, so no fragment starts there. This holds whatever length the header reads.
 
-   Otherwise, a fragment that crosses its sector reads as a tear, because the next sector may be
-   old.
+   Otherwise, a fragment that crosses its sector reads as a tear, because a sector after its first
+   may be old. Such a fragment fills the next sector, or it is the last fragment written there.
 3. **A gap that holds damage** costs the groups that its first block's manifest names. That manifest
    is in the next block's header. When no manifest reads back, the gap costs every group, and the
    damage is reported.
@@ -39,7 +49,9 @@ to verify is damage. A crash cannot leave that.
 - A block whose size is not a multiple of 512 can start mid-sector. The rules then cannot see many
   of its headers.
 - A damaged payload byte in a fragment that crosses its sector, in the last turn, reads as a torn
-  tail.
+  tail when no fragment of the segment verifies in the next sector. In that case the fragment
+  fills the next sector, or it is the last fragment written there. Only a per-sector checksum
+  could tell this damage from a tear.
 - A tear inside a sector, as on pmem without BTT, is outside the model: it reads as damage.
 
 ## Evidence
