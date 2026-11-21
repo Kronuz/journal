@@ -140,14 +140,14 @@ public:
 		auto found = recovered_.groups.find(group); return found == recovered_.groups.end() ? none : found->second;
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
-	// A group no Store holds leaves memory but not the log (TurnLog::park); live() reads its
+	// A group no Store holds leaves memory but not the log (TurnLog::evict); live() reads its
 	// records back for the next Store. Nothing of it may be staged. Its refusal goes too: the
 	// refused records never reached the log, and no waiter of the old holder remains.
-	void park(std::uint64_t group) {
+	void evict(std::uint64_t group) {
 		if (staged(group)) { throw std::logic_error("the group has records staged or in flight"); }
-		log_.park(group); recovered_.groups.erase(group); refused_.erase(group);
+		log_.evict(group); recovered_.groups.erase(group); refused_.erase(group);
 	}
-	bool parked(std::uint64_t group) const { return log_.parked(group); }
+	bool evicted(std::uint64_t group) const { return log_.evicted(group); }
 	std::vector<TurnRecord> live(std::uint64_t group) { return log_.live(group); }
 	// A closed group leaves the log (TurnLog::forget) and its sealer is unregistered: no
 	// sealer of it runs once this returns. Nothing of it may be staged. Every durable() waiter
@@ -238,12 +238,16 @@ public:
 	// sequence + 1, so forget() keeps no entry per closed group. Called on the loop, maybe under
 	// the sealers' lock; it must not throw.
 	void retire_with(std::function<std::uint64_t(std::uint64_t)> floor) { retired_by_ = std::move(floor); }
+	// A host's table commit before each turn that has records, ahead of encoding: a group's
+	// create or wake is durable before the turn carrying its first record (docs/design/idle-groups.md
+	// D5). On the loop; one that throws fails the driver, as a failed turn does.
+	void before_turn(std::function<void()> hook) { before_turn_ = std::move(hook); }
 	bool failed() const noexcept { return log_failed_; }
 
 	// Stages a record for the next turn that has room for it; its operation, if any, completes
 	// at that turn's barrier with the token it was staged with. A record no segment holds is
 	// refused at the next turn: its operation, and those of its group's later records, fail with
-	// std::length_error, and so do durable() waits on them, until the group is forgotten or parked.
+	// std::length_error, and so do durable() waits on them, until the group is forgotten or evicted.
 	// Returns the record's sequence.
 	std::uint64_t stage(TurnRecord record, std::shared_ptr<IOOperation> operation = {}, MutationToken token = {}) {
 		if (log_failed_) { throw std::logic_error("turn driver failed"); }
@@ -486,6 +490,13 @@ private:
 		const auto take = used <= whole_room() ? records.size() : log_.fitting(records);
 		for (std::size_t i = take; i < records.size(); ++i) { pending_[i].record = std::move(records[i]); }
 		records.resize(take);
+		if (before_turn_) {
+			try { before_turn_(); }
+			catch (...) {
+				for (std::size_t i = 0; i < take; ++i) { pending_[i].record = std::move(records[i]); }
+				fail(std::current_exception()); throw;
+			}
+		}
 		flight_.assign(std::make_move_iterator(pending_.begin()), std::make_move_iterator(pending_.begin() + static_cast<std::ptrdiff_t>(take)));
 		pending_.erase(pending_.begin(), pending_.begin() + static_cast<std::ptrdiff_t>(take));
 		try { write_ = log_.stage(records); }
@@ -513,7 +524,7 @@ private:
 	// Takes out of pending_ each record that does not encode alone in an empty segment, as encode()
 	// refuses it, and every later record of its group, and fails their operations and the durable()
 	// waits on them; the rest keep their order. A refused group seals nothing more, and its sealer
-	// owes nothing, until it is forgotten or parked.
+	// owes nothing, until it is forgotten or evicted.
 	void refuse() {
 		const auto room = whole_room();
 		std::vector<Pending> refused;
@@ -683,10 +694,11 @@ private:
 	std::map<std::uint64_t, Sealing> sealers_;
 	std::map<std::uint64_t, std::uint64_t> retired_;  // per group forgotten past its host's floor: retired()
 	std::function<std::uint64_t(std::uint64_t)> retired_by_;  // the host's floor: retire_with()
+	std::function<void()> before_turn_;  // the host's table commit: before_turn()
 	std::uint64_t kept(std::uint64_t group) const { auto found = retired_.find(group); return found == retired_.end() ? 0 : found->second; }
 	// A group whose record at `hole` no segment holds: its records from there through `last` failed.
 	struct Refusal { std::uint64_t hole = 0, last = 0; std::exception_ptr error; };
-	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten or parked
+	std::map<std::uint64_t, Refusal> refused_;  // on the loop, until the group is forgotten or evicted
 	std::shared_ptr<Sealer> running_;  // the sealer being called, on running_thread_
 	std::uint64_t running_group_ = 0;  // and the group and owner it was called for
 	const void* running_owner_ = nullptr;

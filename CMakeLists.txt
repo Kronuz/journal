@@ -38,10 +38,20 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		if(t IN_LIST faultfs_tests)
 			target_link_libraries(journal_${t}_test PRIVATE faultlab::faultlab)
 		endif()
-		if(NOT t STREQUAL "placement" AND NOT t STREQUAL "turn_seal")
+		if(NOT t STREQUAL "placement" AND NOT t STREQUAL "turn_seal" AND NOT t STREQUAL "host")
 			add_test(NAME journal_${t} COMMAND journal_${t}_test)
 			set_tests_properties(journal_${t} PROPERTIES TIMEOUT 30)
 		endif()
+	endforeach()
+	# Host runs one entry per case, read from host_test.cc's case list, so each has its own time
+	# under the sanitizers and the cases run in parallel.
+	set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/host_test.cc)
+	file(READ ${CMAKE_CURRENT_SOURCE_DIR}/test/host_test.cc host_source)
+	string(REGEX MATCHALL "\\{\"[a-z_]+\", [a-z_]+\\}" host_cases "${host_source}")
+	foreach(entry ${host_cases})
+		string(REGEX REPLACE "^\\{\"([a-z_]+)\".*" "\\1" c "${entry}")
+		add_test(NAME journal_host_${c} COMMAND journal_host_test ${c})
+		set_tests_properties(journal_host_${c} PROPERTIES TIMEOUT 600)
 	endforeach()
 	# Placement runs one entry per case, and remap's crash points in eight shards that together
 	# cut every durable step: each entry stays well inside its timeout under TSan.
