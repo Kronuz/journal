@@ -444,7 +444,7 @@ void recycle() {
 			const auto [sealing, completing] = run_turn(groups, [] {});
 			check(!open_plain, "the plain sealer's record sealed: " + at);
 			for (std::uint64_t group = 1; group <= groups; ++group) { check(handed[group] == t + 1, "group " + std::to_string(group) + "'s buffer came back once: " + at); }
-			if (t >= 2) {
+			if (t >= 4) {  // the log's live index has its spare nodes by then
 				check(sealing.calls == 0 && sealing.bytes == 0, "a warm begin() allocates nothing: " + at + ": " + std::to_string(sealing.calls) + " allocations, " + std::to_string(sealing.bytes) + " bytes");
 				check(completing.calls == 0 && completing.bytes == 0, "a warm completed() allocates nothing: " + at + ": " + std::to_string(completing.calls) + " allocations, " + std::to_string(completing.bytes) + " bytes");
 			}
