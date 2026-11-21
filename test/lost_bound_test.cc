@@ -257,11 +257,46 @@ void retention() {
 	auto host = std::make_unique<j::Host>(host_io(disk), host_identity, j::HostOptions{3, small});
 	check(host->status(1) == j::GroupStatus::bounded && host->bound(1) == 2 && host->driver_of(1).records(1) == after(w[1], 2), "a re-partition carries the records after the bound");
 }
+
+// One gap over two blocks, past the newest epoch's last kept turn (rule 5). Block W holds group
+// 1's batch 2 (turn K), then the first fragment of group 2's 700-byte batch (turn T) in W's
+// second sector; W+1 holds that batch's last fragment, then group 1's batch 3 in W+1's first
+// sector. A byte flipped in each fragment makes one gap from W into W+1, whose manifest alone
+// names batch 3: group 1 is lost, or bounded at 3 or above, never at 2.
+void spans() {
+	const std::uint64_t block = options.block_bytes, sector = 512;
+	for (std::size_t filler = 8; filler < 2000; ++filler) {
+		fl::filesystem disk;
+		Records w;
+		{
+			auto host = open(disk);
+			for (std::uint64_t g = 1; g <= 2; ++g) { host->create_group(g); stage(*host, w, g, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)); }
+			commit(*host);
+			stage(*host, w, 1, j::TurnRecordKind::Batch, run('~', filler)); commit(*host);
+			stage(*host, w, 2, j::TurnRecordKind::Batch, run('Q', 700)); stage(*host, w, 1, j::TurnRecordKind::Batch, run('Z', 40)); commit(*host);
+		}
+		const auto [segment, q] = find(disk, run('Q', 16));
+		const auto k = find(disk, run('~', 8)).second, z = find(disk, run('Z', 40)).second;
+		if (segment.empty()) { continue; }
+		const auto at = q / block, first = q - j::turn_log_detail::record_header - 24;  // Q's first fragment
+		const bool fits = first / block == at && first % block >= sector && first % block + 24 + j::turn_log_detail::record_header + 700 > block &&
+			k / block == at && k < first && z / block == at + 1 && (z + 40) % block < sector && z > (at + 1) * block;
+		if (!fits) { continue; }
+		damage(disk, segment, q + 10); damage(disk, segment, z + 10);
+		auto host = open(disk);
+		check(host->driver(0).recovered().damaged, "the two-block damage is reported");
+		const auto status = host->status(1);
+		check(status == j::GroupStatus::lost || (status == j::GroupStatus::bounded && host->bound(1) >= 3),
+			"group 1, whose batch 3 the gap's second block held, is lost or bounded at 3 or above (bound " + std::to_string(host->bound(1)) + ")");
+		return;
+	}
+	check(false, "a filler lays the gap over two blocks");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
-	const std::vector<std::pair<std::string, void (*)()>> cases{{"bounds", bounds}, {"crash", crash}, {"second", second}, {"retention", retention}};
+	const std::vector<std::pair<std::string, void (*)()>> cases{{"bounds", bounds}, {"crash", crash}, {"second", second}, {"retention", retention}, {"spans", spans}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

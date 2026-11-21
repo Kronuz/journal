@@ -166,6 +166,7 @@ struct Item {
 	std::uint64_t turn = 0, group = 0, sequence = 0;
 	std::string payload;
 	std::uint64_t segment = 0, offset = 0;  // the record's first fragment; a gap's block start
+	std::uint64_t last = 0;  // a gap's last block whose bytes may begin a lost record
 };
 // Per described block: its groups' highest sequences, and where the header naming them is.
 struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0, epoch = 0; std::uint32_t block = 0; };
@@ -211,17 +212,23 @@ inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::
 }
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
 	std::uint64_t here = 0;
-	auto gap = [&] { if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = here; items.push_back(std::move(item)); } };
+	// A gap merges every unreadable run up to the next record. `holds`: this block's bytes may
+	// begin a lost record (a continuation's record began in a block the gap covers already).
+	auto gap = [&](bool holds) {
+		if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = item.last = here; items.push_back(std::move(item)); }
+		else if (holds) { items.back().last = here; }
+	};
 	std::string block(options.block_bytes, '\0'), partial; bool assembling = false; std::uint64_t partial_epoch = 0, partial_offset = 0;
 	const auto size = std::min(file.size(), options.segment_bytes);
 	for (std::uint64_t offset = 0, index = 0; offset + options.block_bytes <= size; offset += options.block_bytes, ++index) {
 		here = offset;
-		if (file.read_at(offset, block) != block.size()) { gap(); assembling = false; continue; }
+		if (file.read_at(offset, block) != block.size()) { gap(true); assembling = false; continue; }
 		std::string_view view(block);
 		const auto header = framing::parse_header(view, stream(identity, options.block_bytes, segment, 0), index);
 		if (header.check != framing::Check::ok) {
-			gap(); assembling = false;
-			if (damaged_header(view, offset, segment)) { items.back().damage = true; }
+			const bool damage = damaged_header(view, offset, segment);  // else unwritten, stale or torn
+			gap(damage); assembling = false;
+			if (damage) { items.back().damage = true; }
 			continue;
 		}
 		const auto epoch = header.epoch; const auto count = header.count;
@@ -235,30 +242,30 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		while (options.block_bytes - position >= framing::fragment_header + 1) {
 			const auto fragment = framing::parse_fragment(view.substr(position), options.block_bytes - position, segment, epoch);
 			if (fragment.check != framing::Check::ok) {
-				gap(); assembling = false;
+				gap(true); assembling = false;
 				if (damaged_fragment(view, offset, position, segment, epoch)) { items.back().damage = true; }
 				break;
 			}
 			const auto type = fragment.type; const auto payload = fragment.payload; const auto length = payload.size();
 			position += framing::fragment_header + length;
 			if (type == framing::Full || type == framing::First) {
-				if (assembling) { gap(); }
+				if (assembling) { gap(false); }
 				partial.assign(payload); partial_epoch = epoch; partial_offset = offset + position - framing::fragment_header - length; assembling = type == framing::First;
 				if (assembling) { continue; }
 			} else {
-				if (!assembling || partial_epoch != epoch) { gap(); assembling = false; continue; }
+				if (!assembling || partial_epoch != epoch) { gap(false); assembling = false; continue; }
 				partial.append(payload);
 				if (type == framing::Middle) { continue; }
 				assembling = false;
 			}
-			if (partial.size() < record_header) { gap(); continue; }
+			if (partial.size() < record_header) { gap(true); continue; }
 			std::string_view record(partial);
 			Item item; item.epoch = epoch; item.segment = segment; item.offset = partial_offset; item.kind = static_cast<std::uint8_t>(record[0]); record.remove_prefix(1);
 			item.turn = get64(record); item.group = get64(record); item.sequence = get64(record); item.payload.assign(record);
 			items.push_back(std::move(item));
 		}
 	}
-	if (assembling) { gap(); }
+	if (assembling) { gap(false); }
 }
 }  // namespace turn_log_detail
 
@@ -745,12 +752,16 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	std::vector<std::size_t> kept_records; std::map<std::uint64_t, std::uint64_t> named; std::set<std::size_t> counted;
 	auto name = [&](std::uint64_t group, std::uint64_t sequence) { auto& bound = named[group]; bound = std::max(bound, sequence); };
 	bool unknown = false, damaged = false;  // unknown: damage whose groups no manifest names
+	// A gap costs what every block it covers names, through its last that may begin a lost record.
 	auto gap_damage = [&](std::size_t g) {
 		if (!counted.insert(g).second) { return; }
 		damaged = true;
-		auto found = manifests.find({items[g].segment, static_cast<std::uint32_t>(items[g].offset / options_.block_bytes)});
-		if (found == manifests.end()) { unknown = true; return; }
-		for (const auto& [group, sequence] : found->second.groups) { if (!superseded(group, sequence)) { name(group, sequence); } }
+		const auto& gap = items[g];
+		for (auto block = gap.offset / options_.block_bytes; block <= std::max(gap.offset, gap.last) / options_.block_bytes; ++block) {
+			auto found = manifests.find({gap.segment, static_cast<std::uint32_t>(block)});
+			if (found == manifests.end()) { unknown = true; return; }
+			for (const auto& [group, sequence] : found->second.groups) { if (!superseded(group, sequence)) { name(group, sequence); } }
+		}
 	};
 	std::uint64_t last_turn = 0;
 	// Per epoch, the block where its last kept turn ends: a manifest is acknowledged only if

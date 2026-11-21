@@ -19,12 +19,16 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   keeps the group, which reports `GroupStatus::bounded`. A reader holding the group through
   `Host::bound(group)` continues it from the records after the bound; one that does not calls
   `Host::lose(group)`. A `Journal` Store loses a bounded group on recover.
+- A damaged gap that runs on into later blocks costs each of their manifests, through the last
+  block whose bytes may begin a lost record, and is `unknown` when one of them is missing. It
+  cost only its first block's manifest: past the newest epoch's last kept turn, a group a later
+  block named lost a record silently.
 
 ### Added
 
 - `TurnLogGroups::bound`, `TurnLog::keep(group, bound)`, `TurnLog::refuse(group)`,
   `TurnDriver::keep(group)`, `Host::bound(group)`, `Host::lose(group)`.
-- `lost_bound_test bounds`, `crash`, `second` and `retention`.
+- `lost_bound_test bounds`, `crash`, `second`, `retention` and `spans`.
 
 ## 2026-11-20
 
