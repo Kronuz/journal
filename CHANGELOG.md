@@ -62,6 +62,14 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   forwarded copy after the damage read as such a write and kept a group whose newer records the
   damage held. A byte-granular cut inside a sector, which the sector crash model never leaves,
   now reads as damage.
+- `TurnLog` recovery reports damage that reads as a segment's unwritten end: a tail gap holding
+  a header or fragment that fails while its sector holds bytes bound to its segment costs what
+  its block's manifest names, or every group. Before, in the oldest segment it cost nothing, so
+  a group whose records were all there vanished unreported, and before an incomplete
+  acknowledged turn it lost its charge to an earlier segment's empty tail.
+- A fragment whose damaged length makes it cross its sector, read as a tear before, is damage
+  when its checksum verifies at a length its sector holds whole: a flipped length byte in the
+  last turn no longer drops that acknowledged turn as the torn tail.
 
 ## 2026-11-19
 

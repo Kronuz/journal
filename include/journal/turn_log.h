@@ -169,8 +169,8 @@ inline bool damaged_header(std::string_view block, std::uint64_t offset, std::ui
 	return verifies_in_sector(block, framing::header_bytes(0), sector_end(block, offset, 0), segment);
 }
 // A fragment at `at` that fails while its sector is this segment's: its header names this
-// segment and epoch, or a later fragment of the segment starts there. Whole in its sector, or
-// with a header no writer emits, it is damage.
+// segment and epoch, or a later fragment of the segment starts there. Whole in its sector, with
+// a header no writer emits, or verifying at a length its sector holds whole, it is damage.
 inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch) {
 	const auto end = sector_end(block, offset, at);
 	if (verifies_in_sector(block, at + 1, end, segment)) { return true; }
@@ -179,7 +179,15 @@ inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::
 	if (framing::peek64(bytes.substr(8)) != segment || framing::peek64(bytes.substr(16)) != epoch) { return false; }
 	const std::size_t length = framing::get16(bytes.substr(4)); const auto type = static_cast<std::uint8_t>(bytes[6]);
 	if (!length || framing::fragment_header + length > block.size() - at || type < framing::Full || type > framing::Last || bytes[7]) { return true; }
-	return at + framing::fragment_header + length <= end;
+	if (at + framing::fragment_header + length <= end) { return true; }
+	// Crossing its sector, it reads as a tear unless its length is what was damaged.
+	std::string header(bytes.substr(4, framing::fragment_header - 4));
+	for (std::size_t whole = 1; at + framing::fragment_header + whole <= end; ++whole) {
+		header[0] = static_cast<char>(whole); header[1] = static_cast<char>(whole >> 8);
+		Checksum checksum; checksum.update(header); checksum.update(bytes.substr(framing::fragment_header, whole));
+		if (checksum.value() == framing::peek32(bytes)) { return true; }
+	}
+	return false;
 }
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
 	std::uint64_t here = 0;
@@ -646,7 +654,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 		std::map<std::uint64_t, Turn> turns; std::vector<std::size_t> gaps, tails;
 		for (std::size_t i = open.begin; i < stop; ++i) {
 			const auto& item = items[i];
-			if (item.tail) { tails.push_back(i); continue; }
+			if (item.tail && !item.damage) { tails.push_back(i); continue; }  // damage no crash leaves is no unwritten end
 			const bool recognized = (item.kind >= 1 && item.kind <= 3) || item.kind == end_of_turn;
 			if (item.gap || item.epoch != open.epoch || !recognized) { gaps.push_back(i); continue; }
 			if (item.turn <= open.kept || item.turn > limit) { continue; }
