@@ -64,7 +64,10 @@ struct Workload {
 		for (auto n = random() % 3 + 1; n; --n) {
 			auto group = random() % 6 + 1;
 			auto& sequence = next.try_emplace(group, log.sequence(group)).first->second;
-			batch.push_back(record(group, ++sequence, random() % 700 + 1, random() % 5 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint));
+			// Drawn in order: an argument list's evaluation order differs between compilers.
+			const std::size_t size = random() % 700 + 1;
+			const auto kind = random() % 5 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint;
+			batch.push_back(record(group, ++sequence, size, kind));
 		}
 		return batch;
 	}
