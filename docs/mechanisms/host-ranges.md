@@ -1,4 +1,4 @@
-> Status: CURRENT (2026-11-18) which thread owns `Host::ranges_`, the table of the groups' views'
+> Status: CURRENT (2026-11-20) which thread owns `Host::ranges_`, the table of the groups' views'
 > serial ranges, in `include/journal/host.h`.
 > Consumers: every shared Store (`Journal(Host&, group)` takes its view through `group_io`), and
 > reclamation scans that run a view's scan primitive on a completion worker.
@@ -29,10 +29,25 @@ a table from group id to the live `Range`s so that a commit of the group's table
    is empty and the constructor's thread owns no table.
 5. **Debug builds check it.** `owned_ranges(g)`, the one way `group_io` and `publish` reach a
    table, binds table `loop(g)` to the first thread that touches it after the open, and asserts
-   that every later caller is that thread.
+   that every later caller is that thread. A thread started after the owner exits may take its
+   id and pass: the check can miss a stranger, never abort the owner.
+6. **A handoff moves it.** `Host::adopt_loop(l)` makes the calling thread table `l`'s owner, and
+   the check follows it: the new thread's calls pass, the old thread's abort.
 
 One thread may run several loops (the tests drive every loop from one thread). A loop's table
-stays with its first thread for the host's life.
+stays with its first thread until a thread adopts it.
+
+## The handoff
+
+A caller that serializes a loop itself, rather than running it on one thread, calls
+`adopt_loop(l)` under that serialization before it touches loop `l`'s table from the current
+thread. strata's `turn_sealer` is that caller: it runs every table call (create, close, reopen,
+attach) under its turn mutex, from whichever thread calls in. The mutex orders the handoff after
+the old owner's last table call and before the new owner's first, which is what makes the table
+safe without a lock of its own; the handoff only tells the debug check who holds it. It is the
+caller's statement, not a guess: the host never infers an owner from a held lock, since it cannot
+see which one serializes the loop. A release build keeps no owner, so the handoff costs nothing
+there but the bounds check that refuses a loop the host lacks (`std::out_of_range`).
 
 ## The callers
 
@@ -64,3 +79,13 @@ publishing to a view it took first. Under TSan (`-fsanitize=thread`) it reports 
 held view of a created group lists the group's first artifact afterwards. A mutant that sends
 every group to table 0 (one shared table) makes TSan report the race and the test exit nonzero.
 `host_test view_sweep` checks the sweep bound on one loop's table.
+
+`host_test loop_handoff` adopts loop 0's table on a second thread, which takes a view and creates
+a group; in a forked child, a view or a create from the old owner and a view from other threads
+each abort on the check (two live threads probe at once, since a new one may reuse the exited
+adopter's id), and adopting the table back makes the first thread's calls pass.
+`host_test handoff_scope` checks that the handoff takes effect at `adopt_loop` and moves only the
+named loop: on a 2-loop host a thread adopts loop 1 and makes no call, then the first thread's
+loop-1 view aborts while its loop-0 view passes.
+`host_test handoff_close` is strata's t6w case: a group created and checkpointed on the first
+thread and closed on another aborts without the handoff and closes with it.
