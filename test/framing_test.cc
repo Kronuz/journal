@@ -337,6 +337,36 @@ void rule_rows() {
 	auto file4 = stored("bad-header", bad_header);
 	check(refuses([&] { f::read_record(*file4, stream, clean.records[2].offset); }), "read_record refuses a block header that fails its check");
 }
+// read_record streams a block header's manifest and CRC through a fixed 1 KiB buffer: a manifest
+// that ends with the first read (64 groups: the CRC is a read of its own) and one past it (100),
+// each read whole, and a byte changed in the manifest's first, last, or first read's last byte,
+// or in the CRC, refused.
+void reader_manifests() {
+	kronuz::faultlab::filesystem disk; disk.make_directory("manifests"); kronuz::faultlab::io io(disk, "manifests");
+	const f::Stream wide{"RFTM0001", identity, 4096, 7, 1, true};
+	auto refuses = [](const std::function<void()>& read) {
+		try { read(); } catch (const j::Corruption&) { return true; }
+		return false;
+	};
+	for (std::uint16_t groups : {std::uint16_t{64}, std::uint16_t{100}}) {
+		f::Emitter emitter(wide, 0);
+		for (std::uint64_t g = 1; g < groups; ++g) { emitter.record("s", g, 1); }
+		const auto across = emitter.record(std::string(3000, 'm'), groups, 1);
+		const std::string bytes = emitter.bytes();
+		const auto name = std::to_string(groups);
+		const auto size = f::header_bytes(groups);
+		check(f::get16(std::string_view(bytes).substr(4096 + 56)) == groups && across < 4096 && across + 3000 > 4096, "a record crosses into a " + name + "-group header");
+		{
+			auto file = io.create_exclusive(name); file->write_at(0, bytes);
+			check(f::read_record(*file, wide, across) == std::string(3000, 'm'), "read_record reads across a " + name + "-group header");
+		}
+		for (std::size_t at : std::set<std::size_t>{f::header_fixed, f::header_fixed + 1023, size - 5, size - 4, size - 1}) {
+			std::string changed = bytes; changed[4096 + at] ^= 1;
+			auto file = io.create_exclusive(name + "-" + std::to_string(at)); file->write_at(0, changed);
+			check(refuses([&] { f::read_record(*file, wide, across); }), "read_record refuses a " + name + "-group header changed at byte " + std::to_string(at));
+		}
+	}
+}
 // record_end against the emitter: every record start in a block and the next block's first, sizes to four blocks.
 void record_ends() {
 	for (std::uint32_t block : {256u, 512u}) {
@@ -363,6 +393,7 @@ int main() {
 		model_logs();
 		rule_rows();
 		record_ends();
+		reader_manifests();
 	} catch (const std::exception& error) {
 		std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
 		return 1;

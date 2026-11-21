@@ -30,9 +30,9 @@
 
 #include "framing.h"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <deque>
-#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -113,9 +113,16 @@ inline constexpr std::uint8_t end_of_turn = 0x10, open_record = 0x11;
 inline framing::Stream stream(const Identity& identity, std::uint32_t block_bytes, std::uint64_t segment, std::uint64_t epoch) {
 	return {magic, identity, block_bytes, segment, epoch, true};
 }
+using RecordHeader = std::array<char, record_header>;
+inline RecordHeader header(std::uint8_t kind, std::uint64_t turn, std::uint64_t group, std::uint64_t sequence) {
+	RecordHeader bytes; bytes[0] = static_cast<char>(kind);
+	framing::store(bytes.data() + 1, turn, 8); framing::store(bytes.data() + 9, group, 8); framing::store(bytes.data() + 17, sequence, 8);
+	return bytes;
+}
+inline std::string_view view(const RecordHeader& header) { return {header.data(), header.size()}; }
+// A record's bytes as one string; the turn path frames the header and payload in place instead.
 inline std::string logical(std::uint8_t kind, std::uint64_t turn, std::uint64_t group, std::uint64_t sequence, std::string_view payload) {
-	std::string bytes; bytes.reserve(record_header + payload.size());
-	bytes.push_back(static_cast<char>(kind)); put64(bytes, turn); put64(bytes, group); put64(bytes, sequence); bytes.append(payload);
+	std::string bytes(view(header(kind, turn, group, sequence))); bytes.append(payload);
 	return bytes;
 }
 // A bound on a turn's bytes in an empty segment, whatever its manifests: each record costs its
@@ -271,7 +278,7 @@ public:
 		next_segment_ = highest_segment_ + 1;
 		begin_segment();
 		data_segments_.insert(segment_);
-		write({[&](framing::Emitter& emitter) { emitter.record(turn_log_detail::logical(turn_log_detail::open_record, turn_, 0, 0, {})); }});
+		write([&](framing::Emitter& emitter) { emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::open_record, turn_, 0, 0))); });
 	}
 	// What a log holds, read without writing to it: a re-partition reads the stored generation.
 	static TurnRecovery read(IO& io, Identity identity, TurnLogOptions options = {}, const TurnLogGroups& known = {}) {
@@ -378,12 +385,13 @@ public:
 	TurnWrite stage(std::span<const TurnRecord> records) {
 		if (failed_) { throw std::logic_error("turn log failed"); }
 		if (staged_) { throw std::logic_error("a turn is already in flight"); }
-		Staged turn; turn.turn = turn_ + 1;
+		Staged turn = std::move(spare_); turn.turn = turn_ + 1; turn.next.clear(); turn.notes.clear();
 		for (const auto& record : records) {
 			if (!record.group) { throw std::invalid_argument("group 0 is reserved"); }
 			if (lost_.contains(record.group)) { throw std::invalid_argument("a lost group rejoins under a new id"); }
 			if (evicted_.contains(record.group)) { throw std::logic_error("an evicted group stages nothing until it is restored"); }
-			auto [found, fresh] = turn.next.try_emplace(record.group, sequence(record.group));
+			auto found = turn.next.find(record.group); const bool fresh = found == turn.next.end();
+			if (fresh) { found = next_nodes_.put(turn.next, turn.next.end(), record.group, sequence(record.group)); }
 			auto& last = found->second;
 			bool start = fresh && !sequences_.contains(record.group) && record.kind == TurnRecordKind::Checkpoint && record.sequence;
 			if (record.sequence != last + 1 && !start) {
@@ -395,35 +403,46 @@ public:
 			last = record.sequence;
 		}
 		for (const auto& record : records) { turn.notes.push_back({record.group, record.sequence, record.kind, record.payload.size(), false}); }
-		auto copies = forward_slice();
-		std::vector<std::uint64_t> offsets;
+		forward_slice();
+		// Each record's header and payload, and each copy read back from its segment, framed
+		// straight into the turn's buffer.
 		auto emit = [&](framing::Emitter& emitter) {
-			offsets.clear();
-			for (const auto& record : records) { offsets.push_back(emitter.record(turn_log_detail::logical(static_cast<std::uint8_t>(record.kind), turn.turn, record.group, record.sequence, record.payload), record.group, record.sequence)); }
-			for (const auto& copy : copies) { offsets.push_back(emitter.record(turn_log_detail::logical(static_cast<std::uint8_t>(copy.kind), turn.turn, copy.group, copy.sequence, copy.payload), copy.group, copy.sequence)); }
-			std::string count; put32(count, static_cast<std::uint32_t>(records.size() + copies.size()));
-			emitter.record(turn_log_detail::logical(turn_log_detail::end_of_turn, turn.turn, 0, 0, count));
+			std::size_t i = 0;
+			for (const auto& record : records) {
+				const auto head = turn_log_detail::header(static_cast<std::uint8_t>(record.kind), turn.turn, record.group, record.sequence);
+				const auto offset = emitter.record(turn_log_detail::view(head), record.payload, record.group, record.sequence);
+				if (!emitter.measuring()) { turn.notes[i].offset = offset; }
+				++i;
+			}
+			for (const auto& copy : copies_) {
+				const auto head = turn_log_detail::header(static_cast<std::uint8_t>(copy.live.kind), turn.turn, copy.group, copy.sequence);
+				Forward original{*this, copy, std::nullopt};
+				const auto offset = emitter.record(turn_log_detail::view(head), copy.live.bytes, original, copy.group, copy.sequence);
+				if (!emitter.measuring()) { original.finish(); turn.notes[i].offset = offset; }
+				++i;
+			}
+			char count[4]; framing::store(count, records.size() + copies_.size(), 4);
+			emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::end_of_turn, turn.turn, 0, 0)), std::string_view(count, 4), 0, 0);
 		};
 		// Copies ride along only where the turn still fits in a segment.
-		if (!copies.empty() && !fits(emit)) { copies.clear(); }
-		for (const auto& copy : copies) { turn.notes.push_back({copy.group, copy.sequence, copy.kind, copy.payload.size(), true}); }
-		auto emitter = encode(emit);
-		for (std::size_t i = 0; i < turn.notes.size(); ++i) { turn.notes[i].offset = offsets[i]; }
-		turn.offset = offset_; turn.end = emitter.position(); turn.filling = emitter.filling(); turn.bytes = emitter.bytes();
+		if (!copies_.empty() && !fits(emit, turn.filling)) { copies_.clear(); }
+		for (const auto& copy : copies_) { turn.notes.push_back({copy.group, copy.sequence, copy.live.kind, copy.live.bytes, true}); }
+		turn.end = encode(emit, turn.bytes, turn.filling);
+		turn.offset = offset_;
 		staged_ = std::move(turn);
 		return {file_.get(), staged_->offset, staged_->bytes, staged_->turn};
 	}
 	// How many of `records`, from the first, one turn encodes in an empty segment without
 	// forwarded copies: what encode() accepts. Sequences are not checked.
-	std::size_t fitting(std::span<const TurnRecord> records) const {
+	std::size_t fitting(std::span<const TurnRecord> records) {
 		std::size_t n = 0;  // a turn holds at least each record's logical bytes
 		for (std::uint64_t bytes = 0; n < records.size() && (bytes += turn_log_detail::record_header + records[n].payload.size()) <= options_.segment_bytes; ++n) {}
 		auto fit = [&](std::size_t count) {
 			return fits([&](framing::Emitter& emitter) {
-				for (const auto& record : records.first(count)) { emitter.record(turn_log_detail::logical(static_cast<std::uint8_t>(record.kind), turn_ + 1, record.group, record.sequence, record.payload), record.group, record.sequence); }
-				std::string tally; put32(tally, static_cast<std::uint32_t>(count));
-				emitter.record(turn_log_detail::logical(turn_log_detail::end_of_turn, turn_ + 1, 0, 0, tally));
-			});
+				for (const auto& record : records.first(count)) { emitter.record(turn_log_detail::view(turn_log_detail::header(static_cast<std::uint8_t>(record.kind), turn_ + 1, record.group, record.sequence)), record.payload, record.group, record.sequence); }
+				char tally[4]; framing::store(tally, count, 4);
+				emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::end_of_turn, turn_ + 1, 0, 0)), std::string_view(tally, 4), 0, 0);
+			}, spare_.filling);
 		};
 		if (fit(n)) { return n; }
 		std::size_t low = 0;  // fits; n does not
@@ -434,21 +453,24 @@ public:
 	void completed() {
 		if (!staged_) { throw std::logic_error("no turn in flight"); }
 		auto turn = std::move(*staged_); staged_.reset();
-		offset_ = turn.end; filling_ = turn.filling; ++stats_.barriers; stats_.bytes_written += turn.bytes.size();
+		offset_ = turn.end; std::swap(filling_, turn.filling); ++stats_.barriers; stats_.bytes_written += turn.bytes.size();
 		turn_ = turn.turn; ++stats_.turns;
 		for (const auto& [group, sequence] : turn.next) { sequences_[group] = sequence; }
 		for (const auto& n : turn.notes) {
-			if (!n.copy) { note(n.group, n.sequence, n.kind, n.offset); stats_.bytes_appended += n.bytes; continue; }
+			if (!n.copy) { note(n.group, n.sequence, n.kind, n.offset, n.bytes); stats_.bytes_appended += n.bytes; continue; }
 			// A copy replaces its original unless a checkpoint in this turn superseded both.
 			if (auto evicted = evicted_.find(n.group); evicted != evicted_.end()) {
 				auto& live = evicted->second.live;
 				if (n.sequence >= evicted->second.first && n.sequence - evicted->second.first < live.size()) {
 					auto& original = live[n.sequence - evicted->second.first]; drop(original);
-					original = Live{segment_, epoch_, n.offset, n.kind}; ++live_counts_[segment_];
+					original = Live{segment_, epoch_, n.offset, n.kind, n.bytes}; ++live_counts_[segment_];
 				}
-			} else if (auto found = index_.find(n.group); found != index_.end() && found->second.contains(n.sequence)) { note(n.group, n.sequence, n.kind, n.offset, true); }
+			} else if (auto found = index_.find(n.group); found != index_.end() && found->second.contains(n.sequence)) { note(n.group, n.sequence, n.kind, n.offset, n.bytes, true); }
 			stats_.forwarded_bytes += n.bytes; ++stats_.forwarded_records;
 		}
+		// The next turn reuses this one's buffers and map nodes.
+		while (!turn.next.empty()) { next_nodes_.give(turn.next, turn.next.begin()); }
+		turn.notes.clear(); spare_ = std::move(turn);
 		reclaim();
 	}
 	// The staged turn's write or barrier failed: what it reached is unknown, so the log fails.
@@ -475,7 +497,25 @@ private:
 		}
 		return options;
 	}
-	struct Live { std::uint64_t segment, epoch, offset; TurnRecordKind kind; };
+	// A live record's position, kind and payload size, in 32 bytes.
+	// Every field is the constructor's: a Live built without its payload size does not compile.
+	struct Live {
+		Live(std::uint64_t segment, std::uint64_t epoch, std::uint64_t offset, TurnRecordKind kind, std::uint64_t bytes) : segment(segment), epoch(epoch), offset(offset), kind(kind), bytes(bytes) {}
+		std::uint64_t segment, epoch, offset; TurnRecordKind kind; std::uint64_t bytes : 56;
+	};
+	static_assert(sizeof(Live) == 32);
+	// Map nodes the turn path frees, reused by later inserts: a warm turn allocates none. They
+	// never outnumber what the map they came from held at its largest.
+	template <class Map> struct Nodes {
+		std::vector<typename Map::node_type> spare;
+		typename Map::iterator put(Map& map, typename Map::const_iterator hint, const typename Map::key_type& key, const typename Map::mapped_type& value) {
+			if (spare.empty()) { return map.emplace_hint(hint, key, value); }
+			auto node = std::move(spare.back()); spare.pop_back();
+			node.key() = key; node.mapped() = value;
+			return map.insert(hint, std::move(node));
+		}
+		void give(Map& map, typename Map::const_iterator at) { spare.push_back(map.extract(at)); }
+	};
 	// An evicted group's live records, consecutive from `first`.
 	struct Evicted { std::uint64_t first = 0; std::vector<Live> live; };
 	void drop(const Live& live) { if (!--live_counts_[live.segment]) { live_counts_.erase(live.segment); } }
@@ -502,41 +542,65 @@ private:
 		return records;
 	}
 	// A checkpoint supersedes the group's earlier records; a copy only replaces its original.
-	void note(std::uint64_t group, std::uint64_t sequence, TurnRecordKind kind, std::uint64_t offset, bool copy = false) {
-		auto& records = index_[group];
-		if (kind == TurnRecordKind::Checkpoint && !copy) { for (const auto& [_, live] : records) { drop(live); } records.clear(); }
-		if (auto found = records.find(sequence); found != records.end()) { drop(found->second); records.erase(found); }
-		records.emplace(sequence, Live{segment_, epoch_, offset, kind}); ++live_counts_[segment_];
+	// The new record counts first, so the current segment's count never passes through zero.
+	void note(std::uint64_t group, std::uint64_t sequence, TurnRecordKind kind, std::uint64_t offset, std::uint64_t bytes, bool copy = false) {
+		auto& records = index_[group]; ++live_counts_[segment_];
+		if (kind == TurnRecordKind::Checkpoint && !copy) { while (!records.empty()) { drop(records.begin()->second); index_nodes_.give(records, records.begin()); } }
+		if (auto found = records.find(sequence); found != records.end()) { drop(found->second); index_nodes_.give(records, found); }
+		index_nodes_.put(records, records.end(), sequence, Live{segment_, epoch_, offset, kind, bytes});
 	}
-	bool fits(const std::function<void(framing::Emitter&)>& emit) const {
-		framing::Emitter fresh(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, filling_);
-		emit(fresh); return fresh.position() <= options_.segment_bytes;
+	// Whether a turn fits an empty segment, laid out without writing it in `manifest`, a turn
+	// manifest not in use.
+	template <class Emit> bool fits(Emit&& emit, framing::Manifest& manifest) const {
+		manifest.groups.reserve(framing::block_groups(options_.block_bytes)); manifest = filling_;
+		auto empty = framing::Emitter::measure(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(manifest));
+		emit(empty);
+		manifest = std::move(empty).filling();
+		return empty.position() <= options_.segment_bytes;
 	}
+	// A live record forward_slice chose; stage() reads it straight into the turn's buffer.
+	struct Copy { std::uint64_t group, sequence; Live live; };
 	// Past retain_segments, the oldest segment's live records move forward, a bounded slice
 	// per turn (at most a quarter segment), keeping their group and sequence (condition 9).
-	std::vector<TurnRecord> forward_slice() {
-		std::vector<TurnRecord> copies;
-		if (data_segments_.size() <= options_.retain_segments) { return copies; }
+	void forward_slice() {
+		copies_.clear();
+		if (data_segments_.size() <= options_.retain_segments) { return; }
 		const auto oldest = *data_segments_.begin();
-		if (oldest == segment_ || !live_counts_.contains(oldest)) { return copies; }
+		if (oldest == segment_ || !live_counts_.contains(oldest)) { return; }
 		std::size_t bytes = 0;
-		// Copies one live record of the oldest segment; true once the slice is full.
+		// Chooses one live record of the oldest segment; true once the slice is full.
 		auto forward = [&](std::uint64_t group, std::uint64_t sequence, const Live& live) {
 			++stats_.forward_scanned;
 			if (live.segment != oldest) { return false; }
-			auto record = framing::read_record(reader(oldest), turn_log_detail::stream(identity_, options_.block_bytes, oldest, live.epoch), live.offset);
-			std::string_view logical = record; logical.remove_prefix(turn_log_detail::record_header);
-			copies.push_back({group, sequence, live.kind, std::string(logical)});
-			return (bytes += logical.size()) >= std::min<std::uint64_t>(options_.forward_bytes, options_.segment_bytes / 4);
+			copies_.push_back({group, sequence, live});
+			return (bytes += live.bytes) >= std::min<std::uint64_t>(options_.forward_bytes, options_.segment_bytes / 4);
 		};
 		for (const auto& [group, records] : index_) {
-			for (const auto& [sequence, live] : records) { if (forward(group, sequence, live)) { return copies; } }
+			for (const auto& [sequence, live] : records) { if (forward(group, sequence, live)) { return; } }
 		}
 		for (const auto& [group, evicted] : evicted_) {
-			for (std::size_t i = 0; i < evicted.live.size(); ++i) { if (forward(group, evicted.first + i, evicted.live[i])) { return copies; } }
+			for (std::size_t i = 0; i < evicted.live.size(); ++i) { if (forward(group, evicted.first + i, evicted.live[i])) { return; } }
 		}
-		return copies;
 	}
+	// A copy's payload, read from its original into the emitter's buffer: the original's header
+	// must name the same record, and its payload end where the copy's does.
+	struct Forward {
+		TurnLog& log; const Copy& copy; std::optional<framing::RecordReader> original;
+		void operator()(std::string& out, std::size_t count) {
+			open();
+			const auto at = out.size(); out.resize(at + count); original->read(out.data() + at, count);
+		}
+		void finish() { open(); if (!original->done()) { throw Corruption("a live record does not read back as itself"); } }
+		void open() {
+			if (original) { return; }
+			const auto& live = copy.live;
+			original.emplace(log.reader(live.segment), turn_log_detail::stream(log.identity_, log.options_.block_bytes, live.segment, live.epoch), live.offset);
+			turn_log_detail::RecordHeader head; original->read(head.data(), head.size());
+			if (head != turn_log_detail::header(static_cast<std::uint8_t>(live.kind), framing::peek64(std::string_view(head.data() + 1, 8)), copy.group, copy.sequence)) {
+				throw Corruption("a live record does not read back as itself");
+			}
+		}
+	};
 	// Releases segments from the oldest while no live record remains in them: recycled into
 	// the spare pool while it is short, removed otherwise. Only the oldest go, each ordered
 	// ahead of the next, so a power cut undoes only the newest of them and the turns left stay contiguous.
@@ -560,7 +624,6 @@ private:
 		if (!file) { file = io_.open_existing(turn_log_detail::segment_name(segment)); }
 		return *file;
 	}
-	struct Body { std::function<void(framing::Emitter&)> emit; };
 	std::unique_ptr<File> preallocate() {
 		auto file = io_.create_exclusive(turn_log_detail::segment_name(next_segment_++));
 		const std::string zeros(std::min<std::uint64_t>(options_.segment_bytes, 1 << 20), '\0');
@@ -577,27 +640,32 @@ private:
 		segment_ = next_segment_ - 1 - spares_.size(); offset_ = 0;
 		data_segments_.insert(segment_);
 	}
-	// A turn never crosses a segment: one that does not fit starts the next one.
-	framing::Emitter encode(const std::function<void(framing::Emitter&)>& emit) {
-		framing::Emitter emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), offset_, filling_);
+	// Frames a turn into `bytes` from the current position, and `filling` the manifest after it.
+	// A turn never crosses a segment: one that does not fit starts the next one. Returns its end.
+	// The manifest reserves what a block can name, so no turn grows it.
+	template <class Emit> std::uint64_t encode(Emit&& emit, std::string& bytes, framing::Manifest& filling) {
+		filling.groups.reserve(framing::block_groups(options_.block_bytes)); filling = filling_;
+		framing::Emitter emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), offset_, std::move(filling), std::move(bytes));
 		emit(emitter);
 		if (emitter.position() > options_.segment_bytes) {
-			framing::Emitter fresh(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, filling_);
-			emit(fresh);
-			if (fresh.position() > options_.segment_bytes) { throw std::length_error("turn exceeds a segment"); }
+			filling = std::move(emitter).filling(); bytes = std::move(emitter).bytes();
+			if (!fits(emit, filling)) { throw std::length_error("turn exceeds a segment"); }
 			begin_segment();
-			emitter = framing::Emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, filling_);
+			filling = filling_;
+			emitter = framing::Emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(filling), std::move(bytes));
 			emit(emitter);
 		}
-		return emitter;
+		const auto end = emitter.position();
+		filling = std::move(emitter).filling(); bytes = std::move(emitter).bytes();
+		return end;
 	}
-	void write(Body body) {
-		auto emitter = encode(body.emit);
+	template <class Emit> void write(Emit&& emit) {
+		const auto end = encode(emit, spare_.bytes, spare_.filling);
 		try {
-			if (file_->write_at(offset_, emitter.bytes()) != emitter.bytes().size()) { throw std::runtime_error("short turn log write"); }
+			if (file_->write_at(offset_, spare_.bytes) != spare_.bytes.size()) { throw std::runtime_error("short turn log write"); }
 			detail::sync_data_file(io_, *file_);
 		} catch (...) { failed_ = true; throw; }
-		offset_ = emitter.position(); filling_ = emitter.filling(); ++stats_.barriers; stats_.bytes_written += emitter.bytes().size();
+		offset_ = end; std::swap(filling_, spare_.filling); ++stats_.barriers; stats_.bytes_written += spare_.bytes.size();
 	}
 	TurnRecovery recover(const TurnLogGroups& known);
 
@@ -614,6 +682,9 @@ private:
 	struct Note { std::uint64_t group, sequence; TurnRecordKind kind; std::size_t bytes; bool copy; std::uint64_t offset = 0; };
 	struct Staged { std::uint64_t turn = 0, offset = 0, end = 0; std::map<std::uint64_t, std::uint64_t> next; std::vector<Note> notes; framing::Manifest filling; std::string bytes; };
 	std::optional<Staged> staged_;
+	Staged spare_;  // the last turn's buffers, emptied: the next stage() frames into their capacity
+	Nodes<std::map<std::uint64_t, std::uint64_t>> next_nodes_; Nodes<std::map<std::uint64_t, Live>> index_nodes_;
+	std::vector<Copy> copies_;  // forward copies
 	TurnLogStats stats_; bool failed_ = false;
 };
 
@@ -776,7 +847,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 		}
 	}
 	auto record_of = [&](std::uint64_t group, std::size_t r) { const auto& item = items[r]; return TurnRecord{group, item.sequence, static_cast<TurnRecordKind>(item.kind), item.payload}; };
-	auto live_of = [&](std::size_t r) { const auto& item = items[r]; return Live{item.segment, item.epoch, item.offset, static_cast<TurnRecordKind>(item.kind)}; };
+	auto live_of = [&](std::size_t r) { const auto& item = items[r]; return Live{item.segment, item.epoch, item.offset, static_cast<TurnRecordKind>(item.kind), item.payload.size()}; };
 	// bound: a lost group bounded at `bound`, holding its records after it.
 	auto bound = [&](std::uint64_t group, std::uint64_t at, std::vector<TurnRecord> records, std::map<std::uint64_t, Live> live) {
 		result.lost.insert(group);
