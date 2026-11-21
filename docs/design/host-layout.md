@@ -38,8 +38,9 @@ and, once the group has closed, its last checkpoint record (`base`, its sequence
 manifest bytes). Each slot's table is a binary trie of shard files, each replaced whole
 (`groups-<slot>-<node>.pending`, synced, renamed, then the directory synced) and split by the
 group's mixed-id bits once it passes 4 KiB, so a transition rewrites at most 4 KiB however many
-groups the host holds ([idle-groups.md](idle-groups.md) D9). A damaged shard costs only its own
-groups, which are lost (D11). The table is read once when the host opens. Every transition writes its shard before anything acts on
+groups the host holds ([idle-groups.md](idle-groups.md) D9); a slot's first file is its root,
+whole, and only a stored node splits. A damaged or missing shard costs only its own groups, which
+are lost (D11). The table is read once when the host opens. Every transition writes its shard before anything acts on
 it; a failed write restores the entry in memory, so the table there never runs ahead of the disk.
 A failed close may still have reached the disk, so it also leaves the entry in doubt (below).
 
@@ -55,8 +56,8 @@ A failed close may still have reached the disk, so it also leaves the entry in d
   entry in memory; the loop commits its changed slots before its next turn with records
   (`TurnDriver::before_turn`), so the entry is durable before that record
   ([idle-groups](idle-groups.md) D5).
-- **Park.** `Host::park(loop)` closes every idle released group of the loop, as close does, with
-  one commit ([idle-groups](idle-groups.md) D1-D3).
+- **Park.** `Host::park(loop)` closes every idle group of the loop that no consumer has open (no
+  hold, no sealer), as close does, with one commit ([idle-groups](idle-groups.md) D1-D3).
 - **Close.** The group's last record must be a durable checkpoint covering every batch. The
   table takes it as `base`; once that shard is durable the loop's log forgets the group
   (`TurnLog::forget`), and retention reclaims its records. A failed commit leaves the group open

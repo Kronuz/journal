@@ -116,7 +116,7 @@ MUTANTS = {
         "journal_host_test", ["recreate"]),
     # Park ignores the log: a parked group keeps its checkpoint live, so the log never shrinks.
     "park-keeps-log": ("include/journal/host.h",
-        "\t\tfor (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); }\n", "",
+        "{ driver_of(record.group).forget(record.group, record.sequence + 1); opened_", "{ opened_",
         "journal_journal_test", ["park_count"]),
     # A damaged table shard fails the host's open instead of its own groups.
     "damaged-shard-fails-open": ("include/journal/host.h",
@@ -132,6 +132,35 @@ MUTANTS = {
         "\t\tio_->sync_directory();\n\t\tfor (auto slot : slots) { orphans_[slot].clear(); }\n\t\tfor (auto shard : split) {",
         "\t\tfor (auto slot : slots) { orphans_[slot].clear(); }\n\t\tfor (auto shard : split) {",
         "journal_host_test", ["split_crash"]),
+    # Review F1: a failed split's children are never removed: they cover their node at open
+    # and shadow the slot's later commits, so an acknowledged create reads none.
+    "no-orphans": ("include/journal/host.h",
+        "\t\tremove_orphans(slots);\n", "",
+        "journal_host_test", ["split_orphan"]),
+    # Review F2: open deletes a slot's shards when one file is missing: their groups read none.
+    "missing-shard-stale": ("include/journal/host.h",
+        "\tif (rest.empty() || depth(node) == max_depth) { kept.push_back(node); missing.push_back(node); return; }\n\tresolve(rest.first(split), 2 * node, kept, stale, missing);\n\tresolve(rest.subspan(split), 2 * node + 1, kept, stale, missing);\n}",
+        "\tstale.insert(stale.end(), rest.begin(), rest.end());\n}",
+        "journal_host_test", ["missing_shard"]),
+    # Review F2: a slot's first commit splits its unstored root: a power cut then leaves children
+    # that do not cover it, which open reads as a missing shard, so unacknowledged creates are lost.
+    "split-unstored": ("include/journal/host.h",
+        "if (stored(shard)) { host_detail::partition(", "if (true) { host_detail::partition(",
+        "journal_host_test", ["first_split_crash"]),
+    # Review F3: park skips the groups a consumer created or attached without a hold (strata's).
+    "park-skips-opened": ("include/journal/host.h",
+        "if (holding(group) || turns.staged(group) || turns.sealed(group)) { continue; }",
+        "if (holding(group) || opened_[at].contains(group) || turns.staged(group) || turns.sealed(group)) { continue; }",
+        "journal_host_test", ["park_unheld"]),
+    # Review F3: a closed or parked group keeps its opened_ entry: heap per closed group.
+    "close-keeps-opened": ("include/journal/host.h",
+        " opened_[loop(record.group)].erase(record.group); }", " }",
+        "journal_host_test", ["park_unheld"]),
+    # Review F3: park takes a group whose consumer has it open by its sealer (strata's index).
+    "park-ignores-sealer": ("include/journal/host.h",
+        "if (holding(group) || turns.staged(group) || turns.sealed(group)) { continue; }",
+        "if (holding(group) || turns.staged(group)) { continue; }",
+        "journal_host_test", ["park_unheld"]),
 }
 
 def main():

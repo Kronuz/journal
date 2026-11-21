@@ -56,6 +56,8 @@ namespace hd = kronuz::journal::host_detail;
 template <class Tag, auto Member> struct Steal { friend constexpr auto steal(Tag) { return Member; } };
 struct RangesTag { friend constexpr auto steal(RangesTag); };
 template struct Steal<RangesTag, &j::Host::ranges_>;
+struct OpenedTag { friend constexpr auto steal(OpenedTag); };
+template struct Steal<OpenedTag, &j::Host::opened_>;
 
 namespace {
 int checks = 0, failures = 0;
@@ -862,8 +864,10 @@ struct Model {
 // The run up to the cut; the model of what it staged and acknowledged.
 void run(fl::filesystem& disk, Model& model) {
 	auto host = open(disk, 2);
+	std::vector<std::unique_ptr<j::Host::Hold>> open_groups;  // their consumer keeps them open
 	for (std::uint64_t g : {20u, 21u, 22u, 23u}) { host->create_group(g); model.stage(*host, g, j::TurnRecordKind::Checkpoint, "c" + std::to_string(g)); }
 	commit(*host); model.acknowledge();
+	for (std::uint64_t g : {20u, 21u, 22u, 23u}) { open_groups.push_back(host->hold(g)); }
 	for (std::uint64_t g = 1; g <= 4; ++g) {
 		host->reopen_group(g);
 		const auto entry = host->entry(g);
@@ -878,7 +882,7 @@ void run(fl::filesystem& disk, Model& model) {
 	commit(*host); model.acknowledge();
 	for (std::uint64_t g : {1u, 2u, 9u, 10u}) { host->hold(g); }  // held, then released
 	check(park(*host) == 5, "the checkpointed released groups park, and 12, idle since the open");
-	host.reset();
+	open_groups.clear(); host.reset();
 	open(disk, 3);
 }
 // Ids of one slot, enough to split its shard: the first `count` from `from`.
@@ -897,9 +901,10 @@ std::size_t shard_files(const fl::filesystem& disk, std::uint32_t slot) {
 void split_run(fl::filesystem& disk, Model& model) {
 	auto host = open(disk, 2);
 	const auto fresh = slot_ids(7, 1, 160);
+	std::vector<std::unique_ptr<j::Host::Hold>> open_groups;
 	for (std::size_t i = 40; i < 160; ++i) { host->create_group(fresh[i]); model.stage(*host, fresh[i], j::TurnRecordKind::Checkpoint, "s" + std::to_string(fresh[i])); }
 	commit(*host); model.acknowledge();
-	for (std::size_t i = 40; i < 160; i += 2) { host->hold(fresh[i]); }
+	for (std::size_t i = 41; i < 160; i += 2) { open_groups.push_back(host->hold(fresh[i])); }
 	park(*host);
 	for (std::size_t i = 0; i < 40; i += 3) {
 		host->reopen_group(fresh[i]);
@@ -909,7 +914,7 @@ void split_run(fl::filesystem& disk, Model& model) {
 		model.stage(*host, fresh[i], j::TurnRecordKind::Batch, "w" + std::to_string(fresh[i]));
 	}
 	commit(*host); model.acknowledge();
-	host.reset();
+	open_groups.clear(); host.reset();
 	check(shard_files(disk, 7) > 1, "the slot's shard split");
 	open(disk, 3);
 }
@@ -942,8 +947,9 @@ void idle_crash() {
 		idle::commit(*host);
 		for (std::uint64_t g = 1; g <= 12; ++g) { model.stage(*host, g, j::TurnRecordKind::Checkpoint, "q" + std::to_string(g)); }
 		idle::commit(*host); model.acknowledge();
-		for (std::uint64_t g = 1; g <= 8; ++g) { host->hold(g); }
-		check(idle::park(*host) == 8, "the released groups park");
+		std::vector<std::unique_ptr<j::Host::Hold>> open_groups;
+		for (std::uint64_t g = 9; g <= 12; ++g) { open_groups.push_back(host->hold(g)); }
+		check(idle::park(*host) == 8, "the groups no consumer has open park");
 	}
 	std::uint64_t cut = 1;
 	while (!idle_crash_run(base, model, cut)) { ++cut; }
@@ -986,7 +992,8 @@ void split_stale_node() {
 		stale = std::string(disk.view("host/" + root));
 		for (std::size_t i = 40; i < 160; ++i) { host->create_group(ids[i]); turns.stage(j::TurnRecord{ids[i], 1, j::TurnRecordKind::Checkpoint, "s" + std::to_string(ids[i])}); }
 		idle::commit(*host);
-		for (std::size_t i = 40; i < 160; i += 2) { host->hold(ids[i]); }
+		std::vector<std::unique_ptr<j::Host::Hold>> open_groups;
+		for (std::size_t i = 41; i < 160; i += 2) { open_groups.push_back(host->hold(ids[i])); }
 		idle::park(*host);
 	}
 	check(idle::shard_files(disk, 7) > 1 && !host_io(disk)->entry_footprint(root), "the slot's root split");
@@ -1018,7 +1025,8 @@ void table_damage() {
 			for (auto g : ids) { host->create_group(g); turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g)}); }
 		}
 		idle::commit(*host);
-		for (auto ids : {damaged, other}) { for (std::size_t i = 0; i < 3; ++i) { host->hold(ids[i]); } }
+		std::vector<std::unique_ptr<j::Host::Hold>> open_groups;
+		for (auto ids : {damaged, other}) { for (std::size_t i = 3; i < 6; ++i) { open_groups.push_back(host->hold(ids[i])); } }
 		check(idle::park(*host) == 6, "half of each slot's groups park");
 		for (auto ids : {damaged, other}) { for (std::size_t i = 3; i < 6; ++i) { turns.stage(j::TurnRecord{ids[i], 2, j::TurnRecordKind::Batch, "b" + std::to_string(ids[i])}); } }
 		idle::commit(*host);
@@ -1064,7 +1072,7 @@ void park_mid_turn() {
 		auto& turns = host->driver(0);
 		for (std::uint64_t g = 1; g <= 3; ++g) { host->create_group(g); turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g)}); }
 		idle::commit(*host);
-		auto holder = host->hold(1);
+		auto holder = host->hold(1), third = host->hold(3);
 		host->hold(2);  // held, then released
 		turns.stage(j::TurnRecord{1, 2, j::TurnRecordKind::Batch, "b1"});
 		const auto& write = turns.begin();
@@ -1093,7 +1101,7 @@ void idle_unmanifested() {
 			turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g)});
 		}
 		idle::commit(*host);
-		for (std::uint64_t g = 1; g <= 5; ++g) { host->hold(g); }
+		auto sixth = host->hold(6);
 		check(idle::park(*host) == 5, "five groups park");
 		host->reopen_group(1);
 		const auto at = std::max(host->entry(1)->base, turns.retired(1)) + 1;
@@ -1131,7 +1139,7 @@ void idle_damage() {
 			turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g)});
 		}
 		idle::commit(*host);
-		for (std::uint64_t g = 1; g <= 5; ++g) { host->hold(g); }
+		auto sixth = host->hold(6);
 		check(idle::park(*host) == 5, "five groups park");
 		host->reopen_group(1);
 		const auto at = std::max(host->entry(1)->base, turns.retired(1)) + 1;
@@ -1161,6 +1169,125 @@ void idle_damage() {
 	check(host->status(6) == j::GroupStatus::lost || host->driver(0).records(6).size() == 5, "the group that wrote after the damage keeps every record or is lost");
 }
 
+// Review F1, D9's orphan rule: a park whose split fails at its directory sync, after its renames,
+// leaves its children beside their node. The next commit of the slot removes them first, so a
+// create it acknowledges survives a power cut: no orphan covers the node at open.
+void split_orphan() {
+	fl::filesystem disk;
+	const auto ids = idle::slot_ids(7, 1, 81);
+	const auto fresh = ids[80];
+	{
+		auto host = idle::open(disk, 1);
+		auto& turns = host->driver(0);
+		for (std::size_t i = 0; i < 80; ++i) { host->create_group(ids[i]); turns.stage(j::TurnRecord{ids[i], 1, j::TurnRecordKind::Checkpoint, std::string(40, 'x') + std::to_string(ids[i])}); }
+		idle::commit(*host);
+		check(idle::shard_files(disk, 7) == 1, "split_orphan: eighty open entries fit one shard");
+		disk.add_fault(fl::fault{fl::op::sync_directory, 1, EIO, true});
+		bool threw = false;
+		try { idle::park(*host); } catch (const std::exception&) { threw = true; }
+		disk.clear_faults();
+		check(threw && idle::shard_files(disk, 7) > 1, "split_orphan: the splitting park fails at its directory sync and leaves its children");
+		host->create_group(fresh);
+		turns.stage(j::TurnRecord{fresh, 1, j::TurnRecordKind::Checkpoint, "fresh"});
+		turns.stage(j::TurnRecord{fresh, 2, j::TurnRecordKind::Batch, "acked"});
+		idle::commit(*host);
+		check(host->status(fresh) == j::GroupStatus::stored, "split_orphan: the create is acknowledged");
+	}
+	disk.crash(0, sector_cut);
+	for (int restart = 0; restart < 2; ++restart) {
+		auto host = idle::open(disk, 1);
+		check(host->status(fresh) == j::GroupStatus::stored && host->driver(0).records(fresh).size() == 2, "split_orphan: the create acknowledged after the failed split survives: restart " + std::to_string(restart));
+	}
+}
+
+// Review F2: a split slot loses one shard file (the name is gone, not a CRC failure). Only that
+// file's groups are lost, and reported so; its siblings stay on disk and their parked groups open.
+void missing_shard() {
+	fl::filesystem disk;
+	const auto ids = idle::slot_ids(7, 1, 160);
+	{
+		auto host = idle::open(disk, 1);
+		auto& turns = host->driver(0);
+		for (auto g : ids) { host->create_group(g); turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, std::string(40, 'p') + std::to_string(g)}); }
+		idle::commit(*host);
+		check(idle::shard_files(disk, 7) == 1, "missing_shard: a slot's first commit writes its root whole");
+		check(idle::park(*host) == ids.size(), "missing_shard: the slot's groups park");
+	}
+	std::vector<std::string> leaves;
+	for (const auto& name : disk.list("host")) { if (name.starts_with("groups-" + hd::hex(7, 3) + "-")) { leaves.push_back(name); } }
+	check(leaves.size() >= 3, "missing_shard: the slot split into at least three shards");
+	const auto gone = hd::shard_of(leaves[leaves.size() / 2])->second;
+	host_io(disk)->remove(leaves[leaves.size() / 2]);
+	host_io(disk)->sync_directory();
+	for (int restart = 0; restart < 2; ++restart) {
+		auto host = idle::open(disk, 1);
+		check(idle::shard_files(disk, 7) == leaves.size() - 1, "missing_shard: open keeps the other shards");
+		std::size_t lost = 0;
+		for (auto g : ids) {
+			if (hd::holds(gone, g)) { lost += host->status(g) == j::GroupStatus::lost; continue; }
+			check(host->status(g) == j::GroupStatus::closed && host->entry(g)->manifest == std::string(40, 'p') + std::to_string(g), "missing_shard: a parked group of another shard opens: " + std::to_string(g));
+		}
+		const auto in_gone = static_cast<std::size_t>(std::count_if(ids.begin(), ids.end(), [&](auto g) { return hd::holds(gone, g); }));
+		check(in_gone > 0 && lost == in_gone, "missing_shard: every group of the missing shard is lost, never none");
+		std::vector<std::uint64_t> inside, outside;
+		for (auto g : idle::slot_ids(7, ids.back() + 1, 400)) { (hd::holds(gone, g) ? inside : outside).push_back(g); }
+		check(!inside.empty() && outside.size() > 1, "missing_shard: fresh ids on both sides");
+		bool refused = false;
+		try { host->create_group(inside.front()); } catch (const std::logic_error&) { refused = true; }
+		check(refused && host->status(inside.front()) == j::GroupStatus::lost, "missing_shard: an id on the missing shard's paths is lost, and a create there is refused");
+		const auto other = outside[static_cast<std::size_t>(restart)];
+		host->create_group(other);
+		host->driver(0).stage(j::TurnRecord{other, 1, j::TurnRecordKind::Checkpoint, "born"});
+		idle::commit(*host);
+		check(host->status(other) == j::GroupStatus::stored, "missing_shard: the slot's other shards take a create");
+	}
+}
+
+namespace idle {
+// A slot's first commit past leaf_bytes, then a park that splits it, the power failing anywhere.
+void first_split_run(fl::filesystem& disk, Model& model) {
+	auto host = open(disk, 1);
+	for (auto g : slot_ids(7, 1, 160)) { host->create_group(g); model.stage(*host, g, j::TurnRecordKind::Checkpoint, std::string(40, 'f') + std::to_string(g)); }
+	commit(*host); model.acknowledge();
+	park(*host);
+	host.reset();
+	check(shard_files(disk, 7) > 1, "the parked slot split");
+}
+}  // namespace idle
+
+// Review F2's premise: only a stored node splits, so a power cut never leaves an unstored node's
+// files short of covering it, and open may call such a node's paths lost.
+void first_split_crash() {
+	fl::filesystem base;
+	idle::Model model;
+	std::uint64_t cut = 1;
+	while (!idle_crash_run(base, model, cut, idle::first_split_run)) { ++cut; }
+	std::cout << "first_split_crash: " << cut - 1 << " power cuts, every one of them recovered\n";
+}
+
+// Review F3, the consumer contract (D2): Host::park takes every idle group no consumer has open,
+// held by no Store and sealed by no sealer, as strata's groups are once their index closes; a
+// closed or parked group leaves opened_, so it costs the host no heap.
+void park_unheld() {
+	fl::filesystem disk;
+	{
+		auto host = idle::open(disk, 1);
+		auto& turns = host->driver(0);
+		for (std::uint64_t g = 1; g <= 10; ++g) { host->create_group(g); turns.stage(j::TurnRecord{g, 1, j::TurnRecordKind::Checkpoint, "p" + std::to_string(g)}); }
+		idle::commit(*host);
+		const int owner = 0;
+		for (std::uint64_t g = 6; g <= 10; ++g) { turns.seal(g, [](std::uint64_t, bool) { return std::optional<j::TurnRecord>(); }, &owner); }
+		const auto& opened = (*host).*steal(OpenedTag{});
+		check(opened[0].size() == 10, "park_unheld: created groups are open");
+		check(host->park(0) == 5, "park_unheld: the idle groups with no hold and no sealer park");
+		for (std::uint64_t g = 1; g <= 10; ++g) { check(host->status(g) == (g <= 5 ? j::GroupStatus::closed : j::GroupStatus::stored), "park_unheld: a sealed group stays open: " + std::to_string(g)); }
+		for (std::uint64_t g = 6; g <= 10; ++g) { host->close_group(g, 1, "c" + std::to_string(g)); }
+		check(opened[0].empty(), "park_unheld: a parked or closed group leaves opened_");
+	}
+	auto host = idle::open(disk, 1);
+	for (std::uint64_t g = 1; g <= 10; ++g) { check(host->status(g) == j::GroupStatus::closed && host->entry(g)->manifest == (g <= 5 ? "p" : "c") + std::to_string(g), "park_unheld: every group reads back closed: " + std::to_string(g)); }
+}
+
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
 	const std::vector<std::pair<std::string, void (*)()>> cases{
@@ -1169,7 +1296,8 @@ int main(int argc, char** argv) {
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
 		{"loop_views", loop_views}, {"idle_crash", idle_crash}, {"idle_damage", idle_damage},
 		{"split_crash", split_crash}, {"table_damage", table_damage}, {"park_mid_turn", park_mid_turn}, {"split_stale_node", split_stale_node},
-		{"idle_unmanifested", idle_unmanifested}};
+		{"idle_unmanifested", idle_unmanifested}, {"split_orphan", split_orphan}, {"missing_shard", missing_shard}, {"first_split_crash", first_split_crash},
+		{"park_unheld", park_unheld}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

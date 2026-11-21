@@ -10,15 +10,16 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ### Added
 
-- `Host::park(loop)` parks the loop's idle groups: every group no Store holds or has opened,
-  with nothing staged, no sealer, and one live record, a checkpoint, closes into the table with
+- `Host::park(loop)` parks the loop's idle groups: every group no consumer has open (no hold,
+  no sealer), with nothing staged and one live record, a checkpoint, closes into the table with
   one commit for them all. A parked group is a closed entry: no log record, no heap, 45 bytes plus
   its checkpoint in its shard ([docs/design/idle-groups.md](docs/design/idle-groups.md)).
 - `TurnDriver::before_turn(hook)`: a host's table commit, run before each turn with records.
 - `TurnLog::peek(group)` reads a group's live records without restoring it; `TurnLog::idle()`
   lists the groups whose only live record is a checkpoint.
-- `host_test split_crash`, `split_stale_node`, `table_damage`, `park_mid_turn`, and
-  `idle_unmanifested` (review F3's unmanifested damage of a woken group's turn).
+- `host_test split_crash`, `split_stale_node`, `table_damage`, `park_mid_turn`,
+  `idle_unmanifested` (review F3's unmanifested damage of a woken group's turn), `split_orphan`,
+  `missing_shard`, `first_split_crash` and `park_unheld`.
 - `TurnLogStats::forward_scanned` counts the live records `forward_slice` visits.
 
 ### Changed
@@ -27,8 +28,11 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   `groups-<slot:3x>-<node:9x>`, split once one passes 4 KiB, so a create, wake, park or block
   reservation rewrites one file of at most 4 KiB instead of its whole slot (15 KB at 1M groups).
   The old `groups-<slot:3x>` files are not read.
-- A damaged table shard no longer fails the host's open: every id it could hold is lost, the
-  shard is never rewritten, and the log forgets its groups.
+- A damaged or missing table shard no longer fails the host's open: every id it could hold is
+  lost, the shard is never rewritten, and the log forgets its groups. A slot's first commit
+  writes its root whole; only a stored shard splits.
+- A closed or parked group leaves the host's record of groups a consumer opened, so strata's
+  groups, which take no hold, cost no heap once closed.
 - The in-memory release step is renamed evict: `TurnDriver::evict`, `TurnDriver::evicted`,
   `TurnLog::evict` and `TurnLog::evicted` replace `park` and `parked`, which now name the durable
   table state alone (`Host::park`).

@@ -52,9 +52,9 @@ The records stay live for retention: the per-segment live counts do not change, 
 updating its evicted positions. `TurnLog::sequence` answers for an evicted group from its entry, so
 `holds()` and `status()` still see it as stored. An evicted group stages nothing; `live()` restores it.
 
-`Host::park(loop)` takes the next step for a released group whose only live record is a
-checkpoint: it closes the group into the table, as `Store::close` would, so the log and memory
-forget it ([idle-groups](../design/idle-groups.md)). A released group with batches after its
+`Host::park(loop)` takes the next step for a group no consumer has open (no hold, no sealer)
+whose only live record is a checkpoint: it closes the group into the table, as `Store::close`
+would, so the log and memory forget it ([idle-groups](../design/idle-groups.md) D2). A released group with batches after its
 checkpoint stays in the log until a holder checkpoints it. It runs on the loop's thread, costs one
 table commit, and is safe mid-turn: the turn's groups are skipped (D10 there).
 

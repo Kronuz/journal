@@ -54,19 +54,29 @@ lists only `open` entries (`host.h:555`), and records through `base` are superse
 - *Lost: parking as an `open` entry with `base` set* (D10 item 3 as written). Recovery lists
   every open group as at risk from any damage (`turn_log.h:690`), which is review F3.
 
-**D2. What parks.** `Host::park(loop)` runs on the loop and off the turn (as `prepare()` does).
-It parks every group of the loop that:
+**D2. What parks: every idle group no consumer has open.** `Host::park(loop)` runs on the loop
+and off the turn (as `prepare()` does). A consumer has a group open while it holds it (a `Store`'s
+`Host::hold`) or has its sealer registered (strata's index, `TurnDriver::seal` until `unseal`).
+`park` parks every group of the loop that:
 
-- has been released (no `Store` holds it and its hold has settled, `host.h:382-396`);
-- has nothing staged and no sealer registered;
+- no consumer has open: no hold, or a hold that ended and settled, and no sealer;
+- has nothing staged or in flight;
 - has exactly one live record in the log, a checkpoint.
 
-One table commit covers every such group of the loop. Parking a held group is refused by
-construction: its holder's next record follows sequences only the log knows. A released group
-with batches after its checkpoint stays in the log, as it does today, until a holder recovers it
-and checkpoints. strata and Xapiand park a group by closing it (`turn_seal.hh` `close()`). They
-call no `hold`, so `park` never touches a group they own. How long a group must stay idle first
-is the caller's policy: it decides when to call `park`.
+One table commit covers every such group of the loop. Parking an open group is refused by
+construction: its consumer's next record follows sequences only the log knows. A group with
+batches after its checkpoint stays in the log, as it does today, until its consumer checkpoints
+it. This is the one consumer contract, for `Store` and strata alike:
+
+- **Park** is the host's: the consumer's idle policy calls `Host::park(loop)`, which takes the
+  groups whose consumer let go of them (a `Store` closed by its `Journal`'s end, an index whose
+  sealer is gone, a group recovered at open that nothing has opened since).
+- **Close** is the consumer's: it hands the table its last checkpoint itself
+  (`Host::close_group`, strata's `turn_sealer::close`). Both write the same `closed` state (D1).
+
+How long a group must stay idle first is the caller's policy: it decides when to call `park`.
+Between deciding to open a group and holding or sealing it (strata's `attach_log`: `status`,
+`reopen` or `records`, `stage`, `seal`), the consumer runs no `park` on that loop.
 
 - *Lost: parking inside `settle()`.* `settle` runs inside every `hold()` (`host.h:369`), so a hold
   would pay table I/O.
@@ -80,7 +90,9 @@ memory as a closed entry does today ("Closing" in `docs/mechanisms/group-lifetim
 - the log drops its index, sequence and released positions (`turn_log.h:217-228`);
 - the driver drops its recovered copy and refusal. It keeps no retired floor, because
   `forget(group, base + 1)` keeps one only above the table's floor (`turn_driver.h:157-172`);
-- `opened_` dropped it at release.
+- `opened_`, which marks a group a consumer created or recovered, drops it at release or when the
+  group closes or parks (`close_into_table`), so a group strata created and never held leaves no
+  entry either (review F3; `host_test park_unheld`).
 
 Its checkpoint's live count leaves its segment. Once no other live record remains there,
 `reclaim()` releases the segment with no forward copy (review F5).
@@ -199,10 +211,14 @@ One whose entries pass `leaf_bytes` (4 KiB) splits by the next bit until each pa
 entry, or sits at depth 32. Both children of a split are written, so a slot's files always cover
 every path. The host keeps each slot's nodes, 8 B per file, prefix-free and in path order.
 
+- Only a stored node splits. A slot's first commit writes its root whole, even past `leaf_bytes`,
+  and its next commit splits it. So every split has its node on disk until its children are.
 - A split renames its children, syncs the directory, then removes the split node. The removal is
   durable with a later directory sync; until then `open()` drops a node whose children cover it.
-  Children that do not cover their node are an unfinished split's: the node stands, or, under a
-  slot's unstored root, nothing there was durable (`host_detail::resolve`).
+  Children that do not cover their stored node are an unfinished split's: the node stands
+  (`host_detail::resolve`).
+- Paths under no stored node and no cover never come from a crash: a file is gone. Their node is
+  missing, and its groups are lost (D11), never read as `none`.
 - A commit that fails after renaming children leaves orphans. The next commit of their slot
   removes them and syncs the directory before it renames anything, so no orphan shadows a later
   version of its node.
@@ -259,7 +275,8 @@ next step if a host's open time matters.
   before it can tell which stand. The cover rule decides from the names alone.
 
 **D10. The park call contract (lead ruling Q2).** The mechanism is journal's and the policy the
-consumer's: Xapiand calls `Host::park(loop)` from its idle policy, as strata does from its own.
+consumer's: Xapiand calls `Host::park(loop)` from its idle policy, and it parks the groups D2 names,
+strata's included once their index lets go.
 
 - **Thread:** the loop's thread, the one that runs the loop's turns and its groups' `group_io`
   (`docs/mechanisms/host-ranges.md`).
@@ -275,7 +292,8 @@ consumer's: Xapiand calls `Host::park(loop)` from its idle policy, as strata doe
   does (D2).
 
 **D11. A damaged shard fails only its own groups (lead ruling Q3).** `open()` reads each shard
-file; one that fails its CRC or its checks is damaged, and the host still opens:
+file; one that fails its CRC or its checks is damaged, and one that is gone is missing (D9: paths
+under no stored node and no cover). Either way the host still opens:
 
 - Every id the shard could hold (the ids on its path) is `lost`, parked, open or never created,
   because the shard's ids are unknown. `create_group` refuses them.
@@ -286,7 +304,9 @@ file; one that fails its CRC or its checks is damaged, and the host still opens:
 - Other shards' groups recover as before. The blast radius is one shard file, at most 4 KiB of
   entries (D9), about 45 groups at 1M with 17-B payloads, where it was the whole host.
 
-`host_test table_damage` damages one shard and checks all of this across two restarts.
+`host_test table_damage` damages one shard and `missing_shard` removes one; each checks all of
+this across two restarts. A slot whose every file is gone reads as never written: nothing on disk
+names it.
 
 ## Crash at each step
 
@@ -333,8 +353,11 @@ design is written against its quest file. Nothing here depends on how many logs 
   `journal:driver`: its lead hears this before landing.
 - New: `Host::park(loop)`, which returns how many groups it parked (call contract in D10), and
   `TurnDriver::before_turn(std::function<void()>)`.
+- `Host::park` parks every idle group no consumer has open: no hold and no sealer (D2). strata
+  and Xapiand's idle policy call it; closing stays the consumer's own end of a group.
 - The table's files are `groups-<slot:3x>-<node:9x>`, each at most 4 KiB unless it holds one
-  entry (D9). A damaged one no longer fails the host's open (D11).
+  entry or is a slot's first file (D9). A damaged or missing one no longer fails the host's open
+  (D11).
 - A create's first serial block moves from the create to the first `next_artifact`.
 - No byte changes in an `RJGT0001` entry or in `RFTW0001`.
 
@@ -347,6 +370,9 @@ design is written against its quest file. Nothing here depends on how many logs 
 | A3 | `host_test idle_crash`: power cut after every mutation of create, wake, park and a re-partition, each followed by three restarts. Every acknowledged record must come back, and each group must be at an attempted state no older than its acknowledged one. `host_test idle_damage`: two damaged blocks of a woken group's batch; parked groups open, and the woken group, whose only post-wake records were there, reports lost. `host_test split_crash`: power cut after every mutation of commits that split one slot's shard. Mutants in `test/mutants.py` (`parked-as-open`, `wake-skips-commit`, `create-with-block`, `park-keeps-log`, `split-keeps-parent`, `split-removes-early`), each `--fails-without` |
 | Q2 | `host_test park_mid_turn` |
 | Q3 | `host_test table_damage`; mutant `damaged-shard-fails-open` |
+| Review F1 (D9's orphan rule) | `host_test split_orphan`; mutant `no-orphans` |
+| Review F2 (a missing shard) | `host_test missing_shard`, `first_split_crash`; mutants `missing-shard-stale`, `split-unstored` |
+| Review F3 (the consumer contract) | `host_test park_unheld`; mutants `park-skips-opened`, `close-keeps-opened`, `park-ignores-sealer` |
 | F3, unmanifested damage | `host_test idle_unmanifested` |
 | A4 | The suite and CI |
 

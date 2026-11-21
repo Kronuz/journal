@@ -256,23 +256,26 @@ inline bool covered(std::span<const std::uint64_t> nodes, std::uint64_t node) {
 	const auto split = static_cast<std::size_t>(middle - nodes.begin());
 	return covered(nodes.first(split), 2 * node) && covered(nodes.subspan(split), 2 * node + 1);
 }
-// Sorts a slot's stored nodes into those that stand and those an interrupted commit left
-// (open() removes them). A node whose children are covered was split, and its removal is not
-// yet durable; nodes under a node they do not cover are an unfinished split's: the node stands,
-// or with none, nothing there was durable before.
-inline void resolve(std::span<const std::uint64_t> nodes, std::uint64_t node, std::vector<std::uint64_t>& kept, std::vector<std::uint64_t>& stale) {
+// Sorts a slot's stored nodes into those that stand, those an interrupted commit left (open()
+// removes them), and the nodes no file covers (`missing`, also in `kept`). A node whose children
+// are covered was split, and its removal is not yet durable; nodes under a stored node they do not
+// cover are an unfinished split's, and the node stands. Only a stored node splits (Host::commit),
+// so a path under no stored node and no cover lost its file: its node is missing, never guessed.
+inline void resolve(std::span<const std::uint64_t> nodes, std::uint64_t node, std::vector<std::uint64_t>& kept, std::vector<std::uint64_t>& stale, std::vector<std::uint64_t>& missing) {
 	const bool stored = !nodes.empty() && nodes.front() == node;
 	const auto rest = stored ? nodes.subspan(1) : nodes;
 	const auto middle = std::partition_point(rest.begin(), rest.end(), [&](std::uint64_t low) { return first_path(low) < first_path(2 * node + 1); });
 	const auto split = static_cast<std::size_t>(middle - rest.begin());
 	if (!rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {
 		if (stored) { stale.push_back(node); }
-		resolve(rest.first(split), 2 * node, kept, stale);
-		resolve(rest.subspan(split), 2 * node + 1, kept, stale);
+		resolve(rest.first(split), 2 * node, kept, stale, missing);
+		resolve(rest.subspan(split), 2 * node + 1, kept, stale, missing);
 		return;
 	}
-	if (stored) { kept.push_back(node); }
-	stale.insert(stale.end(), rest.begin(), rest.end());
+	if (stored) { kept.push_back(node); stale.insert(stale.end(), rest.begin(), rest.end()); return; }
+	if (rest.empty() || depth(node) == max_depth) { kept.push_back(node); missing.push_back(node); return; }
+	resolve(rest.first(split), 2 * node, kept, stale, missing);
+	resolve(rest.subspan(split), 2 * node + 1, kept, stale, missing);
 }
 
 // A group's serial range as its views' scans read it, on whichever thread runs the scan
@@ -504,8 +507,9 @@ public:
 		std::vector<TurnRecord> closing{{group, sequence, TurnRecordKind::Checkpoint, std::move(manifest)}};
 		close_into_table(closing);
 	}
-	// Parks the loop's idle groups (docs/design/idle-groups.md D2): every group no Store holds or
-	// has opened, with nothing staged, no sealer, and one live record, a checkpoint, closes into
+	// Parks the loop's idle groups (docs/design/idle-groups.md D2): every group no consumer has
+	// open (no Store holds it, no sealer is registered), with nothing staged and one live record, a
+	// checkpoint, closes into
 	// the table as close_group does, with one commit for them all (each touched shard, one file
 	// sync, one directory sync). On the loop's thread; mid-turn it skips the turn's groups (D10).
 	// Returns how many parked; a failed commit leaves each of them in doubt, as a failed close does.
@@ -514,7 +518,7 @@ public:
 		auto& turns = driver(at);
 		std::vector<TurnRecord> parking;
 		for (auto group : turns.log().idle()) {
-			if (holding(group) || opened_[at].contains(group) || turns.staged(group) || turns.sealed(group)) { continue; }
+			if (holding(group) || turns.staged(group) || turns.sealed(group)) { continue; }
 			const auto* found = resident(group);
 			if (!found || found->state != GroupState::open || found->in_doubt) { continue; }
 			auto records = turns.log().peek(group);
@@ -597,8 +601,8 @@ private:
 		while (entry.mark < entry.next && !io_->entry_footprint(host_detail::artifact_name(group, entry.incarnation, entry.mark))) { ++entry.mark; }
 	}
 	// Each record, a group's last and a checkpoint covering every batch, becomes its table entry's
-	// base; the slots commit once, then the log forgets each group, and the closed entries leave
-	// memory. A failed commit restores each entry open, in doubt.
+	// base; the slots commit once, then the log forgets each group, and the closed entries and
+	// opened_ leave memory. A failed commit restores each entry open, in doubt.
 	void close_into_table(std::vector<TurnRecord>& records) {
 		std::set<std::uint64_t> groups; std::set<std::uint32_t> slots; std::vector<GroupEntry> before; before.reserve(records.size());
 		for (auto& record : records) {
@@ -615,7 +619,7 @@ private:
 			}
 			throw;
 		}
-		for (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); }
+		for (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); opened_[loop(record.group)].erase(record.group); }
 		for (auto slot : slots) { std::erase_if(shards_[slot], [](const auto& item) { return item.second.state == GroupState::closed; }); }
 	}
 	bool remove_artifacts(std::uint64_t group, GroupEntry& entry) {
@@ -661,7 +665,9 @@ private:
 			std::erase_if(entries, [&](const auto& item) { return item.second.state != GroupState::closed || resident.contains(item.first); });
 			for (const auto& [id, entry] : resident) { if (host_detail::holds(shard.second, id)) { entries.insert_or_assign(id, entry); } }
 			std::vector<std::pair<std::uint64_t, host_detail::Entries>> parts;
-			host_detail::partition(shard.second, std::move(entries), parts);
+			// A slot's first file is its root, whole: only a stored node splits (host_detail::resolve).
+			if (stored(shard)) { host_detail::partition(shard.second, std::move(entries), parts); }
+			else { parts.emplace_back(shard.second, std::move(entries)); }
 			if (parts.size() > 1) { split.push_back(shard); }
 			for (const auto& [node, part] : parts) { writes.push_back({{shard.first, node}, host_detail::encode_shard(identity_, part)}); }
 		}
@@ -817,15 +823,17 @@ private:
 		ranges_.resize(loops_);  // last: the open's commits publish to no table
 	}
 	// Reads each slot's stored shards: an interrupted commit's files go first (host_detail::resolve),
-	// and a damaged shard fails only its own groups, which are lost.
+	// and a damaged or missing shard fails only its own groups, which are lost.
 	void load_table(Names& names) {
 		bool removed = false;
 		for (auto& [slot, found] : names.shards) {
 			std::sort(found.begin(), found.end(), host_detail::path_order);
-			std::vector<std::uint64_t> kept, stale;
-			host_detail::resolve(found, 1, kept, stale);
+			std::vector<std::uint64_t> kept, stale, missing;
+			host_detail::resolve(found, 1, kept, stale, missing);
 			for (auto node : stale) { io_->remove(host_detail::shard_name({slot, node})); removed = true; }
+			damaged_[slot] = missing;
 			for (auto node : kept) {
+				if (std::find(missing.begin(), missing.end(), node) != missing.end()) { continue; }
 				try {
 					auto entries = host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name({slot, node}), std::uint64_t{1} << 32), identity_, {slot, node});
 					shards_[slot].merge(entries);
@@ -918,7 +926,7 @@ private:
 	std::vector<std::vector<std::uint64_t>> orphans_ = std::vector<std::vector<std::uint64_t>>(host_detail::slots);
 	std::map<std::pair<std::uint64_t, std::uint32_t>, std::vector<std::string>> logs_;
 	std::vector<std::shared_ptr<IO>> loop_views_;
-	std::vector<std::set<std::uint64_t>> opened_;  // per loop: groups a Store created or recovered, until released
+	std::vector<std::set<std::uint64_t>> opened_;  // per loop: groups a consumer created or recovered, until released or closed
 	mutable std::mutex holds_mutex_;
 	std::set<std::uint64_t> holds_;  // groups a live Store holds
 	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()

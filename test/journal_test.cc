@@ -2191,6 +2191,8 @@ void park_count() {
 		const std::uint64_t anchor = ids + 2;
 		host.create_group(anchor);
 		turns.stage(TurnRecord{anchor, 1, TurnRecordKind::Checkpoint, "anchor"});
+		node.commit();
+		const auto anchor_hold = host.hold(anchor);  // open, so park leaves it
 		for (std::uint64_t low = 1; low <= ids; low += batch) {
 			const auto high = std::min(ids + 1, low + batch);
 			for (auto group = low; group < high; ++group) {
