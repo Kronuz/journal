@@ -84,5 +84,8 @@ every group to table 0 (one shared table) makes TSan report the race and the tes
 a group; in a forked child, a view or a create from the old owner and a view from other threads
 each abort on the check (two live threads probe at once, since a new one may reuse the exited
 adopter's id), and adopting the table back makes the first thread's calls pass.
+`host_test handoff_scope` checks that the handoff takes effect at `adopt_loop` and moves only the
+named loop: on a 2-loop host a thread adopts loop 1 and makes no call, then the first thread's
+loop-1 view aborts while its loop-0 view passes.
 `host_test handoff_close` is strata's t6w case: a group created and checkpointed on the first
 thread and closed on another aborts without the handoff and closes with it.

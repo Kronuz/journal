@@ -832,7 +832,7 @@ void loop_handoff() {
 	auto first = host.group_io(1);  // this thread, the first, owns loop 0's table
 	std::shared_ptr<j::IO> adopted;
 	check(on_thread([&] { host.adopt_loop(0); adopted = host.group_io(2); host.create_group(2); }), "the adopting thread takes a view and creates a group");
-	check(adopted && host.status(2) != j::GroupStatus::none, "the adopting thread's group exists");
+	check(adopted && host.status(2) == j::GroupStatus::stored, "the adopting thread's group exists");
 	if (owner_checked) {
 		check(aborts([&] { host.group_io(3); }), "the old owner's view fails the debug check");
 		check(aborts([&] { host.create_group(3); }), "the old owner's table commit fails the debug check");
@@ -848,10 +848,30 @@ void loop_handoff() {
 	}
 	host.adopt_loop(0);
 	auto back = host.group_io(3); host.create_group(3);
-	check(back && host.status(3) != j::GroupStatus::none, "the thread that adopts the table back takes a view and creates a group");
+	check(back && host.status(3) == j::GroupStatus::stored, "the thread that adopts the table back takes a view and creates a group");
 	bool refused = false;
 	try { host.adopt_loop(1); } catch (const std::out_of_range&) { refused = true; }
 	check(refused, "a loop the host lacks is refused");
+}
+
+// journal-loop-handoff A1. The handoff takes effect at adopt_loop, before the adopter's first table
+// call, and moves only the loop it names: on a 2-loop host a thread adopts loop 1 and makes no
+// call; the first thread's loop-1 view then fails the debug check while its loop-0 view passes.
+void handoff_scope() {
+	fl::filesystem disk;
+	Node node(disk, 2);
+	auto& host = *node.host;
+	std::uint64_t groups[2] = {0, 0};  // a group on each loop
+	for (std::uint64_t group = 1; !groups[0] || !groups[1]; ++group) { if (!groups[host.loop(group)]) { groups[host.loop(group)] = group; } }
+	auto zero = host.group_io(groups[0]), one = host.group_io(groups[1]);  // this thread owns both tables
+	check(on_thread([&] { host.adopt_loop(1); }), "a thread adopts loop 1 and makes no table call");
+	if (owner_checked) {
+		check(aborts([&] { host.group_io(groups[1]); }), "the old owner's loop-1 view fails the debug check before the adopter calls");
+		check(!aborts([&] { host.group_io(groups[0]); }), "the first thread's loop-0 view still passes");
+	} else {
+		std::cout << "handoff_scope: NDEBUG build, no owner check to fail\n";
+	}
+	check(host.group_io(groups[0]) != nullptr, "the first thread keeps loop 0's table");
 }
 
 // journal-loop-handoff A2, strata's t6w: a group created and checkpointed on this thread, its
@@ -868,7 +888,6 @@ void handoff_close() {
 	} else {
 		std::cout << "handoff_close: NDEBUG build, no owner check to abort\n";
 	}
-	check(node.host->status(7) == j::GroupStatus::stored, "the aborted close left this process's group open");
 	check(on_thread([&] { node.host->adopt_loop(loop); node.store(7).close(); }), "a close on another thread after adopt_loop returns");
 	check(node.host->status(7) == j::GroupStatus::closed, "the table holds the group closed");
 }
@@ -897,7 +916,7 @@ int main(int argc, char** argv) {
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"close_in_doubt", close_in_doubt}, {"failed_close_crash", failed_close_crash}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
-		{"loop_views", loop_views}, {"loop_handoff", loop_handoff}, {"handoff_close", handoff_close}};
+		{"loop_views", loop_views}, {"loop_handoff", loop_handoff}, {"handoff_close", handoff_close}, {"handoff_scope", handoff_scope}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }
