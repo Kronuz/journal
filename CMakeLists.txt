@@ -66,7 +66,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	# The turn path's buffers: main's bytes, no allocation in a warm turn, forward copies in place.
 	add_executable(journal_turn_buffers_test test/turn_buffers_test.cc)
 	target_link_libraries(journal_turn_buffers_test PRIVATE journal::journal faultlab::faultlab)
-	foreach(c bytes turns warm seal forward power)
+	foreach(c bytes turns warm seal recycle forward power)
 		add_test(NAME journal_turn_buffers_${c} COMMAND journal_turn_buffers_test ${c})
 		set_tests_properties(journal_turn_buffers_${c} PROPERTIES TIMEOUT 600)
 	endforeach()

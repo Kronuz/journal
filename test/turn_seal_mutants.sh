@@ -20,6 +20,7 @@
 #   seal-copy         seal_turn copies the sealed record instead of moving it (journal-turn-buffers A2)
 #   stage-copy        TurnLog::stage frames each body from a fresh copy (journal-turn-buffers A2)
 #   forward-string    a forward copy reads into a string of its own first (journal-turn-buffers A3)
+#   drop-recycled     the driver frees a sealed payload instead of handing it back (journal-turn-buffers A6)
 set -eu
 new='if (false) {'
 case "$1" in
@@ -31,14 +32,15 @@ case "$1" in
 	bare-home) file=include/journal/turn_driver.h; old='if (!detail::posts_calls(waiter.home)) {'; new='if (!waiter.home) {' ;;
 	keep-waiters) file=include/journal/turn_driver.h; old='resume([group](const detail::TurnWaiter& waiter) { return waiter.group == group; }, detail::TurnWaiter::closed);'; new='' ;;
 	reuse-sequence) file=include/journal/turn_driver.h; old='return found == retired_.end() ? 0 : found->second;'; new='return 0;' ;;
-	one-call) file=include/journal/turn_driver.h; old='pending_.push_back({std::move(*record), {}, {}});'; new='pending_.push_back({std::move(*record), {}, {}}); break;' ;;
+	one-call) file=include/journal/turn_driver.h; old='pending_.push_back({std::move(*record), {}, {}, false, fn});'; new='pending_.push_back({std::move(*record), {}, {}, false, fn}); break;' ;;
 	framing) file=include/journal/turn_driver.h; old='used += turn_log_detail::record_cost(record->payload.size()); first = false;'; new='used += record->payload.size(); first = false;' ;;
 	staged) file=include/journal/turn_driver.h; old='if (found != sealers_.end()) { found->second.staged = record->sequence; mark(found->second); }'; new='' ;;
 	rotation) file=include/journal/turn_driver.h; old='if (resume_at) { next_seal_ = *resume_at; }'; new='' ;;
 	unsealed-again) file=include/journal/turn_driver.h; old='if (found == sealers_.end() || found->second.fn != fn) { break; }'; new='' ;;
 	repeat-throw) file=include/journal/turn_driver.h; old='catch (...) { if (!repeat) { throw; } deferred_ = std::current_exception(); return; }'; new='catch (...) { throw; }' ;;
 	deferred-ignored) file=include/journal/turn_driver.h; old='catch (...) { if (!repeat) { throw; } deferred_ = std::current_exception(); return; }'; new='catch (...) { if (!repeat) { throw; } return; }' ;;
-	seal-copy) file=include/journal/turn_driver.h; old='pending_.push_back({std::move(*record), {}, {}});'; new='pending_.push_back({TurnRecord(*record), {}, {}});' ;;
+	seal-copy) file=include/journal/turn_driver.h; old='pending_.push_back({std::move(*record), {}, {}, false, fn});'; new='pending_.push_back({TurnRecord(*record), {}, {}, false, fn});' ;;
+	drop-recycled) file=include/journal/turn_driver.h; old='try { (*fn)(std::move(item.record.payload)); }'; new='try {}' ;;
 	stage-copy) file=include/journal/turn_log.h; old='emitter.record(turn_log_detail::view(head), record.payload, record.group, record.sequence);'; new='emitter.record(turn_log_detail::view(head), std::string(record.payload), record.group, record.sequence);' ;;
 	forward-string) file=include/journal/turn_log.h; old='const auto at = out.size(); out.resize(at + count); original->read(out.data() + at, count);'; new='std::string piece(count, 0); original->read(piece.data(), count); out.append(piece);' ;;
 	*) echo "unknown mutant: $1" >&2; exit 2 ;;

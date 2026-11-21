@@ -26,6 +26,7 @@
 //   turns    a log's turns, rolling into new segments, write main's bytes at main's offsets
 //   warm     a warm turn of 32 records from 8 groups allocates nothing in stage() or completed()
 //   seal     a sealed turn through the driver allocates far less than one body: no copy at seal
+//   recycle  the driver hands each sealed body back once its turn completes; warm turns allocate nothing
 //   forward  a forward copy reads into the turn's buffer, allocating nothing, byte for byte
 //   power    a power cut at every write of such turns recovers exactly the acknowledged records
 #include "faultlab/faultfs.h"
@@ -363,6 +364,107 @@ void seal() {
 	check(after.recovered().groups == model, "every sealed record recovers");
 }
 
+// A6. Four sealers encode each turn's 128 KiB body into one buffer per group and take it back
+// through their recycler; group 5's sealer has none and hands over a body built before the turn.
+// Each buffer comes back only once its turn completes (its sequence durable), cleared with its
+// capacity, and the next body is encoded into it: once warm, begin() (sealing, encoding and
+// staging) and completed() allocate nothing. A group unsealed while its turn is in flight gets
+// nothing back; a recycler's throw fails the driver after its turn is acknowledged.
+void recycle() {
+	const j::TurnLogOptions options{std::uint64_t{16} << 20, 32 << 10, 1, 100, 1 << 20};
+	constexpr std::size_t body = 128 << 10;
+	constexpr std::uint64_t groups = 4, plain = 5;
+	fl::filesystem disk; fl::io io(disk);
+	// A body is zeros with a mark every 4 KiB, so encoding into a cleared buffer writes it whole.
+	auto encode = [](std::string& into, std::uint64_t group, std::uint64_t sequence) {
+		into.resize(body);
+		for (std::size_t i = 0; i < body; i += 4096) { into[i] = static_cast<char>('a' + (group + sequence + i / 4096) % 26); }
+	};
+	std::map<std::uint64_t, std::vector<j::TurnRecord>> model;
+	std::vector<std::string> buffers(groups + 1);
+	std::vector<const char*> sealed(groups + 1), returned(groups + 1);
+	std::vector<std::uint64_t> sequences(groups + 1), handed(groups + 1);
+	std::optional<j::TurnRecord> open_plain;
+	std::uint64_t turn = 0;
+	bool in_turn = false, throw_next = false;
+	unsigned reused = 0, early = 0, cleared = 0, durable = 0;
+	{
+		j::TurnDriver driver(io, identity, options);
+		const int owner = 0;
+		auto sealer = [&](std::uint64_t group) {
+			return [&, group](std::uint64_t room, bool) -> std::optional<j::TurnRecord> {
+				if (sequences[group] > turn || d::record_cost(body) > room) { return std::nullopt; }
+				auto& buffer = buffers[group];
+				encode(buffer, group, turn + 1);
+				if (returned[group]) { reused += buffer.data() == returned[group]; }
+				sealed[group] = buffer.data(); sequences[group] = turn + 1;
+				return j::TurnRecord{group, turn + 1, j::TurnRecordKind::Batch, std::move(buffer), turn};
+			};
+		};
+		auto recycler = [&](std::uint64_t group) {
+			return [&, group](std::string&& payload) {
+				if (throw_next) { throw_next = false; throw std::runtime_error("recycler failed"); }
+				early += in_turn; cleared += payload.empty() && payload.capacity() >= body;
+				durable += driver.sequence(group) >= sequences[group] && !driver.in_flight();
+				if (payload.data() != sealed[group]) { check(false, "the payload handed back is the buffer group " + std::to_string(group) + " sealed"); }  // no string unless it fails
+				returned[group] = payload.data(); ++handed[group];
+				buffers[group] = std::move(payload);
+			};
+		};
+		for (std::uint64_t group = 1; group <= groups; ++group) { driver.seal(group, sealer(group), &owner, recycler(group)); }
+		driver.seal(plain, [&](std::uint64_t room, bool) -> std::optional<j::TurnRecord> {
+			if (!open_plain || d::record_cost(open_plain->payload.size()) > room) { return std::nullopt; }
+			auto taken = std::move(*open_plain); open_plain.reset();
+			return taken;
+		});
+		// One turn: the plain body is built before it, the recycled ones inside begin().
+		auto run_turn = [&](std::uint64_t sealing_groups, const std::function<void()>& in_flight) {
+			open_plain = record(plain, turn + 1, 1000); model[plain].push_back(*open_plain);
+			for (std::uint64_t group = 1; group <= sealing_groups; ++group) {
+				std::string bytes; encode(bytes, group, turn + 1);
+				model[group].push_back({group, turn + 1, j::TurnRecordKind::Batch, std::move(bytes), turn});
+			}
+			const j::TurnLog::TurnWrite* write = nullptr;
+			in_turn = true;
+			const auto sealing = counted([&] { write = &driver.begin(); });
+			in_flight();
+			check(write->file->write_at(write->offset, write->bytes) == write->bytes.size(), "the turn is written: " + std::to_string(turn));
+			driver.log().flush(*write);
+			in_turn = false;
+			std::pair<Count, Count> counts{sealing, {}};
+			try { counts.second = counted([&] { driver.completed(); }); } catch (...) { ++turn; throw; }
+			++turn;
+			return counts;
+		};
+		for (unsigned t = 0; t < 8; ++t) {
+			const auto at = "turn " + std::to_string(t);
+			const auto [sealing, completing] = run_turn(groups, [] {});
+			check(!open_plain, "the plain sealer's record sealed: " + at);
+			for (std::uint64_t group = 1; group <= groups; ++group) { check(handed[group] == t + 1, "group " + std::to_string(group) + "'s buffer came back once: " + at); }
+			if (t >= 2) {
+				check(sealing.calls == 0 && sealing.bytes == 0, "a warm begin() allocates nothing: " + at + ": " + std::to_string(sealing.calls) + " allocations, " + std::to_string(sealing.bytes) + " bytes");
+				check(completing.calls == 0 && completing.bytes == 0, "a warm completed() allocates nothing: " + at + ": " + std::to_string(completing.calls) + " allocations, " + std::to_string(completing.bytes) + " bytes");
+			}
+			if (t == 7) { std::cout << "recycle: " << sealing.calls << " allocations (" << sealing.bytes << " bytes) in begin() sealing and encoding 4 recycled bodies of " << body << " bytes and a plain one, " << completing.calls << " in completed()\n"; }
+		}
+		check(reused == groups * 7, "every body after the first is encoded into the buffer handed back: " + std::to_string(reused) + " of " + std::to_string(groups * 7));
+		check(cleared == groups * 8, "each buffer comes back cleared, with its capacity: " + std::to_string(cleared));
+		check(early == 0 && durable == groups * 8, "each buffer comes back only after its turn is durable: " + std::to_string(early) + " early, " + std::to_string(durable) + " durable");
+		// Unsealed in flight: its record is durable, its buffer freed, not handed back.
+		run_turn(groups, [&] { driver.unseal(groups, &owner); });
+		check(handed[groups] == 8 && handed[1] == 9, "a group unsealed in flight gets nothing back; the others do");
+		check(driver.sequence(groups) == turn, "the unsealed group's record is durable");
+		// A throwing recycler: its turn is acknowledged, then the driver fails with its error.
+		throw_next = true;
+		bool threw = false;
+		try { run_turn(groups - 1, [] {}); } catch (const std::runtime_error& error) { threw = std::string(error.what()) == "recycler failed"; }
+		check(threw && driver.failed(), "a recycler's throw fails the driver");
+		check(driver.sequence(1) == turn && driver.sequence(plain) == turn, "the throwing turn's records are durable");
+	}
+	j::TurnDriver after(io, identity, options);
+	check(after.recovered().groups == model, "every record recovers");
+}
+
 // A3. Four idle groups' checkpoints sit in the oldest segment while group 9 checkpoints every
 // turn; one record moves forward a turn. Each forward copy reads back as its original's bytes,
 // and once warm (its segment's reader open, the turn in its segment) stage() allocates nothing.
@@ -474,7 +576,7 @@ void power() {
 
 int main(int argc, char** argv) {
 	const std::vector<std::pair<std::string, std::function<void()>>> cases{
-		{"bytes", bytes}, {"turns", turns}, {"warm", warm}, {"seal", seal}, {"forward", forward}, {"power", power},
+		{"bytes", bytes}, {"turns", turns}, {"warm", warm}, {"seal", seal}, {"recycle", recycle}, {"forward", forward}, {"power", power},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
 	bool ran = false;
