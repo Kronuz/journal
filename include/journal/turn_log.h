@@ -482,7 +482,7 @@ private:
 	}
 	// Whether a turn fits an empty segment, laid out without writing it.
 	template <class Emit> bool fits(Emit&& emit) const {
-		measured_ = filling_;
+		measured_.groups.reserve(framing::block_groups(options_.block_bytes)); measured_ = filling_;
 		auto empty = framing::Emitter::measure(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(measured_));
 		emit(empty);
 		measured_ = std::move(empty).filling();
@@ -572,8 +572,9 @@ private:
 	}
 	// Frames a turn into `bytes` from the current position, and `filling` the manifest after it.
 	// A turn never crosses a segment: one that does not fit starts the next one. Returns its end.
+	// The manifest reserves what a block can name, so no turn grows it.
 	template <class Emit> std::uint64_t encode(Emit&& emit, std::string& bytes, framing::Manifest& filling) {
-		filling = filling_;
+		filling.groups.reserve(framing::block_groups(options_.block_bytes)); filling = filling_;
 		framing::Emitter emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), offset_, std::move(filling), std::move(bytes));
 		emit(emitter);
 		if (emitter.position() > options_.segment_bytes) {

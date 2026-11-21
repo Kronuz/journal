@@ -52,8 +52,11 @@ inline constexpr bool valid_block_bytes(std::uint32_t bytes) { return bytes >= 2
 
 enum Fragment : std::uint8_t { Full = 1, First, Middle, Last };
 
+// The most groups a block's fragments can name: one per fragment, each at least 25 bytes.
+inline constexpr std::size_t block_groups(std::uint32_t block_bytes) { return (block_bytes - header_bytes(no_manifest)) / (fragment_header + 1); }
+
 // A block's groups and their highest sequences, read in group order. raise() appends and the
-// first read sorts, so filling a block allocates nothing once its capacity is warm. Not for
+// first read sorts, so filling a block allocates nothing within its reserved capacity. Not for
 // concurrent readers: a read may sort.
 class Groups {
 public:
@@ -77,6 +80,7 @@ public:
 	std::vector<value_type>::const_iterator begin() const { settle(); return entries_.cbegin(); }
 	std::vector<value_type>::const_iterator end() const { settle(); return entries_.cend(); }
 	void clear() noexcept { entries_.clear(); sorted_ = true; }
+	void reserve(std::size_t count) { entries_.reserve(count); }
 private:
 	// Sorts by group, each group's highest sequence first, and keeps that one.
 	void settle() const {
