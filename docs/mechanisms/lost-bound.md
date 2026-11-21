@@ -10,10 +10,13 @@ stored, and who may continue past it. The code is `TurnLog::recover` and `TurnLo
 
 A damaged block costs the groups its manifest names (turn-log-damage rule 3). The manifest holds
 each group's highest sequence in the block (`framing::Emitter::record`), so a group lost nothing
-above that sequence there. Its bound is the highest such sequence over every damage that names it:
-the damaged blocks' manifests, the records of turns dropped past the newest epoch's last kept turn
-(rule 5), and a kept manifest naming more than the group holds. Every record the damage could have
-taken is at or below the bound.
+above that sequence there. A gap that runs on into later blocks costs each of their manifests
+too, through the last block whose bytes may begin a lost record (`Item::last`); a block holding
+only the rest of a record that began earlier in the gap adds nothing. A missing manifest among
+them makes the damage `unknown`. Its bound is the highest such sequence over every damage that
+names it: the damaged blocks' manifests, the records of turns dropped past the newest epoch's last
+kept turn (rule 5), and a kept manifest naming more than the group holds. Every record the damage
+could have taken is at or below the bound.
 
 Recovery then sorts each named group three ways:
 
@@ -40,7 +43,9 @@ Each open passes the stored bounds back (`TurnLogGroups::bound`). Recovery treat
 records through its bound as superseded, as it treats those through a closed group's base: they
 are not required, damage among them names nothing, and the group's records may start at
 bound + 1. A second damage names the group only above the stored bound, so the bound only rises.
-A crash before the commit leaves the damage in the log, and the next open finds the same bound.
+A crash before the commit leaves the damage in the log, and the next open finds the same bound,
+for damage a later kept turn acknowledges (mid-log damage). Damage past the newest epoch's last
+kept turn (rule 5) is not kept that way; see Limits.
 
 The bound clears when the group's log keeps a checkpoint after it (the next open sees it first)
 or when the group closes into the table, whose base then supersedes it.
@@ -58,5 +63,12 @@ recover loses a bounded group and throws `Corruption`.
 ## Limits
 
 - Damage no manifest names loses every group, bounded ones too, as before.
+- Rule-5 damage survives only an open that completes. The open writes its new epoch's open record
+  (`TurnLog`'s constructor) before `Host::open` stores the bound or the loss; after a power cut
+  between the two, the damaged epoch is no longer the newest, recovery ignores its turns past the
+  open's kept turn, and the next open reports no damage: the bound is forgotten and the records
+  the damage took are silently gone. Power cuts at every mutation of that first open disagree at
+  11 of 17 cuts, here and at main before the bound (jobs 261121-141538-9a63b7,
+  261121-141627-fe334f). Storing the verdict before the open record would close it.
 - A group whose damaged block's manifest is itself damaged has no bound until a later source
   (a copy flag, a per-segment roster) gives one.
