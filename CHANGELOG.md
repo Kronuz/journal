@@ -6,6 +6,26 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-21
+
+### Changed
+
+- Damage to a turn log bounds a group's loss instead of losing the group
+  ([docs/mechanisms/lost-bound.md](docs/mechanisms/lost-bound.md)). A group the damaged blocks'
+  manifests name keeps its records from a checkpoint it kept after the damage, as if undamaged;
+  without one, recovery reports it in `TurnRecovery::bounded` with its bound (the highest
+  sequence the damage could hold) and its records after it. `Host::open` stores the bound in the
+  group's table entry (`GroupEntry::bound`; the shard's state byte carries `bounded_state`) and
+  keeps the group, which reports `GroupStatus::bounded`. A reader holding the group through
+  `Host::bound(group)` continues it from the records after the bound; one that does not calls
+  `Host::lose(group)`. A `Journal` Store loses a bounded group on recover.
+
+### Added
+
+- `TurnLogGroups::bound`, `TurnLog::keep(group, bound)`, `TurnLog::refuse(group)`,
+  `TurnDriver::keep(group)`, `Host::bound(group)`, `Host::lose(group)`.
+- `lost_bound_test bounds`, `crash`, `second` and `retention`.
+
 ## 2026-11-20
 
 ### Added

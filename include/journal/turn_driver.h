@@ -140,6 +140,14 @@ public:
 		auto found = recovered_.groups.find(group); return found == recovered_.groups.end() ? none : found->second;
 	}
 	void release(std::uint64_t group) { recovered_.groups.erase(group); }
+	// Keeps a bounded lost group whose bound its host stored (TurnLog::keep): recovery's records
+	// after the bound become the group's recovered records.
+	void keep(std::uint64_t group) {
+		const auto& found = recovered_.bounded.at(group);
+		log_.keep(group, found.bound);
+		recovered_.lost.erase(group);
+		if (!found.records.empty()) { recovered_.groups[group] = found.records; }
+	}
 	// A group no Store holds leaves memory but not the log (TurnLog::evict); live() reads its
 	// records back for the next Store. Nothing of it may be staged. Its refusal goes too: the
 	// refused records never reached the log, and no waiter of the old holder remains.
