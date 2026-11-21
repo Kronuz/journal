@@ -353,7 +353,8 @@ void reader_manifests() {
 		for (std::uint64_t g = 1; g < groups; ++g) { emitter.record("s", g, 1); }
 		const auto across = emitter.record(std::string(3000, 'm'), groups, 1);
 		const std::string bytes = emitter.bytes();
-		const auto name = std::to_string(groups), size = f::header_bytes(groups);
+		const auto name = std::to_string(groups);
+		const auto size = f::header_bytes(groups);
 		check(f::get16(std::string_view(bytes).substr(4096 + 56)) == groups && across < 4096 && across + 3000 > 4096, "a record crosses into a " + name + "-group header");
 		{
 			auto file = io.create_exclusive(name); file->write_at(0, bytes);
