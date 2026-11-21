@@ -6,6 +6,13 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-21
+
+### Added
+
+- `JOURNAL_FUZZ_DECODER` (`segment` or `checkpoint`) pins `journal_fuzz` to one decoder, so each gets
+  fuzzing time of its own; empty keeps the choice by the input's first byte, which is consumed either way.
+
 ## 2026-11-20
 
 ### Added
