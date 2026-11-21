@@ -21,6 +21,7 @@
 #   stage-copy        TurnLog::stage frames each body from a fresh copy (journal-turn-buffers A2)
 #   forward-string    a forward copy reads into a string of its own first (journal-turn-buffers A3)
 #   drop-recycled     the driver frees a sealed payload instead of handing it back (journal-turn-buffers A6)
+#   header-crc        RecordReader skips a block header's streamed CRC check (journal-turn-buffers A3)
 set -eu
 new='if (false) {'
 case "$1" in
@@ -43,6 +44,7 @@ case "$1" in
 	drop-recycled) file=include/journal/turn_driver.h; old='try { (*fn)(std::move(item.record.payload)); }'; new='try {}' ;;
 	stage-copy) file=include/journal/turn_log.h; old='emitter.record(turn_log_detail::view(head), record.payload, record.group, record.sequence);'; new='emitter.record(turn_log_detail::view(head), std::string(record.payload), record.group, record.sequence);' ;;
 	forward-string) file=include/journal/turn_log.h; old='const auto at = out.size(); out.resize(at + count); original->read(out.data() + at, count);'; new='std::string piece(count, 0); original->read(piece.data(), count); out.append(piece);' ;;
+	header-crc) file=include/journal/framing.h; old='if (checksum.value() != peek32(std::string_view(stored, 4))) {' ;;
 	*) echo "unknown mutant: $1" >&2; exit 2 ;;
 esac
 git checkout -- "$file" 2>/dev/null || true

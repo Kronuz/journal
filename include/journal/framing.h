@@ -208,17 +208,29 @@ enum class Check : std::uint8_t { ok, bad, cut };
 // The header opening `block`, the bytes from a block start to its end or the end of file.
 // Verifies everything but the epoch, which the header carries.
 struct Header { Check check = Check::bad; std::uint64_t epoch = 0; std::uint16_t count = 0; std::size_t size = 0; };
+// A header's count and size, read from its fixed part: ok when they fit the stream's blocks.
+inline Header header_shape(std::string_view fixed, const Stream& stream) {
+	Header header;
+	header.count = get16(fixed.substr(56)); header.size = header_bytes(header.count);
+	if (!stream.manifests && header.count != no_manifest) { return header; }
+	if (header.count == no_manifest && (peek64(fixed.substr(44)) || peek32(fixed.substr(52)))) { return header; }  // the emitter writes zeros
+	if (header.size + fragment_header >= stream.block_bytes) { return header; }  // a block holds a fragment byte after its header
+	header.check = Check::ok;
+	return header;
+}
+// Whether a header's fixed part names the stream's block `index`.
+inline bool names_block(std::string_view fixed, const Stream& stream, std::uint64_t index) {
+	return fixed.substr(0, 8) == stream.magic && fixed.substr(8, 16) == std::string_view(stream.identity.data(), 16) && peek64(fixed.substr(24)) == stream.segment &&
+		peek32(fixed.substr(32)) == index;
+}
 inline Header parse_header(std::string_view block, const Stream& stream, std::uint64_t index) {
 	Header header;
 	if (block.size() < (stream.manifests ? header_fixed : header_bytes(no_manifest))) { header.check = Check::cut; return header; }
-	header.count = get16(block.substr(56)); header.size = header_bytes(header.count);
-	if (!stream.manifests && header.count != no_manifest) { return header; }
-	if (header.count == no_manifest && (peek64(block.substr(44)) || peek32(block.substr(52)))) { return header; }  // the emitter writes zeros
-	if (header.size + fragment_header >= stream.block_bytes) { return header; }  // a block holds a fragment byte after its header
+	header = header_shape(block, stream);
+	if (header.check != Check::ok) { return header; }
 	if (header.size > block.size()) { header.check = Check::cut; return header; }
-	if (block.substr(0, 8) != stream.magic || block.substr(8, 16) != std::string_view(stream.identity.data(), 16) || peek64(block.substr(24)) != stream.segment ||
-		peek32(block.substr(32)) != index || peek32(block.substr(header.size - 4)) != crc32c(block.substr(0, header.size - 4))) { return header; }
-	header.check = Check::ok; header.epoch = peek64(block.substr(36));
+	if (!names_block(block, stream, index) || peek32(block.substr(header.size - 4)) != crc32c(block.substr(0, header.size - 4))) { header.check = Check::bad; return header; }
+	header.epoch = peek64(block.substr(36));
 	return header;
 }
 
@@ -240,11 +252,11 @@ inline FragmentView parse_fragment(std::string_view at, std::size_t room, std::u
 
 // Reads back, in order, the record whose first fragment starts at `offset`, checking each block
 // header and fragment on the way as scan does, so a record of another segment or epoch is
-// corruption. Block headers pass through `scratch`; the record's bytes go where read() puts them.
+// corruption. Block headers stream through a fixed buffer into their checksum; the record's
+// bytes go where read() puts them.
 class RecordReader {
 public:
-	RecordReader(File& file, const Stream& stream, std::uint64_t offset, std::string& scratch)
-		: file_(file), stream_(stream), position_(offset), scratch_(scratch) {}
+	RecordReader(File& file, const Stream& stream, std::uint64_t offset) : file_(file), stream_(stream), position_(offset) {}
 	// Reads the record's next `count` bytes to `to`; a record that ends first is corruption.
 	void read(char* to, std::size_t count) {
 		while (count) {
@@ -265,15 +277,7 @@ private:
 		if (done()) { throw Corruption("log record shorter than read"); }
 		const std::uint64_t block = stream_.block_bytes;
 		for (;;) {
-			if (position_ % block == 0) {
-				scratch_.resize(header_fixed); fetch(position_, scratch_.data(), header_fixed);
-				const auto size = header_bytes(get16(std::string_view(scratch_).substr(56)));
-				if (size + fragment_header >= block) { throw Corruption("invalid log block header"); }
-				scratch_.resize(size); fetch(position_ + header_fixed, scratch_.data() + header_fixed, size - header_fixed);
-				const auto header = parse_header(scratch_, stream_, position_ / block);
-				if (header.check != Check::ok || header.epoch != stream_.epoch) { throw Corruption("invalid log block header"); }
-				position_ += size;
-			}
+			if (position_ % block == 0) { enter_block(); }
 			const auto room = block - position_ % block;
 			if (room >= fragment_header + 1) { break; }
 			position_ += room;
@@ -289,14 +293,35 @@ private:
 		checksum_ = Checksum{}; checksum_.update(view.substr(4));
 		position_ += fragment_header;
 	}
-	File& file_; Stream stream_; std::uint64_t position_; std::string& scratch_;
+	// Checks the block header at position_ as parse_header does, its manifest and checksum read
+	// a chunk at a time, and steps past it.
+	void enter_block() {
+		char chunk[1024]; fetch(position_, chunk, header_fixed);
+		const std::string_view fixed(chunk, header_fixed);
+		const auto header = header_shape(fixed, stream_);
+		if (header.check != Check::ok || !names_block(fixed, stream_, position_ / stream_.block_bytes) || peek64(fixed.substr(36)) != stream_.epoch) { throw Corruption("invalid log block header"); }
+		Checksum checksum; checksum.update(fixed);
+		char stored[4] = {};
+		const std::uint64_t end = position_ + header.size, sum = end - 4;
+		for (std::uint64_t at = position_ + header_fixed; at < end;) {
+			const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(sizeof chunk, end - at));
+			fetch(at, chunk, n);
+			const auto body = at < sum ? static_cast<std::size_t>(std::min<std::uint64_t>(n, sum - at)) : 0;
+			checksum.update(chunk, body);
+			for (auto i = body; i < n; ++i) { stored[at + i - sum] = chunk[i]; }
+			at += n;
+		}
+		if (checksum.value() != peek32(std::string_view(stored, 4))) { throw Corruption("invalid log block header"); }
+		position_ = end;
+	}
+	File& file_; Stream stream_; std::uint64_t position_;
 	std::uint64_t left_ = 0; std::uint8_t type_ = 0; std::uint32_t expected_ = 0; Checksum checksum_;
 };
 
 // Reads back the record whose first fragment starts at `offset` (RecordReader).
 inline std::string read_record(File& file, const Stream& stream, std::uint64_t offset) {
-	std::string logical, scratch;
-	RecordReader reader(file, stream, offset, scratch);
+	std::string logical;
+	RecordReader reader(file, stream, offset);
 	while (const auto count = reader.piece()) { const auto at = logical.size(); logical.resize(at + count); reader.read(logical.data() + at, count); }
 	return logical;
 }

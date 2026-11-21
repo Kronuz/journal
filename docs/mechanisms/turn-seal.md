@@ -235,7 +235,9 @@ A sealed body is copied once, into the turn's bytes (strata `docs/design/rocksdb
   read. A turn past the current segment's rest is written once more, at the next segment's start.
 - **Reused.** One turn's bytes, notes, manifest and `next` map, and the live index's map nodes,
   pass to the next turn emptied, so a warm turn allocates nothing. The spare map nodes never
-  outnumber what their map held at its largest.
+  outnumber what their map held at its largest. Measuring lays a turn out in the turn's own
+  manifest, and a forward copy's block headers stream through a stack buffer, so the log keeps no
+  buffer beside the turn's.
 
 - **Handed back.** A sealer registered with a recycler gets each sealed record's payload back,
   cleared with its capacity kept, so it encodes its next body into the same buffer and a warm

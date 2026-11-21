@@ -388,7 +388,7 @@ public:
 			emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::end_of_turn, turn.turn, 0, 0)), std::string_view(count, 4), 0, 0);
 		};
 		// Copies ride along only where the turn still fits in a segment.
-		if (!copies_.empty() && !fits(emit)) { copies_.clear(); }
+		if (!copies_.empty() && !fits(emit, turn.filling)) { copies_.clear(); }
 		for (const auto& copy : copies_) { turn.notes.push_back({copy.group, copy.sequence, copy.live.kind, copy.live.bytes, true}); }
 		turn.end = encode(emit, turn.bytes, turn.filling);
 		turn.offset = offset_;
@@ -397,7 +397,7 @@ public:
 	}
 	// How many of `records`, from the first, one turn encodes in an empty segment without
 	// forwarded copies: what encode() accepts. Sequences are not checked.
-	std::size_t fitting(std::span<const TurnRecord> records) const {
+	std::size_t fitting(std::span<const TurnRecord> records) {
 		std::size_t n = 0;  // a turn holds at least each record's logical bytes
 		for (std::uint64_t bytes = 0; n < records.size() && (bytes += turn_log_detail::record_header + records[n].payload.size()) <= options_.segment_bytes; ++n) {}
 		auto fit = [&](std::size_t count) {
@@ -405,7 +405,7 @@ public:
 				for (const auto& record : records.first(count)) { emitter.record(turn_log_detail::view(turn_log_detail::header(static_cast<std::uint8_t>(record.kind), turn_ + 1, record.group, record.sequence)), record.payload, record.group, record.sequence); }
 				char tally[4]; framing::store(tally, count, 4);
 				emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::end_of_turn, turn_ + 1, 0, 0)), std::string_view(tally, 4), 0, 0);
-			});
+			}, spare_.filling);
 		};
 		if (fit(n)) { return n; }
 		std::size_t low = 0;  // fits; n does not
@@ -508,12 +508,13 @@ private:
 		if (auto found = records.find(sequence); found != records.end()) { drop(found->second); index_nodes_.give(records, found); }
 		index_nodes_.put(records, records.end(), sequence, Live{segment_, epoch_, offset, kind, bytes});
 	}
-	// Whether a turn fits an empty segment, laid out without writing it.
-	template <class Emit> bool fits(Emit&& emit) const {
-		measured_.groups.reserve(framing::block_groups(options_.block_bytes)); measured_ = filling_;
-		auto empty = framing::Emitter::measure(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(measured_));
+	// Whether a turn fits an empty segment, laid out without writing it in `manifest`, a turn
+	// manifest not in use.
+	template <class Emit> bool fits(Emit&& emit, framing::Manifest& manifest) const {
+		manifest.groups.reserve(framing::block_groups(options_.block_bytes)); manifest = filling_;
+		auto empty = framing::Emitter::measure(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(manifest));
 		emit(empty);
-		measured_ = std::move(empty).filling();
+		manifest = std::move(empty).filling();
 		return empty.position() <= options_.segment_bytes;
 	}
 	// A live record forward_slice chose; stage() reads it straight into the turn's buffer.
@@ -552,8 +553,7 @@ private:
 		void open() {
 			if (original) { return; }
 			const auto& live = copy.live;
-			if (log.scratch_.capacity() < log.options_.block_bytes / 2) { log.scratch_.reserve(log.options_.block_bytes / 2); }  // the largest header kept
-			original.emplace(log.reader(live.segment), turn_log_detail::stream(log.identity_, log.options_.block_bytes, live.segment, live.epoch), live.offset, log.scratch_);
+			original.emplace(log.reader(live.segment), turn_log_detail::stream(log.identity_, log.options_.block_bytes, live.segment, live.epoch), live.offset);
 			turn_log_detail::RecordHeader head; original->read(head.data(), head.size());
 			if (head != turn_log_detail::header(static_cast<std::uint8_t>(live.kind), framing::peek64(std::string_view(head.data() + 1, 8)), copy.group, copy.sequence)) {
 				throw Corruption("a live record does not read back as itself");
@@ -607,10 +607,11 @@ private:
 		framing::Emitter emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), offset_, std::move(filling), std::move(bytes));
 		emit(emitter);
 		if (emitter.position() > options_.segment_bytes) {
-			if (!fits(emit)) { throw std::length_error("turn exceeds a segment"); }
+			filling = std::move(emitter).filling(); bytes = std::move(emitter).bytes();
+			if (!fits(emit, filling)) { throw std::length_error("turn exceeds a segment"); }
 			begin_segment();
-			filling = std::move(emitter).filling(); filling = filling_;
-			emitter = framing::Emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(filling), std::move(emitter).bytes());
+			filling = filling_;
+			emitter = framing::Emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(filling), std::move(bytes));
 			emit(emitter);
 		}
 		const auto end = emitter.position();
@@ -640,8 +641,7 @@ private:
 	std::optional<Staged> staged_;
 	Staged spare_;  // the last turn's buffers, emptied: the next stage() frames into their capacity
 	Nodes<std::map<std::uint64_t, std::uint64_t>> next_nodes_; Nodes<std::map<std::uint64_t, Live>> index_nodes_;
-	std::vector<Copy> copies_; std::string scratch_;  // forward copies; their block headers
-	mutable framing::Manifest measured_;  // fits()' manifest
+	std::vector<Copy> copies_;  // forward copies
 	TurnLogStats stats_; bool failed_ = false;
 };
 

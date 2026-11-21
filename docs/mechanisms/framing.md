@@ -50,10 +50,11 @@ that grows by appends).
   fragment (its size plus 24 below the block size), so the next block's start is always a header's;
   the emitter keeps a manifest within half a block, so honest headers always do.
 - The turn log's `scan_segment` reads whole preallocated blocks with them and keeps its own gap and
-  epoch logic. `RecordReader(file, stream, offset, scratch)` reads one record back by offset, in
+  epoch logic. `RecordReader(file, stream, offset)` reads one record back by offset, in
   order, into wherever its caller asks (the turn log's forwarding, straight into the turn), and
-  checks what `scan` checks on the way: each block header it enters (its count bounded by the block
-  before it is read, then `parse_header`, epoch the stream's) and each fragment against the
+  checks what `scan` checks on the way: each block header it enters (`header_shape` and
+  `names_block` on its fixed part, epoch the stream's, then its CRC over the manifest read through a
+  1 KiB stack buffer, so a read holds no heap) and each fragment against the
   stream's segment and epoch and, as its last byte is read, its CRC. A record of another segment or
   epoch, bytes changed since the scan, or a record shorter than read, are `Corruption`.
   `read_record` reads a whole record into a string through it. The turn log keeps each live
