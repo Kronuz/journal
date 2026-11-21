@@ -625,7 +625,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 		std::map<std::uint64_t, Turn> turns; std::vector<std::size_t> gaps, tails;
 		for (std::size_t i = open.begin; i < stop; ++i) {
 			const auto& item = items[i];
-			if (item.tail) { tails.push_back(i); continue; }
+			if (item.tail && !item.damage) { tails.push_back(i); continue; }  // damage no crash leaves is no unwritten end
 			const bool recognized = (item.kind >= 1 && item.kind <= 3) || item.kind == end_of_turn;
 			if (item.gap || item.epoch != open.epoch || !recognized) { gaps.push_back(i); continue; }
 			if (item.turn <= open.kept || item.turn > limit) { continue; }
