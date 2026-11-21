@@ -366,6 +366,7 @@ void seal() {
 
 // A6. Four sealers encode each turn's 128 KiB body into one buffer per group and take it back
 // through their recycler; group 5's sealer has none and hands over a body built before the turn.
+// Every second record is a checkpoint, so the log's live index stays bounded and reuses its nodes.
 // Each buffer comes back only once its turn completes (its sequence durable), cleared with its
 // capacity, and the next body is encoded into it: once warm, begin() (sealing, encoding and
 // staging) and completed() allocate nothing. A group unsealed while its turn is in flight gets
@@ -380,7 +381,9 @@ void recycle() {
 		into.resize(body);
 		for (std::size_t i = 0; i < body; i += 4096) { into[i] = static_cast<char>('a' + (group + sequence + i / 4096) % 26); }
 	};
+	auto kind = [](std::uint64_t sequence) { return sequence % 2 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint; };
 	std::map<std::uint64_t, std::vector<j::TurnRecord>> model;
+	auto modeled = [&](j::TurnRecord r) { auto& records = model[r.group]; if (r.kind == j::TurnRecordKind::Checkpoint) { records.clear(); } records.push_back(std::move(r)); };
 	std::vector<std::string> buffers(groups + 1);
 	std::vector<const char*> sealed(groups + 1), returned(groups + 1);
 	std::vector<std::uint64_t> sequences(groups + 1), handed(groups + 1);
@@ -398,7 +401,7 @@ void recycle() {
 				encode(buffer, group, turn + 1);
 				if (returned[group]) { reused += buffer.data() == returned[group]; }
 				sealed[group] = buffer.data(); sequences[group] = turn + 1;
-				return j::TurnRecord{group, turn + 1, j::TurnRecordKind::Batch, std::move(buffer), turn};
+				return j::TurnRecord{group, turn + 1, kind(turn + 1), std::move(buffer), turn};
 			};
 		};
 		auto recycler = [&](std::uint64_t group) {
@@ -419,10 +422,10 @@ void recycle() {
 		});
 		// One turn: the plain body is built before it, the recycled ones inside begin().
 		auto run_turn = [&](std::uint64_t sealing_groups, const std::function<void()>& in_flight) {
-			open_plain = record(plain, turn + 1, 1000); model[plain].push_back(*open_plain);
+			open_plain = record(plain, turn + 1, 1000, kind(turn + 1)); modeled(*open_plain);
 			for (std::uint64_t group = 1; group <= sealing_groups; ++group) {
 				std::string bytes; encode(bytes, group, turn + 1);
-				model[group].push_back({group, turn + 1, j::TurnRecordKind::Batch, std::move(bytes), turn});
+				modeled({group, turn + 1, kind(turn + 1), std::move(bytes), turn});
 			}
 			const j::TurnLog::TurnWrite* write = nullptr;
 			in_turn = true;
