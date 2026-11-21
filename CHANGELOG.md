@@ -8,6 +8,13 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-20
 
+### Added
+
+- `Host::adopt_loop(loop)` hands a loop's range table to the calling thread, for a caller that
+  serializes the loop itself, as strata's `turn_sealer` does under its turn mutex. Debug builds
+  check a table's calls against one owner thread; after the handoff they check against the
+  adopting thread, so a close on a thread other than the first no longer aborts.
+
 ### Fixed
 
 - `TurnLog` recovery no longer drops acknowledged records silently when a damaged block is

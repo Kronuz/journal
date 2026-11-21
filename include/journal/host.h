@@ -217,7 +217,7 @@ struct Range {
 struct Ranges {
 	std::multimap<std::uint64_t, std::weak_ptr<Range>> table;
 	std::size_t sweep_at = sweep_floor;  // the table's size that sweeps it: twice the live after a sweep
-	std::thread::id owner;  // the loop's thread, the first to touch the table; debug builds check it
+	std::thread::id owner;  // the loop's thread: the first to touch the table, or the last to adopt it; debug builds check it
 };
 // The names `scan` yields, in order.
 class NameCursor final : public DirectoryCursor {
@@ -284,6 +284,15 @@ public:
 	TurnDriver& driver(std::uint32_t loop) { return *drivers_.at(loop); }
 	TurnDriver& driver_of(std::uint64_t group) { return driver(loop(group)); }
 	IO& io() noexcept { return *io_; }
+	// Hands the loop's range table to the calling thread, for a caller that serializes the loop
+	// itself (strata's turn mutex): that serialization orders this after the old owner's last table
+	// call. Debug builds then check the loop's table calls against this thread.
+	void adopt_loop(std::uint32_t loop) {
+		[[maybe_unused]] auto& ranges = ranges_.at(loop);
+#ifndef NDEBUG
+		ranges.owner = std::this_thread::get_id();
+#endif
+	}
 	// The group's table entry. Open and lost entries live in memory; a closed one only in its
 	// shard file, read back here, so a closed id costs the live host nothing.
 	std::optional<GroupEntry> entry(std::uint64_t group) const {
@@ -525,13 +534,13 @@ private:
 			if (auto range = at->second.lock()) { std::lock_guard hold(range->mutex); range->incarnation = entry.incarnation; range->mark = entry.mark; range->high = entry.high; }
 		}
 	}
-	// The group's loop's range table. Debug builds check that the calling thread is the loop's, the
-	// first that touched the table once the host opened.
+	// The group's loop's range table. Debug builds check that the calling thread is the loop's: the
+	// first that touched the table once the host opened, or the last that adopted it (adopt_loop).
 	host_detail::Ranges& owned_ranges(std::uint64_t group) {
 		auto& ranges = ranges_[loop(group)];
 #ifndef NDEBUG
 		if (ranges.owner == std::thread::id{}) { ranges.owner = std::this_thread::get_id(); }
-		assert(ranges.owner == std::this_thread::get_id() && "group_io and the table commits run on the group's loop");
+		assert(ranges.owner == std::this_thread::get_id() && "group_io and the table commits run on the group's loop; adopt_loop hands it over");
 #endif
 		return ranges;
 	}
@@ -690,7 +699,8 @@ private:
 	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()
 	// Per loop: its groups' views' ranges. Loop l's table belongs to loop l's thread, the one that
 	// runs group_io and the table commits (publish) of l's groups, so no lock guards it; one shared
-	// table would race across loops. docs/mechanisms/host-ranges.md has the rule.
+	// table would race across loops. adopt_loop moves it to another thread. docs/mechanisms/host-ranges.md
+	// has the rule.
 	std::vector<host_detail::Ranges> ranges_;
 	std::vector<std::unique_ptr<TurnDriver>> drivers_;
 };

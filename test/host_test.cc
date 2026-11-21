@@ -32,7 +32,9 @@
 // own; group views that keep their range however many dead views the host sweeps around them, in
 // a range table bounded by twice the live ids; a view taken while its group is closed, which
 // lists none of the closed incarnation's artifacts while the view held across the close keeps its;
-// and two loops that take views and commit their tables at once, free of races under TSan.
+// and two loops that take views and commit their tables at once, free of races under TSan; a
+// loop's table handed to another thread (adopt_loop), whose calls then pass the debug check while
+// the old owner's abort, as a close on a thread other than the first does without the handoff.
 // `host_test [case]` runs one case.
 #include "completion/posix.h"
 #include "faultlab/faultfs.h"
@@ -40,9 +42,13 @@
 #include <cerrno>
 #include <algorithm>
 #include <atomic>
+#include <csignal>
+#include <fcntl.h>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <set>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 
@@ -791,6 +797,76 @@ void closed_view() {
 	check(listing(*held).size() == 4 && listing(*fresh).size() == 4, "both views list the next checkpoint's: " + std::to_string(listing(*held).size()) + ", " + std::to_string(listing(*fresh).size()));
 }
 
+#ifdef NDEBUG
+constexpr bool owner_checked = false;
+#else
+constexpr bool owner_checked = true;
+#endif
+// Whether `run` aborts, run in a forked child (this process must hold no other thread), its
+// stderr silenced; a child that returns exits 0.
+bool aborts(const std::function<void()>& run) {
+	std::cout.flush(); std::cerr.flush();
+	const auto child = ::fork();
+	if (child == 0) {
+		if (const auto null = ::open("/dev/null", O_WRONLY); null >= 0) { ::dup2(null, STDERR_FILENO); }
+		try { run(); } catch (...) { ::_exit(2); }
+		::_exit(0);
+	}
+	int status = 0;
+	return child > 0 && ::waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
+// Runs `run` on a new thread; whether it returned.
+bool on_thread(const std::function<void()>& run) {
+	bool returned = false;
+	std::thread([&] { try { run(); returned = true; } catch (const std::exception& error) { std::cerr << error.what() << '\n'; } }).join();
+	return returned;
+}
+
+// journal-loop-handoff A1. A thread that adopts a loop owns its range table: its view and table
+// commit pass the debug check, while the thread that owned the table before, or any other, fails
+// it; adopting the table back passes again. A loop the host lacks is refused.
+void loop_handoff() {
+	fl::filesystem disk;
+	Node node(disk);
+	auto& host = *node.host;
+	auto first = host.group_io(1);  // this thread, the first, owns loop 0's table
+	std::shared_ptr<j::IO> adopted;
+	check(on_thread([&] { host.adopt_loop(0); adopted = host.group_io(2); host.create_group(2); }), "the adopting thread takes a view and creates a group");
+	check(adopted && host.status(2) != j::GroupStatus::none, "the adopting thread's group exists");
+	if (owner_checked) {
+		check(aborts([&] { host.group_io(3); }), "the old owner's view fails the debug check");
+		check(aborts([&] { host.create_group(3); }), "the old owner's table commit fails the debug check");
+		check(aborts([&] { std::thread([&] { host.group_io(3); }).join(); }), "a third thread's view fails the debug check");
+	} else {
+		std::cout << "loop_handoff: NDEBUG build, no owner check to fail\n";
+	}
+	host.adopt_loop(0);
+	auto back = host.group_io(3); host.create_group(3);
+	check(back && host.status(3) != j::GroupStatus::none, "the thread that adopts the table back takes a view and creates a group");
+	bool refused = false;
+	try { host.adopt_loop(1); } catch (const std::out_of_range&) { refused = true; }
+	check(refused, "a loop the host lacks is refused");
+}
+
+// journal-loop-handoff A2, strata's t6w: a group created and checkpointed on this thread, its
+// loop's table bound here, then closed on another thread, as strata's turn_sealer lets any thread
+// call in under its turn mutex. Without a handoff the close aborts in a debug build; after
+// adopt_loop it closes the group.
+void handoff_close() {
+	fl::filesystem disk;
+	Node node(disk);
+	node.checkpoint(7, "state");
+	const auto loop = node.host->loop(7);
+	if (owner_checked) {
+		check(aborts([&] { on_thread([&] { node.store(7).close(); }); }), "a close on another thread without a handoff aborts");
+	} else {
+		std::cout << "handoff_close: NDEBUG build, no owner check to abort\n";
+	}
+	check(node.host->status(7) == j::GroupStatus::stored, "the aborted close left this process's group open");
+	check(on_thread([&] { node.host->adopt_loop(loop); node.store(7).close(); }), "a close on another thread after adopt_loop returns");
+	check(node.host->status(7) == j::GroupStatus::closed, "the table holds the group closed");
+}
+
 // One owner lock, the directory's own (what strata's cold tier takes): a second host on the
 // directory is refused while the first holds it.
 void lock() {
@@ -815,7 +891,7 @@ int main(int argc, char** argv) {
 		{"names", names}, {"reclaim_isolation", reclaim_isolation}, {"census", census},
 		{"closed_reopen", closed_reopen}, {"recreate", recreate}, {"failed_close", failed_close}, {"failed_reopen", failed_reopen}, {"close_in_doubt", close_in_doubt}, {"failed_close_crash", failed_close_crash}, {"loop_slots", loop_slots}, {"close_behind", close_behind},
 		{"sealer_close", sealer_close}, {"sealer_close_crash", sealer_close_crash}, {"second_recovery", second_recovery}, {"lock", lock}, {"view_sweep", view_sweep}, {"closed_view", closed_view},
-		{"loop_views", loop_views}};
+		{"loop_views", loop_views}, {"loop_handoff", loop_handoff}, {"handoff_close", handoff_close}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }
