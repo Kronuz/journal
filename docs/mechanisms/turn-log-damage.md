@@ -78,7 +78,10 @@ could prove it, so that sector may be old.
 `test/turn_log_power_test.cc` runs crash points and damage patterns over six block sizes: 512,
 4096, 2048, 1000, 768 and 256 bytes. It takes `SEEDS FIRST_SEED BLOCK_BYTES`, so each seed below
 replays alone. `test/turn_log_power_vm.sh` runs the same test in a local Linux or FreeBSD VM. At 200
-seeds the test makes 1,036,264 checks with 0 failures. Its 241,462 crash points report no damage.
+seeds the test makes 1,228,757 checks with 0 failures, on macOS and in the FreeBSD VM. Its 242,242
+crash points and 155,754 simulated tears report no damage, and its 18,365 damaged crossing
+fragments at 2048 and 4096 bytes report damage; 676 more, whose header the sector boundary cuts,
+are only counted.
 
 Each seed below pins one rule:
 
