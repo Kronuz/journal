@@ -17,6 +17,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   that acknowledged turn unreported. A fragment that fills the next sector, is the last written
   there, or has a header the sector boundary cuts with no header of its write before it still
   reads as a tear ([docs/mechanisms/turn-log-damage.md](docs/mechanisms/turn-log-damage.md)).
+- `TurnLog` recovery no longer reads a tear as damage where the old sector holds another
+  segment's record whose group and sequence equal this segment and epoch. A failing fragment's
+  header proves its sector only with a type and reserved byte a writer emits; one with a bad type
+  or reserved byte is damage only when its checksum verifies with that byte corrected.
 
 ## 2026-11-20
 

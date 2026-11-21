@@ -406,6 +406,38 @@ void simulated_tears(std::uint64_t seed, std::uint64_t& tears) {
 		}
 	}
 }
+
+// Simulated tears whose old first sector holds another segment's record where the fragment
+// starts: its turn reads as the checksum, length, type and reserved byte, and its group 2 and
+// sequence 1 as segment 2 and epoch 1. Stale bytes naming the segment and epoch are no proof.
+struct StaleRecordTear { std::uint64_t seed; std::uint32_t block_bytes; std::uint64_t segment, block; std::size_t fragment; };
+constexpr StaleRecordTear stale_record_tears[] = {{29, 2048, 2, 2, 338}, {136, 2048, 2, 1, 750}, {189, 4096, 2, 3, 1627}};
+void stale_record_tear(const StaleRecordTear& tear) {
+	namespace d = j::turn_log_detail; namespace f = j::framing;
+	const auto at = "stale record tear: seed " + std::to_string(tear.seed) + " block_bytes " + std::to_string(tear.block_bytes) + " segment " + std::to_string(tear.segment) + " block " + std::to_string(tear.block) + " fragment " + std::to_string(tear.fragment);
+	const auto saved = options;
+	options = j::TurnLogOptions{tear.block_bytes * (tear.block_bytes == 4096 ? 4u : 8u), tear.block_bytes, 1, 3, 600};
+	fl::filesystem clean; fl::io clean_io(clean); Workload work(tear.seed); j::TurnRecovery recovered;
+	{ j::TurnLog log(clean_io, identity, recovered, options); for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); } }
+	clean.crash(tear.seed, sector_cut);
+	const auto blocks = written_blocks(clean_io);
+	const auto found = blocks.find({tear.segment, tear.block});
+	const Written* stale = nullptr;
+	for (const auto& [other, candidate] : blocks) { if (other.first != tear.segment) { stale = &candidate; break; } }
+	const Fragment* fragment = nullptr;
+	if (found != blocks.end()) { for (const auto& candidate : found->second.fragments) { if (candidate.start == tear.fragment) { fragment = &candidate; } } }
+	check(stale && fragment && !fragment->written, "the case's fragment and stale block exist: " + at);
+	if (stale && fragment && !fragment->written) {
+		const std::uint64_t start = tear.block * options.block_bytes;
+		const std::size_t next = (sector_of(start + fragment->start) + 1) * f::sector_bytes - start;
+		std::string torn = found->second.bytes;
+		for (auto k = fragment->start; k < next; ++k) { torn[k] = stale->bytes[k]; }
+		const auto bytes = std::string_view(torn).substr(fragment->start);
+		check(f::peek64(bytes.substr(8)) == tear.segment && f::peek64(bytes.substr(16)) == found->second.epoch, "the stale bytes name the segment and epoch: " + at);
+		check(!d::damaged_fragment(torn, start, fragment->start, tear.segment, found->second.epoch, false), "a torn fragment reads as a tear: " + at);
+	}
+	options = saved;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -416,6 +448,7 @@ int main(int argc, char** argv) {
 	// Block bytes and blocks per segment. Damage runs where block starts are sector-aligned: an
 	// unaligned header shares its sector with the block before (the journal's R8).
 	const std::pair<std::uint32_t, std::uint64_t> geometries[] = {{512, 8}, {4096, 4}, {2048, 8}, {1000, 8}, {768, 8}, {256, 16}};
+	for (const auto& tear : stale_record_tears) { stale_record_tear(tear); }
 	for (const auto& [block, blocks] : geometries) {
 		if (only && block != only) { continue; }
 		options = j::TurnLogOptions{block * blocks, block, 1, 3, 600};

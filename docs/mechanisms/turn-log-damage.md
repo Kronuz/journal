@@ -14,8 +14,11 @@ of a fragment in it, when it holds any of these:
 
 - A later fragment of this segment that verifies. The sector holds as written everything the log
   wrote in it before that fragment.
-- The fragment's own header, naming this segment and epoch. The sector is new, or the fragment was
-  durable.
+- The fragment's own header, naming this segment and epoch after a type and a reserved byte that a
+  writer emits. The sector is new, or the fragment was durable. The two numbers alone prove
+  nothing: an old sector can hold them as data, as a stale record's group and sequence, two
+  adjacent 64-bit integers. The eight bytes before those hold the record's turn, a small integer
+  whose high bytes, read as the type and the reserved byte, are zero.
 - A header of the fragment's own write that starts in the sector before it and verifies: the
   block's header, or the fragment before it, when that one does not end its write. Only the last
   fragment of a turn's end-of-turn record, or of the open record, ends a write. That header names
@@ -32,12 +35,12 @@ could prove it, so that sector may be old.
 1. **A header that fails** is damage when a fragment of this segment verifies in the header's sector.
 2. **A fragment that fails** is damage in any of these cases:
    - A later fragment of this segment verifies in the same sector.
-   - Its header names this segment and epoch, and any of the following holds:
-     - It has a header no writer emits: zero length, a bad type, or a nonzero reserved byte.
-     - It runs past its block.
-     - Its sector holds it whole.
-     - Its checksum verifies at a length its sector holds whole. A damaged length makes such a
-       fragment look as if it crossed into the next sector.
+   - Its header names this segment and epoch after a writer's type and reserved byte, and either
+     its length is zero or runs past its block, or its sector holds it whole.
+   - Its header names this segment and epoch, and its checksum verifies with one field corrected:
+     - A length its sector holds whole. A damaged length makes such a fragment look as if it
+       crossed into the next sector.
+     - Its type, or its reserved byte, when its length fits its block.
    - Its first sector is proven, by its header or by a header of its write before it, and a fragment
      of this segment verifies in the next sector, which proves that sector too. The fragment ends
      there, since one that ran on past it would fill it and leave no room for another to start.
@@ -65,6 +68,10 @@ could prove it, so that sector may be old.
   write before it in its sector.
   Only a per-sector checksum could tell this damage from a tear.
 - A tear inside a sector, as on pmem without BTT, is outside the model: it reads as damage.
+- Old bytes that hold this segment and epoch after a type byte of 1 to 4 and a zero byte, as a
+  stale payload could, read as the fragment's header, so a tear there reads as damage. The log's
+  own old headers name older segments, and the turn or sequence its records and manifests hold
+  before such a pair stays far below the 2^48 that type byte needs.
 
 ## Evidence
 
@@ -80,3 +87,4 @@ Each seed below pins one rule:
 | seeds 91 and 140, block_bytes 512, 'both' | The oldest segment's last two blocks, before the first kept turn: a byte past block 1's header and one in block 2's header | 4: unreported otherwise, and a group holding records only there would vanish |
 | seed 122, block_bytes 256, 'both' | Segment 42's last blocks, before the incomplete acknowledged turn 57 | 4: otherwise an earlier segment's empty tail takes the charge, and group 6 is kept with 2 of 3 records |
 | seeds 145 and 199, block_bytes 2048, 'last' | A flipped low length byte in the last turn's fragment, length 29 read as 71, which crosses its sector | 2, the checksum at a length the sector holds whole: otherwise the acknowledged last turn drops as a torn tail |
+| seeds 29 and 136 at block_bytes 2048, 189 at 4096, simulated tears | A tear leaves a fragment's first sector old, holding another segment's record where the fragment starts: its turn, group 2 and sequence 1 read as length 0, type 0, segment 2 and epoch 1 | 2, a writer's type and reserved byte before the segment and epoch: otherwise the tear reads as damage. `stale_record_tears` replays the three |

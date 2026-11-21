@@ -169,30 +169,40 @@ inline bool damaged_header(std::string_view block, std::uint64_t offset, std::ui
 	return verifies_in_sector(block, framing::header_bytes(0), sector_end(block, offset, 0), segment);
 }
 // A failing fragment is damage when a later fragment of its segment starts in its sector; when its
-// header names its segment and epoch and it is whole there, has a header no writer emits, or verifies
-// at a length its sector holds whole; or when its header, or a header of its write before it in its
-// sector (`written`), proves that sector and a fragment of the segment verifies in the next sector
-// (docs/mechanisms/turn-log-damage.md).
+// header names its segment and epoch with a writer's type and reserved byte, and has a length no
+// writer emits or its sector holds it whole; when its header names them and verifies with its length
+// (at one its sector holds whole), type or reserved byte corrected; or when its header, or a header
+// of its write before it in its sector (`written`), proves that sector and a fragment of the segment
+// verifies in the next sector (docs/mechanisms/turn-log-damage.md).
 inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch, bool written) {
 	const auto end = sector_end(block, offset, at);
 	if (verifies_in_sector(block, at + 1, end, segment)) { return true; }
 	const auto bytes = block.substr(at);
-	const bool named = at + framing::fragment_header <= end && framing::peek64(bytes.substr(8)) == segment && framing::peek64(bytes.substr(16)) == epoch;
-	const std::size_t length = framing::get16(bytes.substr(4));
-	if (named) {
-		const auto type = static_cast<std::uint8_t>(bytes[6]);
-		if (!length || framing::fragment_header + length > block.size() - at || type < framing::Full || type > framing::Last || bytes[7]) { return true; }
-		if (at + framing::fragment_header + length <= end) { return true; }
-	}
+	const bool names = at + framing::fragment_header <= end && framing::peek64(bytes.substr(8)) == segment && framing::peek64(bytes.substr(16)) == epoch;
+	const std::size_t length = framing::get16(bytes.substr(4)); const auto type = static_cast<std::uint8_t>(bytes[6]);
+	const bool fits = length && framing::fragment_header + length <= block.size() - at;
+	// Old bytes can name the segment and epoch, as a stale record's group and sequence do; the
+	// type and reserved byte a writer emits before them are what make the header this write's.
+	const bool named = names && type >= framing::Full && type <= framing::Last && !bytes[7];
+	if (named && (!fits || at + framing::fragment_header + length <= end)) { return true; }
 	// Crossing its sector: a fragment verifying in the next sector proves that sector too.
 	if ((named || written) && end < block.size() && verifies_in_sector(block, end, sector_end(block, offset, end), segment)) { return true; }
-	if (!named) { return false; }
-	// Otherwise it reads as a tear unless its length is what was damaged.
+	if (!names) { return false; }
+	// Otherwise it reads as a tear unless one damaged field of its header is all that fails.
 	std::string header(bytes.substr(4, framing::fragment_header - 4));
+	auto verifies = [&](std::size_t payload) {
+		Checksum checksum; checksum.update(header); checksum.update(bytes.substr(framing::fragment_header, payload));
+		return checksum.value() == framing::peek32(bytes);
+	};
 	for (std::size_t whole = 1; at + framing::fragment_header + whole <= end; ++whole) {
 		header[0] = static_cast<char>(whole); header[1] = static_cast<char>(whole >> 8);
-		Checksum checksum; checksum.update(header); checksum.update(bytes.substr(framing::fragment_header, whole));
-		if (checksum.value() == framing::peek32(bytes)) { return true; }
+		if (verifies(whole)) { return true; }
+	}
+	if (named || !fits) { return false; }
+	header[0] = bytes[4]; header[1] = bytes[5]; header[3] = '\0';
+	for (auto fragment : {framing::Full, framing::First, framing::Middle, framing::Last}) {
+		header[2] = static_cast<char>(fragment);
+		if (verifies(length)) { return true; }
 	}
 	return false;
 }
