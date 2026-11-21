@@ -247,6 +247,8 @@ A sealed body is copied once, into the turn's bytes (strata `docs/design/rocksdb
   acknowledged, as a repeat sealer call's does. A payload whose sealer was unsealed or replaced
   while its turn was in flight, or whose sealer has no recycler, is freed; a failed turn hands
   nothing back. A staged record's payload is freed once `stage()` has framed it, as before.
+  An unsealed sealer's function and recycler, with their captures, stay alive until the turn in
+  flight completes: an owner that `unseal()`s must not count on its captures being released then.
 - **The driver's own buffers.** Its pending, in-flight and spare in-flight vectors, the turn's
   record list and the sealing order keep their capacity across turns, so a warm turn through the
   driver allocates nothing in `begin()` or `completed()`.
