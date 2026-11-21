@@ -25,7 +25,8 @@
 // cold tier takes too. A group holds a table entry and no descriptor. Names:
 //
 //   layout                          RJHL0001: L and the log generation; replaced whole
-//   groups-<slot:3x>                RJGT0001: the group table's entries of one slot; replaced whole
+//   groups-<slot:3x>-<node:9x>      RJGT0001: the group table's entries under one node of a slot's
+//                                   trie, at most leaf_bytes unless one entry; replaced whole
 //   l<generation:16x>-<loop:4x>-turns-<segment:16x>   a loop's RFTW0001 segment
 //   g<group:16x>-artifact-<incarnation:16x><serial:16x>   a group's artifact
 //
@@ -35,6 +36,7 @@
 
 #include "turn_driver.h"
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
@@ -45,6 +47,7 @@
 #include <thread>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <system_error>
 #include <tuple>
@@ -88,10 +91,27 @@ inline constexpr std::uint64_t serial_block = 64;
 inline constexpr std::size_t sweep_floor = 64;  // the range table's least sweep threshold
 inline constexpr std::string_view layout_name = "layout";
 
-// A group's slot: its id mixed (splitmix64's finalizer) into 4,096 slots.
-inline std::uint32_t slot(std::uint64_t group) noexcept {
+inline constexpr std::size_t leaf_bytes = 4096;  // a shard past this splits, unless it holds one entry
+inline constexpr unsigned max_depth = 32;
+
+// A group's id mixed by splitmix64's finalizer: its top 12 bits are its slot, the next its path
+// in the slot's trie of shards.
+inline std::uint64_t mix(std::uint64_t group) noexcept {
 	group ^= group >> 30; group *= 0xbf58476d1ce4e5b9ull; group ^= group >> 27; group *= 0x94d049bb133111ebull; group ^= group >> 31;
-	return static_cast<std::uint32_t>(group >> 52);
+	return group;
+}
+// A group's slot: one of 4,096.
+inline std::uint32_t slot(std::uint64_t group) noexcept { return static_cast<std::uint32_t>(mix(group) >> 52); }
+// A slot's table is a binary trie whose leaves are its shard files: node 1 is the root, 2n and
+// 2n + 1 are n's children, and a node's depth is its bit width less one.
+inline unsigned depth(std::uint64_t node) noexcept { return static_cast<unsigned>(std::bit_width(node)) - 1; }
+inline std::uint64_t node_at(std::uint64_t group, unsigned depth) noexcept {
+	return std::uint64_t{1} << depth | (mix(group) >> (52 - depth) & ((std::uint64_t{1} << depth) - 1));
+}
+inline bool holds(std::uint64_t node, std::uint64_t group) noexcept { return node_at(group, depth(node)) == node; }
+// Node `low` lies strictly under `node`.
+inline bool below(std::uint64_t low, std::uint64_t node) noexcept {
+	return depth(low) > depth(node) && low >> (depth(low) - depth(node)) == node;
 }
 // Each of L loops owns a contiguous range of floor or ceil(4,096 / L) slots.
 inline std::uint32_t loop(std::uint32_t slot, std::uint32_t loops) noexcept { return static_cast<std::uint32_t>((std::uint64_t{slot} * loops) >> 12); }
@@ -132,11 +152,14 @@ inline Identity artifact_identity(std::uint64_t incarnation, std::uint64_t seria
 inline std::string artifact_name(std::uint64_t group, std::uint64_t incarnation, std::uint64_t serial) {
 	return group_prefix(group) + "artifact-" + hex(incarnation, 16) + hex(serial, 16);
 }
-inline std::string shard_name(std::uint32_t slot) { return "groups-" + hex(slot, 3); }
-inline std::optional<std::uint32_t> shard_slot(std::string_view name) {
-	if (name.size() != 10 || !name.starts_with("groups-")) { return std::nullopt; }
-	auto slot = parse_hex(name.substr(7));
-	return slot && *slot < slots ? std::optional<std::uint32_t>(static_cast<std::uint32_t>(*slot)) : std::nullopt;
+// A shard is a slot and a node of its trie.
+using Shard = std::pair<std::uint32_t, std::uint64_t>;
+inline std::string shard_name(Shard shard) { return "groups-" + hex(shard.first, 3) + "-" + hex(shard.second, 9); }
+inline std::optional<Shard> shard_of(std::string_view name) {
+	if (name.size() != 20 || !name.starts_with("groups-") || name[10] != '-') { return std::nullopt; }
+	auto slot = parse_hex(name.substr(7, 3)); auto node = parse_hex(name.substr(11));
+	if (!slot || *slot >= slots || !node || !*node || depth(*node) > max_depth) { return std::nullopt; }
+	return Shard{static_cast<std::uint32_t>(*slot), *node};
 }
 
 inline std::string read_file(IO& io, std::string_view name, std::uint64_t maximum) {
@@ -172,6 +195,11 @@ inline std::pair<std::uint32_t, std::uint64_t> decode_layout(std::string_view by
 }
 // A shard: magic, the host's identity, the entry count, the entries (id, incarnation, state,
 // mark, high, base, manifest length and bytes), then a CRC.
+inline std::size_t shard_bytes(const std::map<std::uint64_t, GroupEntry>& entries) {
+	std::size_t bytes = 32;
+	for (const auto& [_, entry] : entries) { bytes += 45 + entry.manifest.size(); }
+	return bytes;
+}
 inline std::string encode_shard(const Identity& host, const std::map<std::uint64_t, GroupEntry>& entries) {
 	std::string bytes(table_magic); bytes.append(host.data(), host.size()); put32(bytes, static_cast<std::uint32_t>(entries.size()));
 	for (const auto& [id, entry] : entries) {
@@ -182,7 +210,7 @@ inline std::string encode_shard(const Identity& host, const std::map<std::uint64
 	put32(bytes, crc32c(bytes));
 	return bytes;
 }
-inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, const Identity& host, std::uint32_t slot) {
+inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, const Identity& host, Shard shard) {
 	if (bytes.size() < 32 || crc32c(bytes.substr(0, bytes.size() - 4)) != detail::checksum_at_end(bytes)) { throw Corruption("damaged group table"); }
 	if (bytes.substr(0, 8) != table_magic || bytes.substr(8, 16) != std::string_view(host.data(), host.size())) { throw Corruption("foreign group table"); }
 	bytes.remove_prefix(24); bytes.remove_suffix(4);
@@ -199,10 +227,55 @@ inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, 
 		if (length > bytes.size()) { throw Corruption("truncated group entry"); }
 		entry.manifest.assign(bytes.substr(0, length)); bytes.remove_prefix(length);
 		entry.next = entry.high;
-		if (!id || host_detail::slot(id) != slot || entry.mark > entry.high || !entries.emplace(id, std::move(entry)).second) { throw Corruption("invalid group entry"); }
+		if (!id || host_detail::slot(id) != shard.first || !holds(shard.second, id) || entry.mark > entry.high || !entries.emplace(id, std::move(entry)).second) { throw Corruption("invalid group entry"); }
 	}
 	if (!bytes.empty()) { throw Corruption("trailing group table bytes"); }
 	return entries;
+}
+
+// Splits a shard's entries by the next bit of their path until each part encodes in leaf_bytes,
+// holds one entry, or sits at max_depth. Both children of a split are written, so a slot's
+// shards always cover every path under it.
+using Entries = std::map<std::uint64_t, GroupEntry>;
+inline void partition(std::uint64_t node, Entries entries, std::vector<std::pair<std::uint64_t, Entries>>& parts) {
+	if (entries.size() <= 1 || depth(node) == max_depth || shard_bytes(entries) <= leaf_bytes) { parts.emplace_back(node, std::move(entries)); return; }
+	Entries left, right;
+	for (auto& [id, entry] : entries) { (holds(2 * node, id) ? left : right).emplace(id, std::move(entry)); }
+	partition(2 * node, std::move(left), parts);
+	partition(2 * node + 1, std::move(right), parts);
+}
+// A node's first path, of 2^32, and the order that lists a node before the nodes under it.
+inline std::uint64_t first_path(std::uint64_t node) noexcept { return (node ^ std::uint64_t{1} << depth(node)) << (max_depth - depth(node)); }
+inline bool path_order(std::uint64_t a, std::uint64_t b) noexcept { return std::pair{first_path(a), depth(a)} < std::pair{first_path(b), depth(b)}; }
+// `nodes`: a slot's stored nodes under `node`, in path_order. They cover it when it is stored
+// or its children both are covered.
+inline bool covered(std::span<const std::uint64_t> nodes, std::uint64_t node) {
+	if (nodes.empty()) { return false; }
+	if (nodes.front() == node) { return true; }
+	const auto middle = std::partition_point(nodes.begin(), nodes.end(), [&](std::uint64_t low) { return first_path(low) < first_path(2 * node + 1); });
+	const auto split = static_cast<std::size_t>(middle - nodes.begin());
+	return covered(nodes.first(split), 2 * node) && covered(nodes.subspan(split), 2 * node + 1);
+}
+// Sorts a slot's stored nodes into those that stand, those an interrupted commit left (open()
+// removes them), and the nodes no file covers (`missing`, also in `kept`). A node whose children
+// are covered was split, and its removal is not yet durable; nodes under a stored node they do not
+// cover are an unfinished split's, and the node stands. Only a stored node splits (Host::commit),
+// so a path under no stored node and no cover lost its file: its node is missing, never guessed.
+inline void resolve(std::span<const std::uint64_t> nodes, std::uint64_t node, std::vector<std::uint64_t>& kept, std::vector<std::uint64_t>& stale, std::vector<std::uint64_t>& missing) {
+	const bool stored = !nodes.empty() && nodes.front() == node;
+	const auto rest = stored ? nodes.subspan(1) : nodes;
+	const auto middle = std::partition_point(rest.begin(), rest.end(), [&](std::uint64_t low) { return first_path(low) < first_path(2 * node + 1); });
+	const auto split = static_cast<std::size_t>(middle - rest.begin());
+	if (!rest.empty() && covered(rest.first(split), 2 * node) && covered(rest.subspan(split), 2 * node + 1)) {
+		if (stored) { stale.push_back(node); }
+		resolve(rest.first(split), 2 * node, kept, stale, missing);
+		resolve(rest.subspan(split), 2 * node + 1, kept, stale, missing);
+		return;
+	}
+	if (stored) { kept.push_back(node); stale.insert(stale.end(), rest.begin(), rest.end()); return; }
+	if (rest.empty() || depth(node) == max_depth) { kept.push_back(node); missing.push_back(node); return; }
+	resolve(rest.first(split), 2 * node, kept, stale, missing);
+	resolve(rest.subspan(split), 2 * node + 1, kept, stale, missing);
 }
 
 // A group's serial range as its views' scans read it, on whichever thread runs the scan
@@ -377,7 +450,7 @@ public:
 	}
 	bool holding(std::uint64_t group) const { std::lock_guard lock(holds_mutex_); return holds_.contains(group); }
 	// Releases the loop's groups whose holds ended and whose records are settled: each leaves
-	// memory but not the log (TurnDriver::park), so retention keeps every durable record and
+	// memory but not the log (TurnDriver::evict), so retention keeps every durable record and
 	// the next recover reads them back. On the loop; hold() runs it first.
 	void settle(std::uint32_t at) {
 		std::vector<std::uint64_t> ended;
@@ -387,28 +460,36 @@ public:
 		for (auto group : ended) {
 			if (holding(group)) { continue; }
 			if (turns.staged(group)) { unsettled.push_back(group); continue; }
-			turns.park(group); opened_[at].erase(group);
+			turns.evict(group); opened_[at].erase(group);
 		}
 		if (!unsettled.empty()) {
 			std::lock_guard lock(holds_mutex_);
 			released_[at].insert(released_[at].end(), unsettled.begin(), unsettled.end());
 		}
 	}
-	// The shared Journal's table transitions (journal.h); each is durable when it returns.
-	// A new incarnation of the group, with its first serial block: a group the table does not
-	// hold, or one whose first turn never became durable, whose artifacts go first.
+	// The shared Journal's table transitions (journal.h). Create and reopen change the entry in
+	// memory and mark its slot: the slot commits before the next turn of the group's loop
+	// (TurnDriver::before_turn), so each is durable before the turn carrying the group's first
+	// record (docs/design/idle-groups.md D5). Close and park are durable when they return.
+	// A new incarnation of the group: a group the table does not hold, or one whose first turn
+	// never became durable, whose artifacts go first. Its first serial block is reserved by its
+	// first artifact (next_artifact), durably, so no artifact is named by an undurable block.
 	void create_group(std::uint64_t group) {
 		if (status(group) != GroupStatus::none) { throw std::logic_error("the group exists, is closed, or is lost"); }
-		update(group, [&](GroupEntry& entry) {
-			if (remove_artifacts(group, entry)) { io_->sync_directory(); }
-			entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, host_detail::serial_block, 0, {}, 0};
-		});
+		auto& entry = shards_[host_detail::slot(group)][group];
+		if (remove_artifacts(group, entry)) { io_->sync_directory(); }
+		entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, 0, 0, {}, 0};
+		dirty_[loop(group)].insert(group);
 		opened_[loop(group)].insert(group);
+		publish(group, entry);  // its views name nothing until its first block
 	}
+	// A closed or parked group opens again; its table record is staged again by its holder.
 	void reopen_group(std::uint64_t group) {
 		if (!resident(group)) { if (auto closed = stored(group)) { shards_[host_detail::slot(group)].emplace(group, std::move(*closed)); } }
-		held(group, GroupState::closed);
-		update(group, [](GroupEntry& entry) { entry.state = GroupState::open; });
+		auto& entry = held(group, GroupState::closed);
+		entry.state = GroupState::open;
+		dirty_[loop(group)].insert(group);
+		publish(group, entry);  // its views list its incarnation's artifacts, as the census counts them
 	}
 	// The table takes the group's last record, a checkpoint covering every batch; once that is
 	// durable the log forgets the group, so retention reclaims its records. As TurnLog's
@@ -423,12 +504,34 @@ public:
 		if (sequence < std::max(base, turns.sequence(group))) {
 			throw std::logic_error("a close behind the group's last acknowledged record");
 		}
-		try {
-			update(group, [&](GroupEntry& entry) {
-				settle_mark(group, entry); entry.state = GroupState::closed; entry.base = sequence; entry.manifest = std::move(manifest);
-			});
-		} catch (...) { shards_[host_detail::slot(group)].at(group).in_doubt = true; throw; }
-		turns.forget(group, sequence + 1);
+		std::vector<TurnRecord> closing{{group, sequence, TurnRecordKind::Checkpoint, std::move(manifest)}};
+		close_into_table(closing);
+	}
+	// Parks the loop's idle groups (docs/design/idle-groups.md D2): every group no consumer has
+	// open (no Store holds it, no sealer is registered), with nothing staged and one live record, a
+	// checkpoint, closes into
+	// the table as close_group does, with one commit for them all (each touched shard, one file
+	// sync, one directory sync). On the loop's thread; mid-turn it skips the turn's groups (D10).
+	// Returns how many parked; a failed commit leaves each of them in doubt, as a failed close does.
+	std::size_t park(std::uint32_t at) {
+		settle(at);
+		auto& turns = driver(at);
+		std::vector<TurnRecord> parking;
+		for (auto group : turns.log().idle()) {
+			if (holding(group) || turns.staged(group) || turns.sealed(group)) { continue; }
+			const auto* found = resident(group);
+			if (!found || found->state != GroupState::open || found->in_doubt) { continue; }
+			auto records = turns.log().peek(group);
+			parking.push_back(std::move(records.front()));
+		}
+		if (!parking.empty()) { close_into_table(parking); }
+		return parking.size();
+	}
+	// Commits the loop's groups that a create or reopen changed: the hook every driver runs before
+	// a turn with records.
+	void commit_transitions(std::uint32_t at) {
+		if (dirty_.empty() || dirty_[at].empty()) { return; }
+		commit(std::set<std::uint64_t>(dirty_[at]));
 	}
 	// The group's next artifact identity; a used-up block reserves the next one in the table.
 	Identity next_artifact(std::uint64_t group) {
@@ -444,23 +547,39 @@ private:
 		const auto& shard = shards_[host_detail::slot(group)];
 		auto found = shard.find(group); return found == shard.end() ? nullptr : &found->second;
 	}
-	// The slot's shard file as stored, or nothing before its first commit.
-	std::map<std::uint64_t, GroupEntry> stored_shard(std::uint32_t slot) const {
-		if (!stored_[slot]) { return {}; }
-		return host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name(slot), std::uint64_t{1} << 32), identity_, slot);
+	// The shard the group's entry falls in: the stored node on its path, or its slot's root before
+	// the slot's first commit. A slot's nodes are prefix-free and in path order.
+	host_detail::Shard shard_of(std::uint64_t group) const {
+		const auto slot = host_detail::slot(group);
+		const auto& nodes = nodes_[slot];
+		const auto path = host_detail::mix(group) >> 20 & 0xffffffffu;
+		auto at = std::upper_bound(nodes.begin(), nodes.end(), path, [](std::uint64_t p, std::uint64_t node) { return p < host_detail::first_path(node); });
+		if (at != nodes.begin() && host_detail::holds(*std::prev(at), group)) { return {slot, *std::prev(at)}; }
+		return {slot, 1};
 	}
+	bool stored(host_detail::Shard shard) const { return std::binary_search(nodes_[shard.first].begin(), nodes_[shard.first].end(), shard.second, host_detail::path_order); }
+	bool damaged(host_detail::Shard shard) const { const auto& nodes = damaged_[shard.first]; return std::find(nodes.begin(), nodes.end(), shard.second) != nodes.end(); }
+	// The shard's file as stored, or nothing before its first commit.
+	host_detail::Entries stored_shard(host_detail::Shard shard) const {
+		if (!stored(shard)) { return {}; }
+		return host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name(shard), std::uint64_t{1} << 32), identity_, shard);
+	}
+	// A group of a damaged shard is lost: what the shard held of it is unknown.
 	std::optional<GroupEntry> stored(std::uint64_t group) const {
-		auto entries = stored_shard(host_detail::slot(group));
+		const auto shard = shard_of(group);
+		if (damaged(shard)) { return GroupEntry{0, GroupState::lost, 0, 0, 0, {}, 0}; }
+		auto entries = stored_shard(shard);
 		auto found = entries.find(group);
 		if (found == entries.end()) { return std::nullopt; }
 		return std::move(found->second);
 	}
 	// retired() for the loops' drivers: a group the table closed retires through its close's
 	// sequence + 1 (TurnDriver::forget keeps any floor past it), and so does the incarnation
-	// reopened after it, until its own close. An unreadable table retires every sequence.
+	// reopened after it, until its own close. An unreadable or damaged shard retires every sequence.
 	std::uint64_t retired_floor(std::uint64_t group) const noexcept {
 		try {
 			if (const auto* found = resident(group)) { return found->base ? found->base + 1 : 0; }
+			if (damaged(shard_of(group))) { return std::numeric_limits<std::uint64_t>::max(); }
 			const auto closed = stored(group);
 			return closed && closed->base ? closed->base + 1 : 0;
 		} catch (...) { return std::numeric_limits<std::uint64_t>::max(); }
@@ -481,6 +600,28 @@ private:
 	void settle_mark(std::uint64_t group, GroupEntry& entry) {
 		while (entry.mark < entry.next && !io_->entry_footprint(host_detail::artifact_name(group, entry.incarnation, entry.mark))) { ++entry.mark; }
 	}
+	// Each record, a group's last and a checkpoint covering every batch, becomes its table entry's
+	// base; the slots commit once, then the log forgets each group, and the closed entries and
+	// opened_ leave memory. A failed commit restores each entry open, in doubt.
+	void close_into_table(std::vector<TurnRecord>& records) {
+		std::set<std::uint64_t> groups; std::set<std::uint32_t> slots; std::vector<GroupEntry> before; before.reserve(records.size());
+		for (auto& record : records) {
+			auto& entry = shards_[host_detail::slot(record.group)].at(record.group);
+			before.push_back(entry);
+			settle_mark(record.group, entry); entry.state = GroupState::closed; entry.base = record.sequence; entry.manifest = std::move(record.payload);
+			groups.insert(record.group); slots.insert(host_detail::slot(record.group));
+		}
+		try { commit(groups); }
+		catch (...) {
+			for (std::size_t i = 0; i < records.size(); ++i) {
+				auto& entry = shards_[host_detail::slot(records[i].group)].at(records[i].group);
+				entry = std::move(before[i]); entry.in_doubt = true;
+			}
+			throw;
+		}
+		for (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); opened_[loop(record.group)].erase(record.group); }
+		for (auto slot : slots) { std::erase_if(shards_[slot], [](const auto& item) { return item.second.state == GroupState::closed; }); }
+	}
 	bool remove_artifacts(std::uint64_t group, GroupEntry& entry) {
 		bool removed = false;
 		for (auto serial = entry.mark; serial < entry.high; ++serial) {
@@ -499,25 +640,88 @@ private:
 		std::optional<GroupEntry> before;
 		if (auto found = shard.find(group); found != shard.end()) { before = found->second; }
 		auto& entry = shard[group];
-		try { change(entry); commit({host_detail::slot(group)}); }
+		try { change(entry); commit({group}); }
 		catch (...) {
 			if (before) { entry = std::move(*before); } else { shard.erase(group); }
 			throw;
 		}
 		std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; });
 	}
-	// Replaces the shards, then syncs the directory once; the groups' views see their ranges.
-	// A shard holds the slot's entries in memory and the closed ones only its file holds.
-	void commit(const std::set<std::uint32_t>& slots) {
-		for (auto slot : slots) {
-			auto entries = stored_shard(slot);
-			std::erase_if(entries, [&](const auto& item) { return item.second.state != GroupState::closed || shards_[slot].contains(item.first); });
-			for (const auto& [id, entry] : shards_[slot]) { entries.insert_or_assign(id, entry); }
-			host_detail::replace_file(*io_, host_detail::shard_name(slot), host_detail::encode_shard(identity_, entries));
-			stored_[slot] = true;
+	// Replaces the shards the groups' entries fall in: writes each `.pending`, syncs them all with
+	// one call, renames them, then syncs the directory once; the groups' views see their ranges. A
+	// shard holds the open and lost entries in memory under its node and the closed ones only its
+	// file holds; one past leaf_bytes splits, and the split node's file goes once its children are
+	// durable. A damaged shard is never rewritten. A committed group is no longer dirty.
+	void commit(const std::set<std::uint64_t>& groups) {
+		std::set<host_detail::Shard> shards; std::set<std::uint32_t> slots;
+		for (auto group : groups) { shards.insert(shard_of(group)); slots.insert(host_detail::slot(group)); }
+		remove_orphans(slots);
+		struct Write { host_detail::Shard shard; std::string bytes; };
+		std::vector<Write> writes; std::vector<host_detail::Shard> split;
+		for (auto shard : shards) {
+			if (damaged(shard)) { throw Corruption("damaged group table shard: its groups are lost"); }
+			auto entries = stored_shard(shard);
+			const auto& resident = shards_[shard.first];
+			std::erase_if(entries, [&](const auto& item) { return item.second.state != GroupState::closed || resident.contains(item.first); });
+			for (const auto& [id, entry] : resident) { if (host_detail::holds(shard.second, id)) { entries.insert_or_assign(id, entry); } }
+			std::vector<std::pair<std::uint64_t, host_detail::Entries>> parts;
+			// A slot's first file is its root, whole: only a stored node splits (host_detail::resolve).
+			if (stored(shard)) { host_detail::partition(shard.second, std::move(entries), parts); }
+			else { parts.emplace_back(shard.second, std::move(entries)); }
+			if (parts.size() > 1) { split.push_back(shard); }
+			for (const auto& [node, part] : parts) { writes.push_back({{shard.first, node}, host_detail::encode_shard(identity_, part)}); }
+		}
+		std::vector<std::unique_ptr<File>> files; files.reserve(writes.size());
+		for (const auto& write : writes) {
+			const auto pending = host_detail::shard_name(write.shard) + ".pending";
+			io_->remove(pending);
+			files.push_back(io_->create_exclusive(pending));
+			detail::write_all(*files.back(), 0, write.bytes);
+		}
+		std::vector<File*> syncing; syncing.reserve(files.size());
+		for (auto& file : files) { syncing.push_back(file.get()); }
+		io_->sync_files(syncing);
+		files.clear();
+		// A split's children renamed before a failure are orphans: the next commit removes them
+		// before it renames, so the split node's later versions are never shadowed.
+		for (const auto& write : writes) {
+			if (!stored(write.shard)) { orphans_[write.shard.first].push_back(write.shard.second); }
+			io_->replace(host_detail::shard_name(write.shard) + ".pending", host_detail::shard_name(write.shard));
 		}
 		io_->sync_directory();
-		for (auto slot : slots) { for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); } }
+		for (auto slot : slots) { orphans_[slot].clear(); }
+		for (auto shard : split) {
+			auto& nodes = nodes_[shard.first];
+			if (auto at = std::lower_bound(nodes.begin(), nodes.end(), shard.second, host_detail::path_order); at != nodes.end() && *at == shard.second) {
+				nodes.erase(at);
+				// Durable with a later directory sync; until then open() drops it, its children covering it.
+				try { io_->remove(host_detail::shard_name(shard)); } catch (...) {}
+			}
+		}
+		for (const auto& write : writes) {
+			auto& nodes = nodes_[write.shard.first];
+			auto at = std::lower_bound(nodes.begin(), nodes.end(), write.shard.second, host_detail::path_order);
+			if (at == nodes.end() || *at != write.shard.second) { nodes.insert(at, write.shard.second); }
+		}
+		auto committed = [&](std::uint64_t group) {
+			const auto slot = host_detail::slot(group);
+			for (auto at = shards.lower_bound({slot, 0}); at != shards.end() && at->first == slot; ++at) { if (host_detail::holds(at->second, group)) { return true; } }
+			return false;
+		};
+		for (auto slot : slots) {
+			if (!dirty_.empty()) { std::erase_if(dirty_[host_detail::loop(slot, loops_)], committed); }
+			for (const auto& [id, entry] : shards_[slot]) { publish(id, entry); }
+		}
+	}
+	// Files a failed commit renamed that no node holds: gone, durably, before any later rename in
+	// their slots, so no node's later version is shadowed by them (host_detail::resolve).
+	void remove_orphans(const std::set<std::uint32_t>& slots) {
+		bool removed = false;
+		for (auto slot : slots) {
+			for (auto node : orphans_[slot]) { if (!stored({slot, node})) { io_->remove(host_detail::shard_name({slot, node})); removed = true; } }
+		}
+		if (removed) { io_->sync_directory(); }
+		for (auto slot : slots) { orphans_[slot].clear(); }
 	}
 	void publish(std::uint64_t group, const GroupEntry& entry) {
 		if (ranges_.empty()) { return; }  // the open's commits: no view exists yet
@@ -559,14 +763,14 @@ private:
 	}
 	// The directory's names, read once per open: layout, table and log names. Artifacts are
 	// never listed; a group's are probed by name.
-	struct Names { bool layout = false; std::set<std::string> pending; std::set<std::uint32_t> shards; };
+	struct Names { bool layout = false; std::set<std::string> pending; std::map<std::uint32_t, std::vector<std::uint64_t>> shards; };
 	Names scan() {
 		Names names; logs_.clear();
 		auto cursor = io_->scan_directory();
 		while (auto name = cursor->next()) {
 			if (*name == host_detail::layout_name) { names.layout = true; }
-			else if (*name == "layout.pending" || (name->ends_with(".pending") && host_detail::shard_slot(name->substr(0, name->size() - 8)))) { names.pending.insert(*name); }
-			else if (auto slot = host_detail::shard_slot(*name)) { names.shards.insert(*slot); }
+			else if (*name == "layout.pending" || (name->ends_with(".pending") && host_detail::shard_of(name->substr(0, name->size() - 8)))) { names.pending.insert(*name); }
+			else if (auto shard = host_detail::shard_of(*name)) { names.shards[shard->first].push_back(shard->second); }
 			else if (auto log = host_detail::log_name(*name)) { logs_[{log->generation, log->loop}].push_back(log->inner); }
 		}
 		return names;
@@ -584,7 +788,7 @@ private:
 		} else {
 			std::tie(stored, generation_) = host_detail::decode_layout(host_detail::read_file(*io_, host_detail::layout_name, 64), identity_);
 		}
-		for (auto slot : names.shards) { shards_[slot] = host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name(slot), std::uint64_t{1} << 32), identity_, slot); stored_[slot] = true; }
+		load_table(names);
 		// Logs of another generation are leftovers: an unfinished re-partition's, or the old
 		// generation's that its commit had not yet removed.
 		bool removed = false;
@@ -596,71 +800,105 @@ private:
 		if (removed) { io_->sync_directory(); }
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
-		opened_.resize(loops_); released_.resize(loops_);
+		opened_.resize(loops_); released_.resize(loops_); dirty_.resize(loops_);
 		auto groups = known(loops_);
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
 			loop_views_.push_back(view);
 			drivers_.push_back(std::make_unique<TurnDriver>(*view, identity_, options_.turns, groups[loop]));
 			drivers_.back()->retire_with([this](std::uint64_t group) { return retired_floor(group); });
+			drivers_.back()->before_turn([this, loop] { commit_transitions(loop); });
 		}
 		std::set<std::uint64_t> lost;
 		for (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }
 		mark_lost(lost);
+		// The log's groups of a damaged shard are lost with it: their incarnation and serials, which
+		// name their artifacts, are unknown.
+		for (auto& turns : drivers_) {
+			std::vector<std::uint64_t> orphaned;
+			for (const auto& [id, _] : turns->recovered().groups) { if (damaged(shard_of(id))) { orphaned.push_back(id); } }
+			for (auto id : orphaned) { turns->forget(id, std::numeric_limits<std::uint64_t>::max()); }
+		}
 		for (auto& shard : shards_) { std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; }); }
 		ranges_.resize(loops_);  // last: the open's commits publish to no table
+	}
+	// Reads each slot's stored shards: an interrupted commit's files go first (host_detail::resolve),
+	// and a damaged or missing shard fails only its own groups, which are lost.
+	void load_table(Names& names) {
+		bool removed = false;
+		for (auto& [slot, found] : names.shards) {
+			std::sort(found.begin(), found.end(), host_detail::path_order);
+			std::vector<std::uint64_t> kept, stale, missing;
+			host_detail::resolve(found, 1, kept, stale, missing);
+			for (auto node : stale) { io_->remove(host_detail::shard_name({slot, node})); removed = true; }
+			damaged_[slot] = missing;
+			for (auto node : kept) {
+				if (std::find(missing.begin(), missing.end(), node) != missing.end()) { continue; }
+				try {
+					auto entries = host_detail::decode_shard(host_detail::read_file(*io_, host_detail::shard_name({slot, node}), std::uint64_t{1} << 32), identity_, {slot, node});
+					shards_[slot].merge(entries);
+				} catch (const Corruption&) { damaged_[slot].push_back(node); }
+			}
+			nodes_[slot] = std::move(kept);
+		}
+		if (removed) { io_->sync_directory(); }
 	}
 	// Every open marks the ids recovery calls lost, durably, before it serves; then their
 	// artifacts go, and the entries keep the ids refused for good.
 	void mark_lost(const std::set<std::uint64_t>& ids) {
-		std::set<std::uint32_t> changed;
+		std::set<std::uint64_t> changed;
 		for (auto id : ids) {
+			if (damaged(shard_of(id))) { continue; }  // lost with its shard, which is never rewritten
 			auto& entry = shards_[host_detail::slot(id)][id];
-			if (entry.state != GroupState::lost) { entry.state = GroupState::lost; changed.insert(host_detail::slot(id)); }
+			if (entry.state != GroupState::lost) { entry.state = GroupState::lost; changed.insert(id); }
 		}
 		if (!changed.empty()) { commit(changed); }
 		changed.clear(); bool removed = false;
 		for (std::uint32_t slot = 0; slot < host_detail::slots; ++slot) {
 			for (auto& [id, entry] : shards_[slot]) {
-				if (entry.state == GroupState::lost && entry.mark < entry.high) { removed |= remove_artifacts(id, entry); changed.insert(slot); }
+				if (entry.state == GroupState::lost && entry.mark < entry.high) { removed |= remove_artifacts(id, entry); changed.insert(id); }
 			}
 		}
 		if (removed) { io_->sync_directory(); }
 		if (!changed.empty()) { commit(changed); }
 	}
-	// L changed: (1) recover every log of the stored generation and mark its lost ids; (2)
-	// write each group's live records into its new loop's log of the next generation, each log
-	// synced; (3) commit by replacing the layout, then remove the old logs. Before (3) the old
-	// generation is authoritative and the next open starts again.
+	// L changed: (1) stream each log of the stored generation in turn into the next generation's
+	// L_new logs: its groups' records join their new loop's turn, written and synced once it holds
+	// a quarter segment, so memory holds one old log's live records and L_new turns; (2) mark the
+	// ids recovery calls lost, durably; (3) commit by replacing the layout, then remove the old
+	// logs. Before (3) the old generation is authoritative and the next open starts again. A group
+	// lives in one old log and reads back in sequence order, so none is lost or reordered.
 	void repartition() {
-		std::map<std::uint64_t, std::vector<TurnRecord>> records; std::set<std::uint64_t> lost;
+		std::set<std::uint64_t> lost;
 		auto groups = known(loops_);
+		const auto next = generation_ + 1;
+		// A turn never crosses a segment: a quarter of one, counting each record's framing.
+		const auto budget = options_.turns.segment_bytes / 4;
+		struct Target { std::shared_ptr<PrefixIO> view; std::unique_ptr<TurnLog> log; std::vector<TurnRecord> turn; std::uint64_t bytes = 0; };
+		std::vector<Target> targets(options_.loops);
+		for (std::uint32_t loop = 0; loop < options_.loops; ++loop) {
+			targets[loop].view = std::make_shared<PrefixIO>(io_, host_detail::log_prefix(next, loop), [] {
+				return std::make_unique<host_detail::NameCursor>([] { return std::optional<std::string>(); });
+			});
+			TurnRecovery fresh; targets[loop].log = std::make_unique<TurnLog>(*targets[loop].view, identity_, fresh, options_.turns);
+		}
+		auto flush = [](Target& target) { if (!target.turn.empty()) { target.log->append(target.turn); target.turn.clear(); target.bytes = 0; } };
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
 			auto recovered = TurnLog::read(*view, identity_, options_.turns, groups[loop]);
 			lost.insert(recovered.lost.begin(), recovered.lost.end());
-			for (auto& [id, kept] : recovered.groups) { if (!kept.empty()) { records[id] = std::move(kept); } }
-		}
-		mark_lost(lost);
-		const auto next = generation_ + 1;
-		// A turn never crosses a segment: a quarter of one, counting each record's framing.
-		const auto budget = options_.turns.segment_bytes / 4;
-		for (std::uint32_t loop = 0; loop < options_.loops; ++loop) {
-			auto view = std::make_shared<PrefixIO>(io_, host_detail::log_prefix(next, loop), [] {
-				return std::make_unique<host_detail::NameCursor>([] { return std::optional<std::string>(); });
-			});
-			TurnRecovery fresh; TurnLog log(*view, identity_, fresh, options_.turns);
-			std::vector<TurnRecord> turn; std::uint64_t bytes = 0;
-			for (const auto& [id, kept] : records) {
-				if (host_detail::loop(host_detail::slot(id), options_.loops) != loop) { continue; }
-				for (const auto& record : kept) {
+			for (auto& [id, kept] : recovered.groups) {
+				auto& target = targets[host_detail::loop(host_detail::slot(id), options_.loops)];
+				for (auto& record : kept) {
 					const auto size = record.payload.size() + 64;
-					if (!turn.empty() && bytes + size > budget) { log.append(turn); turn.clear(); bytes = 0; }
-					turn.push_back(record); bytes += size;
+					if (!target.turn.empty() && target.bytes + size > budget) { flush(target); }
+					target.bytes += size; target.turn.push_back(std::move(record));
 				}
 			}
-			if (!turn.empty()) { log.append(turn); }
 		}
+		for (auto& target : targets) { flush(target); }
+		targets.clear();
+		mark_lost(lost);
 		host_detail::replace_file(*io_, std::string(host_detail::layout_name), host_detail::encode_layout(identity_, options_.loops, next));
 		io_->sync_directory();
 		const auto old = generation_;
@@ -681,13 +919,18 @@ private:
 	std::uint32_t loops_ = 0;
 	std::uint64_t generation_ = 0;
 	std::vector<std::map<std::uint64_t, GroupEntry>> shards_ = std::vector<std::map<std::uint64_t, GroupEntry>>(host_detail::slots);  // open and lost entries, and closed ones a failed commit restored
-	std::vector<char> stored_ = std::vector<char>(host_detail::slots);  // slots with a shard file; a byte each, as loops commit their slots concurrently
+	// Per slot, each touched only by its loop: its stored shards' nodes, prefix-free and in path
+	// order; the damaged ones among them, whose groups are lost; and a failed commit's orphans.
+	std::vector<std::vector<std::uint64_t>> nodes_ = std::vector<std::vector<std::uint64_t>>(host_detail::slots);
+	std::vector<std::vector<std::uint64_t>> damaged_ = std::vector<std::vector<std::uint64_t>>(host_detail::slots);
+	std::vector<std::vector<std::uint64_t>> orphans_ = std::vector<std::vector<std::uint64_t>>(host_detail::slots);
 	std::map<std::pair<std::uint64_t, std::uint32_t>, std::vector<std::string>> logs_;
 	std::vector<std::shared_ptr<IO>> loop_views_;
-	std::vector<std::set<std::uint64_t>> opened_;  // per loop: groups a Store created or recovered, until released
+	std::vector<std::set<std::uint64_t>> opened_;  // per loop: groups a consumer created or recovered, until released or closed
 	mutable std::mutex holds_mutex_;
 	std::set<std::uint64_t> holds_;  // groups a live Store holds
 	std::vector<std::vector<std::uint64_t>> released_;  // per loop: groups whose holds ended, for settle()
+	std::vector<std::set<std::uint64_t>> dirty_;  // per loop: groups a create or reopen changed, committed before its next turn
 	// Per loop: its groups' views' ranges. Loop l's table belongs to loop l's thread, the one that
 	// runs group_io and the table commits (publish) of l's groups, so no lock guards it; one shared
 	// table would race across loops. docs/mechanisms/host-ranges.md has the rule.
