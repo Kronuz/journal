@@ -43,11 +43,26 @@
 #include <span>
 #include <tuple>
 
+// TSan's runtime defines operator new, so under TSan nothing is counted and the allocation
+// checks are skipped, saying so.
+#if defined(__SANITIZE_THREAD__)
+#define JOURNAL_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define JOURNAL_TEST_TSAN 1
+#endif
+#endif
 namespace {
+#ifdef JOURNAL_TEST_TSAN
+constexpr bool heap_counted = false;
+#else
+constexpr bool heap_counted = true;
+#endif
 std::atomic<bool> counting{false};
 std::atomic<std::uint64_t> allocations{0}, allocated{0};
 }  // namespace
 
+#ifndef JOURNAL_TEST_TSAN
 // Counts every allocation made while `counting` is set.
 void* operator new(std::size_t size) {
 	if (counting.load(std::memory_order_relaxed)) { allocations.fetch_add(1, std::memory_order_relaxed); allocated.fetch_add(size, std::memory_order_relaxed); }
@@ -59,6 +74,7 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#endif
 
 namespace j = kronuz::journal;
 namespace d = j::turn_log_detail;
@@ -71,6 +87,8 @@ void check(bool value, const std::string& what) {
 	++checks;
 	if (!value) { ++failures; if (failures < 100) { std::cerr << "FAIL: " << what << '\n'; } }
 }
+// An allocation check: skipped under TSan, where nothing is counted.
+void check_heap(bool value, const std::string& what) { if (heap_counted) { check(value, what); } }
 
 struct Count { std::uint64_t calls = 0, bytes = 0; };
 template <class F> Count counted(F&& fn) {
@@ -316,8 +334,8 @@ void warm() {
 			check(log.stats().bytes_appended - appended == bodies, "the turn appends its bodies' bytes: " + at);
 			if (round >= 4) {
 				++measured;
-				check(staging.calls == 0 && staging.bytes == 0, "a warm stage() allocates nothing: " + at + ": " + std::to_string(staging.calls) + " allocations, " + std::to_string(staging.bytes) + " bytes");
-				check(completing.calls == 0 && completing.bytes == 0, "a warm completed() allocates nothing: " + at + ": " + std::to_string(completing.calls) + " allocations, " + std::to_string(completing.bytes) + " bytes");
+				check_heap(staging.calls == 0 && staging.bytes == 0, "a warm stage() allocates nothing: " + at + ": " + std::to_string(staging.calls) + " allocations, " + std::to_string(staging.bytes) + " bytes");
+				check_heap(completing.calls == 0 && completing.bytes == 0, "a warm completed() allocates nothing: " + at + ": " + std::to_string(completing.calls) + " allocations, " + std::to_string(completing.bytes) + " bytes");
 			}
 			if (turn == &batch) { std::cout << "warm: " << at << ": " << staging.calls << " allocations (" << staging.bytes << " bytes) staging " << turn->size() << " records of " << body << " body bytes, " << completing.calls << " completing\n"; }
 			for (const auto& r : *turn) { if (r.kind == j::TurnRecordKind::Checkpoint) { model[r.group].clear(); } model[r.group].push_back(r); }
@@ -355,7 +373,7 @@ void seal() {
 			driver.log().flush(*write); driver.completed();
 			check(std::all_of(open.begin(), open.end(), [](const auto& o) { return !o.second; }), "every body sealed in its turn");
 			if (t >= 2) {
-				check(sealing.bytes < body / 4, "a warm sealed turn copies no body: turn " + std::to_string(t) + ": " + std::to_string(sealing.calls) + " allocations, " + std::to_string(sealing.bytes) + " bytes for 4 bodies of " + std::to_string(body));
+				check_heap(sealing.bytes < body / 4, "a warm sealed turn copies no body: turn " + std::to_string(t) + ": " + std::to_string(sealing.calls) + " allocations, " + std::to_string(sealing.bytes) + " bytes for 4 bodies of " + std::to_string(body));
 			}
 			if (t == 7) { std::cout << "seal: " << sealing.calls << " allocations, " << sealing.bytes << " bytes sealing and staging 4 bodies of " << body << " bytes\n"; }
 		}
@@ -445,8 +463,8 @@ void recycle() {
 			check(!open_plain, "the plain sealer's record sealed: " + at);
 			for (std::uint64_t group = 1; group <= groups; ++group) { check(handed[group] == t + 1, "group " + std::to_string(group) + "'s buffer came back once: " + at); }
 			if (t >= 4) {  // the log's live index has its spare nodes by then
-				check(sealing.calls == 0 && sealing.bytes == 0, "a warm begin() allocates nothing: " + at + ": " + std::to_string(sealing.calls) + " allocations, " + std::to_string(sealing.bytes) + " bytes");
-				check(completing.calls == 0 && completing.bytes == 0, "a warm completed() allocates nothing: " + at + ": " + std::to_string(completing.calls) + " allocations, " + std::to_string(completing.bytes) + " bytes");
+				check_heap(sealing.calls == 0 && sealing.bytes == 0, "a warm begin() allocates nothing: " + at + ": " + std::to_string(sealing.calls) + " allocations, " + std::to_string(sealing.bytes) + " bytes");
+				check_heap(completing.calls == 0 && completing.bytes == 0, "a warm completed() allocates nothing: " + at + ": " + std::to_string(completing.calls) + " allocations, " + std::to_string(completing.bytes) + " bytes");
 			}
 			if (t == 7) { std::cout << "recycle: " << sealing.calls << " allocations (" << sealing.bytes << " bytes) in begin() sealing and encoding 4 recycled bodies of " << body << " bytes and a plain one, " << completing.calls << " in completed()\n"; }
 		}
@@ -497,7 +515,7 @@ void forward() {
 		check(log.stats().forwarded_records == copied + 1 && log.stats().forwarded_bytes - moved == 5000, "one 5000-byte record moves forward a turn");
 		if (forwards > 4 && same_segment && oldest == last_oldest) {
 			++measured;
-			check(staging.calls == 0 && staging.bytes == 0, "a warm forward copy allocates nothing: turn " + std::to_string(t) + ": " + std::to_string(staging.calls) + " allocations, " + std::to_string(staging.bytes) + " bytes");
+			check_heap(staging.calls == 0 && staging.bytes == 0, "a warm forward copy allocates nothing: turn " + std::to_string(t) + ": " + std::to_string(staging.calls) + " allocations, " + std::to_string(staging.bytes) + " bytes");
 		}
 		last_oldest = oldest;
 		for (const auto& [group, original] : idle) {
@@ -582,6 +600,7 @@ int main(int argc, char** argv) {
 		{"bytes", bytes}, {"turns", turns}, {"warm", warm}, {"seal", seal}, {"recycle", recycle}, {"forward", forward}, {"power", power},
 	};
 	const std::string only = argc > 1 ? argv[1] : "";
+	if (!heap_counted) { std::cout << "allocation checks skipped: TSan's runtime defines operator new, so the heap is not counted\n"; }
 	bool ran = false;
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && name != only) { continue; }

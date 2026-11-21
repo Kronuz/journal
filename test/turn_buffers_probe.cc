@@ -34,10 +34,25 @@
 #include <new>
 #include <optional>
 
+// TSan's runtime defines operator new, so under TSan nothing is counted and the probe refuses.
+#if defined(__SANITIZE_THREAD__)
+#define JOURNAL_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define JOURNAL_TEST_TSAN 1
+#endif
+#endif
 namespace {
+#ifdef JOURNAL_TEST_TSAN
+constexpr bool heap_counted = false;
+#else
+constexpr bool heap_counted = true;
+#endif
 std::atomic<bool> counting{false};
 std::atomic<std::uint64_t> allocations{0}, allocated{0};
 }  // namespace
+
+#ifndef JOURNAL_TEST_TSAN
 void* operator new(std::size_t size) {
 	if (counting.load(std::memory_order_relaxed)) { allocations.fetch_add(1, std::memory_order_relaxed); allocated.fetch_add(size, std::memory_order_relaxed); }
 	if (void* p = std::malloc(size ? size : 1)) { return p; }
@@ -48,11 +63,13 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#endif
 
 namespace j = kronuz::journal;
 namespace fl = kronuz::faultlab;
 
 int main(int argc, char** argv) {
+	if (!heap_counted) { std::cerr << "turn_buffers_probe: TSan's runtime defines operator new, so allocations are not counted\n"; return 2; }
 	const unsigned rounds = argc > 1 ? static_cast<unsigned>(std::stoul(argv[1])) : 100;
 	const j::TurnLogOptions options{std::uint64_t{48} << 20, 32 << 10, 1, 1000, 1 << 20};
 	const j::Identity identity{'P', 'R', 'O', 'B', 'E'};
