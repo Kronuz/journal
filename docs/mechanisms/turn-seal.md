@@ -1,6 +1,7 @@
-> Status: CURRENT (2026-11-17) how `TurnDriver::seal` in `include/journal/turn_driver.h` works,
-> repeat calls per turn (journal-seal-repeat) and the one-segment bound on staged records
-> (journal-turn-bound) included.
+> Status: CURRENT (2026-11-20) how `TurnDriver::seal` in `include/journal/turn_driver.h` works,
+> repeat calls per turn (journal-seal-repeat), the one-segment bound on staged records
+> (journal-turn-bound) and the turn's own buffers (journal-turn-buffers, strata
+> `docs/design/rocksdb-parity.md` D3) included.
 > Consumer: strata `docs/design/standalone-turn-log.md` revision 1 (D3, D4, D5; review R3), at
 > strata:8e919415, and the shim it replaces, strata:efe25bcd `include/strata/core/turn_seal.hh`.
 > Format: `RFTW0001`, unchanged.
@@ -213,6 +214,31 @@ Why the group's later records fail too, and not only the oversized one:
 A record that large means the segment is too small for the group's commands or manifests: the
 first record's budget above names the segment size a command needs.
 
+## The turn's buffers
+
+A sealed body is copied once, into the turn's bytes (strata `docs/design/rocksdb-parity.md`, D3).
+
+- **The seal moves the body.** A sealer returns its `TurnRecord` by value; the driver moves it into
+  its pending records and `TurnLog::stage` reads its payload in place. A consumer encodes the body
+  once into the payload it hands over, leaving room at its front for any header of its own, so
+  sealing copies nothing. The log's 25-byte record header needs no room there: the emitter takes
+  it as a separate piece.
+- **Framed in place.** `stage()` frames each record's header (`turn_log_detail::header`, on the
+  stack) and payload straight into fragments of the turn's buffer (`framing::Emitter::record(head,
+  body, ...)`), with no `logical()` string first. A forward copy reads its original back through
+  `framing::RecordReader` straight into the copy's fragments, verifying the original's fragments,
+  its record header (kind, group, sequence) and its size (`Live` keeps each live record's payload
+  size in its padding).
+- **Laid out, not written.** Whether forward copies fit an empty segment (`fits()`, `fitting()`)
+  is answered by a measuring emitter, which places fragments and manifests without a byte or a
+  read. A turn past the current segment's rest is written once more, at the next segment's start.
+- **Reused.** One turn's bytes, notes, manifest and `next` map, and the live index's map nodes,
+  pass to the next turn emptied, so a warm turn allocates nothing. The spare map nodes never
+  outnumber what their map held at its largest.
+
+A record that the driver holds in flight keeps its payload until the turn completes; returning
+that buffer to its sealer for reuse is the driver's to add.
+
 ## Asking for a turn
 
 A turn starts when a record is pending, as before; when `wake()` was called since the last turn
@@ -282,5 +308,17 @@ staged records' bound:
 | `forget` | Forgetting a refused group retires through the open record past the refused ones (3 after a refused 2), as a plain group's through 2: a wait on it fails `group_closed`, and the reopened incarnation's first record does not acknowledge it |
 | `crash` | Power cut at every I/O operation of two waves, 6 seeds, cuts between two turns of one wave counted: recovery keeps every acknowledged record and the in-flight turn whole or absent |
 
+`test/turn_buffers_test.cc`, one CTest entry per case (`journal_turn_buffers_<case>`), covers the
+turn's buffers:
+
+| Case | Shows |
+|---|---|
+| `bytes` | Every record kind, 15 size classes, 6 start positions and manifests empty, small, past half a block and past 4096 groups, at 256-byte to 32 KiB blocks: the head-and-body path, the fill path in uneven pieces and the one-piece path write main's bytes (journal:178030b's emitter and `logical()`, kept in the test), offsets and manifests; a measuring emitter lays them out at the same positions and writes nothing |
+| `turns` | 400 turns on 16 KiB segments, many rolling into a new segment: each turn's bytes and offset are main's, and the log recovers every record |
+| `warm` | Rounds of 32 records from 8 groups (100 B to 40 KiB) and 8 checkpoints: once warm, `stage()` and `completed()` allocate nothing, the bytes are main's, and the payload bytes appended are the bodies' |
+| `seal` | Four sealers hand over 128 KiB bodies through `TurnDriver::begin()`: once warm, sealing and staging allocate under a quarter of one body; every record recovers |
+| `forward` | Four idle groups' checkpoints move forward one per turn: each copy reads back as its original, and once warm a forwarding `stage()` allocates nothing |
+| `power` | Power cut at every mutating I/O operation of runs at 512-byte and 4 KiB blocks whose records cross blocks, roll into new segments and move forward: recovery holds exactly the acknowledged records and the in-flight turn whole or not at all |
+
 `test/turn_seal_mutants.sh` applies each guard's mutant (`one-call`, `framing`, `staged`, `rotation`,
-`unsealed-again`, `repeat-throw`, `deferred-ignored` and the earlier ones); the case named beside it fails at each.
+`unsealed-again`, `repeat-throw`, `deferred-ignored`, `seal-copy`, `stage-copy`, `forward-string` and the earlier ones); the case named beside it fails at each.
