@@ -333,8 +333,9 @@ std::map<std::pair<std::uint64_t, std::uint64_t>, Written> written_blocks(j::IO&
 
 // A byte in the second sector of a fragment that spans two, where the next fragment starts and
 // verifies (the review's P1), in every block, the newest tail included. Where a whole header of
-// its write proves its first sector, the damage is reported and every group not lost keeps its
-// records; the others, whose header the boundary cuts, are only counted (`unproven`).
+// its write proves its first sector and the next fragment's header is whole in the second, the
+// damage is reported and every group not lost keeps its records; the others, where a boundary cuts
+// either header, are only counted (`unproven`).
 void crossing_damage(std::uint64_t seed, std::uint64_t& cases, std::uint64_t& unproven) {
 	namespace d = j::turn_log_detail;
 	fl::filesystem clean; fl::io clean_io(clean); Workload work(seed); j::TurnRecovery recovered;
@@ -348,6 +349,8 @@ void crossing_damage(std::uint64_t seed, std::uint64_t& cases, std::uint64_t& un
 			const auto second = sector_of(start + end - 1);
 			if (sector_of(start + p) + 1 != second || sector_of(start + block.fragments[i + 1].start) != second) { continue; }
 			if (!written && sector_of(start + p + j::framing::fragment_header - 1) == second) { ++unproven; continue; }
+			// The next fragment proves the second sector only with its header whole there.
+			if (sector_of(start + block.fragments[i + 1].start + j::framing::fragment_header - 1) != second) { ++unproven; continue; }
 			const auto boundary = second * j::framing::sector_bytes - start;
 			const auto offset = start + boundary + random() % (end - boundary);
 			fl::filesystem disk = clean.snapshot(); fl::io io(disk); ++cases;
@@ -438,6 +441,43 @@ void stale_record_tear(const StaleRecordTear& tear) {
 	}
 	options = saved;
 }
+// Tears where the old sector before a boundary holds the first k bytes of the fragment G that the
+// boundary cuts, as written (the review's Q2: at k = 1 one stale byte in 256 does). A cut header
+// proves no sector, so none reads as damage: through the next sector of a crossing F whose header
+// names its segment and epoch, through a failing F's own sector, or through a failing block header's.
+void cut_header_tears() {
+	namespace d = j::turn_log_detail; namespace f = j::framing;
+	const std::uint32_t block = 2048; const std::uint64_t segment = 5, epoch = 2;
+	const auto at_header = f::header_bytes(f::no_manifest);
+	// The block's bytes, F at `from` ending where G starts, at `g`, then an end-of-turn.
+	auto emit = [&](bool after_turn, std::size_t g, std::size_t& from) {
+		f::Emitter emitter(d::stream(identity, block, segment, epoch), 0);
+		from = at_header;
+		if (after_turn) { emitter.record(d::logical(d::end_of_turn, 6, 0, 0, std::string(4, '\1'))); from = emitter.position(); }
+		emitter.record(d::logical(1, 7, 3, 4, std::string(g - from - f::fragment_header - d::record_header, 'x')), 3, 4);
+		emitter.record(d::logical(1, 7, 4, 9, std::string(200 - d::record_header, 'y')), 4, 9);
+		emitter.record(d::logical(d::end_of_turn, 7, 0, 0, std::string(4, '\2')));
+		std::string bytes = emitter.bytes(); bytes.resize(block, '\0');
+		return bytes;
+	};
+	for (std::size_t k = 1; k < f::fragment_header; ++k) {
+		const auto at = " with " + std::to_string(k) + " bytes of G's header before the boundary";
+		std::size_t from = 0;
+		{  // F's first sector new, its next sector old (zeros, then G's first k bytes), the one after new.
+			const auto g = 2 * f::sector_bytes - k; auto torn = emit(false, g, from);
+			check(f::parse_fragment(std::string_view(torn).substr(g), block - g, segment, epoch).check == f::Check::ok, "G verifies" + at);
+			for (auto i = f::sector_bytes; i < g; ++i) { torn[i] = '\0'; }
+			check(!d::damaged_fragment(torn, 0, from, segment, epoch, false), "a crossing fragment's torn next sector reads as a tear" + at);
+		}
+		{  // An earlier write's end-of-turn, then F whole in the old first sector (zeros there).
+			const auto g = f::sector_bytes - k; auto torn = emit(true, g, from);
+			for (auto i = from; i < g; ++i) { torn[i] = '\0'; }
+			check(!d::damaged_fragment(torn, 0, from, segment, epoch, false), "a fragment's torn sector reads as a tear" + at);
+			for (std::size_t i = 0; i < from; ++i) { torn[i] = '\0'; }  // the block's header old too
+			check(!d::damaged_header(torn, 0, segment), "a block's torn first sector reads as a tear" + at);
+		}
+	}
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -449,6 +489,7 @@ int main(int argc, char** argv) {
 	// unaligned header shares its sector with the block before (the journal's R8).
 	const std::pair<std::uint32_t, std::uint64_t> geometries[] = {{512, 8}, {4096, 4}, {2048, 8}, {1000, 8}, {768, 8}, {256, 16}};
 	for (const auto& tear : stale_record_tears) { stale_record_tear(tear); }
+	cut_header_tears();
 	for (const auto& [block, blocks] : geometries) {
 		if (only && block != only) { continue; }
 		options = j::TurnLogOptions{block * blocks, block, 1, 3, 600};

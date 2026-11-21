@@ -152,10 +152,10 @@ struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint6
 using Manifests = std::map<std::pair<std::uint64_t, std::uint32_t>, BlockManifest>;
 // Damage no crash leaves, found where a block's header or a fragment fails to verify. A crash
 // leaves each 512-byte sector old or new, and no earlier use of a recycled file holds bytes
-// bound to this segment, so a sector holding them is this segment's: what it holds of the log
-// verified, unless a sector boundary cuts it.
+// bound to this segment, so a sector holding them is this segment's. Only a fragment whose header
+// the sector holds whole proves it: a cut header leaves as few as one checksum byte there.
 inline bool verifies_in_sector(std::string_view block, std::size_t from, std::size_t end, std::uint64_t segment) {
-	for (auto p = from; p < end && p + framing::fragment_header <= block.size(); ++p) {
+	for (auto p = from; p + framing::fragment_header <= end; ++p) {
 		const auto at = block.substr(p);
 		if (framing::parse_fragment(at, block.size() - p, segment, framing::peek64(at.substr(16))).check == framing::Check::ok) { return true; }
 	}
@@ -164,11 +164,11 @@ inline bool verifies_in_sector(std::string_view block, std::size_t from, std::si
 inline std::size_t sector_end(std::string_view block, std::uint64_t offset, std::size_t at) {
 	return std::min<std::size_t>(block.size(), at + framing::sector_bytes - (offset + at) % framing::sector_bytes);
 }
-// A header that fails while a fragment of this segment starts in its sector.
+// A header that fails while a fragment of this segment verifies in its sector.
 inline bool damaged_header(std::string_view block, std::uint64_t offset, std::uint64_t segment) {
 	return verifies_in_sector(block, framing::header_bytes(0), sector_end(block, offset, 0), segment);
 }
-// A failing fragment is damage when a later fragment of its segment starts in its sector; when its
+// A failing fragment is damage when a later fragment of its segment verifies in its sector; when its
 // header names its segment and epoch with a writer's type and reserved byte, and has a length no
 // writer emits or its sector holds it whole; when its header names them and verifies with its length
 // (at one its sector holds whole), type or reserved byte corrected; or when its header, or a header

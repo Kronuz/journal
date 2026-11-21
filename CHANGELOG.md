@@ -21,6 +21,10 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
   segment's record whose group and sequence equal this segment and epoch. A failing fragment's
   header proves its sector only with a type and reserved byte a writer emits; one with a bad type
   or reserved byte is damage only when its checksum verifies with that byte corrected.
+- `TurnLog` recovery no longer reads a tear as damage where the old sector's last bytes equal the
+  first bytes of a fragment whose header the sector boundary cuts, one stale byte in 256 when a
+  single checksum byte lies in the sector. A fragment proves its sector only with its header whole
+  there, for a failing block header and a failing fragment alike.
 
 ## 2026-11-20
 
