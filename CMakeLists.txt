@@ -63,6 +63,13 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		add_test(NAME journal_turn_bound_${c} COMMAND journal_turn_bound_test ${c})
 		set_tests_properties(journal_turn_bound_${c} PROPERTIES TIMEOUT 600)
 	endforeach()
+	# The turn path's buffers: main's bytes, no allocation in a warm turn, forward copies in place.
+	add_executable(journal_turn_buffers_test test/turn_buffers_test.cc)
+	target_link_libraries(journal_turn_buffers_test PRIVATE journal::journal faultlab::faultlab)
+	foreach(c bytes turns warm seal forward power)
+		add_test(NAME journal_turn_buffers_${c} COMMAND journal_turn_buffers_test ${c})
+		set_tests_properties(journal_turn_buffers_${c} PROPERTIES TIMEOUT 600)
+	endforeach()
 	target_compile_definitions(journal_crc_fixture_test PRIVATE JOURNAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/crc32c")
 	target_compile_definitions(journal_framing_test PRIVATE JOURNAL_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/framing")
 	set_tests_properties(journal_turn_log PROPERTIES TIMEOUT 120)  # a full flush per turn on macOS

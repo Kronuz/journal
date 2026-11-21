@@ -17,6 +17,9 @@
 #   unsealed-again    seal_turn calls a group unsealed or replaced during its last call (A3)
 #   repeat-throw      a repeat call's throw fails its turn unwritten (A3)
 #   deferred-ignored  a repeat call's throw is dropped, never failing the driver (review F1)
+#   seal-copy         seal_turn copies the sealed record instead of moving it (journal-turn-buffers A2)
+#   stage-copy        TurnLog::stage frames each body from a fresh copy (journal-turn-buffers A2)
+#   forward-string    a forward copy reads into a string of its own first (journal-turn-buffers A3)
 set -eu
 new='if (false) {'
 case "$1" in
@@ -35,6 +38,9 @@ case "$1" in
 	unsealed-again) file=include/journal/turn_driver.h; old='if (found == sealers_.end() || found->second.fn != fn) { break; }'; new='' ;;
 	repeat-throw) file=include/journal/turn_driver.h; old='catch (...) { if (!repeat) { throw; } deferred_ = std::current_exception(); return; }'; new='catch (...) { throw; }' ;;
 	deferred-ignored) file=include/journal/turn_driver.h; old='catch (...) { if (!repeat) { throw; } deferred_ = std::current_exception(); return; }'; new='catch (...) { if (!repeat) { throw; } return; }' ;;
+	seal-copy) file=include/journal/turn_driver.h; old='pending_.push_back({std::move(*record), {}, {}});'; new='pending_.push_back({TurnRecord(*record), {}, {}});' ;;
+	stage-copy) file=include/journal/turn_log.h; old='emitter.record(turn_log_detail::view(head), record.payload, record.group, record.sequence);'; new='emitter.record(turn_log_detail::view(head), std::string(record.payload), record.group, record.sequence);' ;;
+	forward-string) file=include/journal/turn_log.h; old='const auto at = out.size(); out.resize(at + count); original->read(out.data() + at, count);'; new='std::string piece(count, 0); original->read(piece.data(), count); out.append(piece);' ;;
 	*) echo "unknown mutant: $1" >&2; exit 2 ;;
 esac
 git checkout -- "$file" 2>/dev/null || true
