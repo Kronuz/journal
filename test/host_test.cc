@@ -823,7 +823,7 @@ bool on_thread(const std::function<void()>& run) {
 }
 
 // journal-loop-handoff A1. A thread that adopts a loop owns its range table: its view and table
-// commit pass the debug check, while the thread that owned the table before, or any other, fails
+// commit pass the debug check, while the thread that owned the table before, or another, fails
 // it; adopting the table back passes again. A loop the host lacks is refused.
 void loop_handoff() {
 	fl::filesystem disk;
@@ -836,7 +836,13 @@ void loop_handoff() {
 	if (owner_checked) {
 		check(aborts([&] { host.group_io(3); }), "the old owner's view fails the debug check");
 		check(aborts([&] { host.create_group(3); }), "the old owner's table commit fails the debug check");
-		check(aborts([&] { std::thread([&] { host.group_io(3); }).join(); }), "a third thread's view fails the debug check");
+		// A new thread may take the exited adopter's id, so two live ones, distinct, each take a view:
+		// at least one is not the owner.
+		check(aborts([&] {
+			std::atomic<int> started{0};
+			auto view = [&] { ++started; while (started < 2) {} host.group_io(3); };
+			std::thread one(view), two(view); one.join(); two.join();
+		}), "another thread's view fails the debug check");
 	} else {
 		std::cout << "loop_handoff: NDEBUG build, no owner check to fail\n";
 	}

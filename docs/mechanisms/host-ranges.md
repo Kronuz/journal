@@ -29,7 +29,8 @@ a table from group id to the live `Range`s so that a commit of the group's table
    is empty and the constructor's thread owns no table.
 5. **Debug builds check it.** `owned_ranges(g)`, the one way `group_io` and `publish` reach a
    table, binds table `loop(g)` to the first thread that touches it after the open, and asserts
-   that every later caller is that thread.
+   that every later caller is that thread. A thread started after the owner exits may take its
+   id and pass: the check can miss a stranger, never abort the owner.
 6. **A handoff moves it.** `Host::adopt_loop(l)` makes the calling thread table `l`'s owner, and
    the check follows it: the new thread's calls pass, the old thread's abort.
 
@@ -80,7 +81,8 @@ every group to table 0 (one shared table) makes TSan report the race and the tes
 `host_test view_sweep` checks the sweep bound on one loop's table.
 
 `host_test loop_handoff` adopts loop 0's table on a second thread, which takes a view and creates
-a group; in a forked child, a view or a create from the old owner and a view from a third thread
-each abort on the check, and adopting the table back makes the first thread's calls pass.
+a group; in a forked child, a view or a create from the old owner and a view from other threads
+each abort on the check (two live threads probe at once, since a new one may reuse the exited
+adopter's id), and adopting the table back makes the first thread's calls pass.
 `host_test handoff_close` is strata's t6w case: a group created and checkpointed on the first
 thread and closed on another aborts without the handoff and closes with it.
