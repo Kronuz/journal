@@ -239,6 +239,12 @@ A sealed body is copied once, into the turn's bytes (strata `docs/design/rocksdb
 A record that the driver holds in flight keeps its payload until the turn completes; returning
 that buffer to its sealer for reuse is the driver's to add.
 
+Measured (`test/turn_buffers_probe.cc`, the same source built against journal:178030b and this
+code, faultfs, one `strict` job, 261120-201407-998e89, three alternations): a warm turn of 32
+records from 8 groups, 384,800 body bytes, allocated 122.5 times and 1.91 MB in `stage()` and
+`completed()` before, about five times its bodies, and took 155-170 us at the fastest of 96;
+it now allocates nothing and takes 58-61 us, 2.6 times less.
+
 ## Asking for a turn
 
 A turn starts when a record is pending, as before; when `wake()` was called since the last turn
