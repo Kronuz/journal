@@ -1,6 +1,6 @@
-> Status: CURRENT (2026-11-04) how `include/journal/framing.h` works, on branch
-> `phase/manifest-log-steps12`; design: strata `docs/design/manifest-log.md` revision 1 (D2, D6),
-> strata:1c8ff50. Maintainer: the manifest-log workstream (strata `docs/status/manifest-log-steps12.md`).
+> Status: CURRENT (2026-11-20) how `include/journal/framing.h` works; design: strata
+> `docs/design/manifest-log.md` revision 1 (D2, D6), strata:1c8ff50, and the turn path's in-place
+> framing, strata `docs/design/rocksdb-parity.md` D3 (journal-turn-buffers).
 
 # Block framing and the growing-log tail rule
 
@@ -22,8 +22,19 @@ that grows by appends).
   shorter than 25 bytes is zero padding that no reader reads.
 - `Emitter` writes records from a stream offset, entering blocks as it reaches them. With manifests
   it notes each nonzero group's highest sequence for the next block's header (the turn log's use).
-  The turn log wraps its own 25-byte record header (kind, turn, group, sequence) inside the record
-  (`turn_log_detail::logical`); the framing never looks inside a record.
+  The turn log wraps its own 25-byte record header (kind, turn, group, sequence) inside the record;
+  the framing never looks inside a record.
+- A record comes in pieces, each copied once, straight into its fragments: one string
+  (`record(logical)`), a head and a body (`record(head, body, ...)`, the turn log's header and
+  payload), or a head and `size` bytes a fill function appends in order (`record(head, size, fill,
+  ...)`, a forward copy read from its original). Each fragment's header is written first, its
+  payload pieces after it, then its CRC over both.
+- The emitter writes into a buffer its caller hands over and takes back (`Emitter(stream, position,
+  filling, buffer)`, `std::move(emitter).bytes()`), so a caller that reuses one buffer frames
+  into its capacity. A manifest's groups (`framing::Groups`) are a flat array that appends and
+  sorts once when the header is written, reusing its capacity too.
+- `Emitter::measure` lays records out without writing them: positions and manifests, no bytes, no
+  fill called. The turn log asks it whether a turn fits an empty segment.
 - `record_end(stream, position, size)` says where the emitter would end a record, in constant time,
   for a stream without manifests (a manifest's size depends on the groups written): the header and
   padding of the block it starts in, then whole blocks of `block - 62 - 24` payload bytes, then the
@@ -39,11 +50,14 @@ that grows by appends).
   fragment (its size plus 24 below the block size), so the next block's start is always a header's;
   the emitter keeps a manifest within half a block, so honest headers always do.
 - The turn log's `scan_segment` reads whole preallocated blocks with them and keeps its own gap and
-  epoch logic. `read_record(file, stream, offset)` reads one record back by
-  offset (the turn log's forwarding) and checks what `scan` checks on the way: each block header it
-  enters (its count bounded by the block before it is read, then `parse_header`, epoch the
-  stream's) and each fragment against the stream's segment and epoch. A record of another segment
-  or epoch, or bytes changed since the scan, are `Corruption`. The turn log keeps each live
+  epoch logic. `RecordReader(file, stream, offset)` reads one record back by offset, in
+  order, into wherever its caller asks (the turn log's forwarding, straight into the turn), and
+  checks what `scan` checks on the way: each block header it enters (`header_shape` and
+  `names_block` on its fixed part, epoch the stream's, then its CRC over the manifest read through a
+  1 KiB stack buffer, so a read holds no heap) and each fragment against the
+  stream's segment and epoch and, as its last byte is read, its CRC. A record of another segment or
+  epoch, bytes changed since the scan, or a record shorter than read, are `Corruption`.
+  `read_record` reads a whole record into a string through it. The turn log keeps each live
   record's epoch to rebuild its stream.
 - `read_file` reads a growing file whole, its partial last block included. `scan` reads it from the
   start and returns the whole records, each with its first fragment's offset and its end, and how
@@ -85,6 +99,10 @@ whole, and drops a torn tail.
   584 in padding; 7,504 two-fault images, none silent; two appends in flight, 33 of 76 images damage;
   a short write left in place, 21,846 of 21,962 sizes damage. Then one case per row of the rule.
 - `test/crc_fixture_test.cc` checks that the turn log still writes its `RFTW0001` fixture byte for byte.
+- `test/turn_buffers_test.cc` (`bytes`, `turns`) checks the in-place pieces against main's
+  one-string emitter: bytes, offsets and manifests for every record kind, size class and start
+  position, and a log's turns across segment rollovers (docs/mechanisms/turn-seal.md, "The turn's
+  buffers").
 - `fuzz/fuzz_framing.cc` (libFuzzer, `JOURNAL_FUZZ=ON`) and its replay test check the reader's
   claims on arbitrary bytes.
 
