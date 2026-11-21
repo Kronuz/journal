@@ -278,7 +278,8 @@ void boundary_damage(std::uint64_t seed, Damage damage, std::uint64_t& cases) {
 			for (const auto& [group, records] : work.acknowledged) { if (!recovered.lost.contains(group) && recovered.groups[group] != records) { kept = false; } }
 			check(recovered.damaged, "the damage is reported: " + at);
 			check(kept, "a group not lost keeps every acknowledged record: " + at);
-			if (!kept && std::getenv("T9_DEBUG")) {
+			if ((!kept || !recovered.damaged) && std::getenv("T9_DEBUG")) {
+				std::cerr << "  block start " << start << " header " << size << " damaged:"; for (auto o : offsets) std::cerr << ' ' << o - start; std::cerr << " last_turn " << recovered.last_turn << '\n';
 				std::cerr << "  payload " << payload << " header " << header << " lost:"; for (auto g : recovered.lost) std::cerr << ' ' << g; std::cerr << '\n';
 				for (const auto& [group, records] : work.acknowledged) {
 					if (recovered.lost.contains(group) || recovered.groups[group] == records) { continue; }
@@ -294,15 +295,19 @@ void boundary_damage(std::uint64_t seed, Damage damage, std::uint64_t& cases) {
 }  // namespace
 
 int main(int argc, char** argv) {
-	const std::uint64_t seeds = argc > 1 ? std::stoull(argv[1]) : 8;
+	// turn_log_power_test [SEEDS [FIRST_SEED [BLOCK_BYTES]]]: SEEDS seeds from FIRST_SEED, at one
+	// geometry or all.
+	const std::uint64_t seeds = argc > 1 ? std::stoull(argv[1]) : 8, first = argc > 2 ? std::stoull(argv[2]) : 1;
+	const std::uint32_t only = argc > 3 ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 0;
 	// Block bytes and blocks per segment. Damage runs where block starts are sector-aligned: an
 	// unaligned header shares its sector with the block before (the journal's R8).
 	const std::pair<std::uint32_t, std::uint64_t> geometries[] = {{512, 8}, {4096, 4}, {2048, 8}, {1000, 8}, {768, 8}, {256, 16}};
 	for (const auto& [block, blocks] : geometries) {
+		if (only && block != only) { continue; }
 		options = j::TurnLogOptions{block * blocks, block, 1, 3, 600};
 		const auto before = failures;
 		std::uint64_t points = 0, seconds = 0;
-		for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
+		for (std::uint64_t seed = first; seed < first + seeds; ++seed) {
 			// How many mutations an uninterrupted run makes.
 			fl::filesystem disk; fl::io io(disk); Workload work(seed); j::TurnRecovery recovered;
 			{
@@ -319,7 +324,7 @@ int main(int argc, char** argv) {
 		std::cout << "block " << block << ": " << points << " crash points (" << seconds << " with a second loss in recovery)";
 		if (block % j::framing::sector_bytes == 0 || j::framing::sector_bytes % block == 0) {
 			std::uint64_t corrupted = 0, both = 0, header = 0, last = 0;
-			for (std::uint64_t seed = 1; seed <= seeds; ++seed) {
+			for (std::uint64_t seed = first; seed < first + seeds; ++seed) {
 				corrupted_blocks(seed, corrupted);
 				boundary_damage(seed, Damage::both, both); boundary_damage(seed, Damage::header, header); boundary_damage(seed, Damage::last, last);
 			}
