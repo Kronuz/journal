@@ -25,9 +25,10 @@ to verify is damage. A crash cannot leave that.
 
    Otherwise, a fragment that crosses its sector reads as a tear, because the next sector may be
    old.
-3. **A gap that holds damage** costs the groups that its first block's manifest names. That manifest
-   is in the next block's header. When no manifest reads back, the gap costs every group, and the
-   damage is reported.
+3. **A gap that holds damage** costs the groups named by the manifest of every block from its first
+   through the last block where a lost record may begin. Each block's manifest is in the next
+   block's header. When one of those manifests does not read back, the gap costs every group, and
+   the damage is reported.
 4. **A segment's tail** is a gap at the segment's end, and an unwritten tail costs nothing. A tail
    that holds damage is a gap like any other. Damage in a segment's last block and in the next
    header merges into a single gap, and that gap is the segment's tail.
