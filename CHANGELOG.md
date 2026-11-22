@@ -8,6 +8,11 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-21
 
+### Added
+
+- `JOURNAL_FUZZ_DECODER` (`segment` or `checkpoint`) pins `journal_fuzz` to one decoder, so each gets
+  fuzzing time of its own; empty keeps the choice by the input's first byte, which is consumed either way.
+
 ### Fixed
 
 - `TurnLog` recovery reports damage in a fragment that crosses into a sector where a later
