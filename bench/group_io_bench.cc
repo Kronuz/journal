@@ -21,12 +21,12 @@
  */
 
 // Cost of one Host::group_io call by the number of live ids (goal5 O4). Builds a Host over
-// MemoryIO (a few files, so its directory sync costs nothing), holds N live ranges (what N open
+// faultfs (a few files, so its directory sync costs nothing), holds N live ranges (what N open
 // group views keep), then times calls on fresh ids: ns per call, median of 5 runs. A run spans at
 // least 2N calls when that fits in 10 s, so a table sweep amortized over N calls lands in every run.
 // `journal_group_io_bench [N...]` (default 1000 10000 100000 1000000; 0 is the empty baseline).
 #include "journal/host.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -34,6 +34,7 @@
 #include <string>
 
 namespace j = kronuz::journal;
+namespace fl = kronuz::faultlab;
 
 // Reaches Host::ranges_ with no change to Host: explicit instantiation ignores access.
 template <class Tag, auto Member> struct Steal { friend constexpr auto steal(Tag) { return Member; } };
@@ -96,8 +97,8 @@ int main(int argc, char** argv) {
 		for (auto [name, shuffled, resident, built] : {Case{"random ids", true, false, false}, Case{"ascending ids", false, false, false},
 		                                                Case{"random, resident", true, true, false}, Case{"built by group_io", true, false, true}}) {
 			if (built && count > 10000) { continue; }  // a per-call sweep makes building quadratic
-			j::testing::Disk disk;
-			j::Host host(std::make_shared<j::testing::MemoryIO>(disk), {'G', 'I', 'O', 'C'}, j::HostOptions{1, {}});
+			fl::filesystem disk;
+			j::Host host(std::make_shared<fl::io>(disk), {'G', 'I', 'O', 'C'}, j::HostOptions{1, {}});
 			if (resident) { host.create_group(resident_id); }
 			std::vector<std::shared_ptr<j::host_detail::Range>> held;
 			std::vector<std::shared_ptr<j::IO>> views;

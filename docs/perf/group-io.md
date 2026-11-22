@@ -27,7 +27,7 @@ clang++ -O3 -DNDEBUG -std=gnu++20 -Iinclude <dependency includes> bench/group_io
 
 Before and after run the same bench source, "before" against the `include/` of `journal:ea397ab` (the per-call `erase_if` over every entry), "after" against `journal:965cd55`'s sweep. Exclusive `campaign` job `261118-123558-25b19c`, the sizes interleaved, on an Intel Core i9-9980HK (2.4 GHz, 256 KiB L2 per core, 16 MiB L3, 32 GiB), Darwin 24.6.0, Apple clang `/usr/bin/clang++`.
 
-The bench builds a one-loop `Host` over `MemoryIO` and places N live `Range` entries directly in the loop's table, then times `group_io`. Each cell is the median of 5 runs. A run spans at least 2N calls when they fit in 10 s, so the amortized sweep falls inside every timed run. "Random ids" are splitmix64 keys (the order a real host sees); "ascending ids" are 1..N; "resident" calls the same id every time, so the range is shared.
+The bench builds a one-loop `Host` over faultfs and places N live `Range` entries directly in the loop's table, then times `group_io`. Each cell is the median of 5 runs. A run spans at least 2N calls when they fit in 10 s, so the amortized sweep falls inside every timed run. "Random ids" are splitmix64 keys (the order a real host sees); "ascending ids" are 1..N; "resident" calls the same id every time, so the range is shared.
 
 Median ns per call, before then after:
 
