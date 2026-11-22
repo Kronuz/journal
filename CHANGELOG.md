@@ -29,6 +29,26 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 - `TurnLogGroups::bound`, `TurnLog::keep(group, bound)`, `TurnLog::refuse(group)`,
   `TurnDriver::keep(group)`, `Host::bound(group)`, `Host::lose(group)`.
 - `lost_bound_test bounds`, `crash`, `second`, `retention` and `spans`.
+- `JOURNAL_FUZZ_DECODER` (`segment` or `checkpoint`) pins `journal_fuzz` to one decoder, so each gets
+  fuzzing time of its own; empty keeps the choice by the input's first byte, which is consumed either way.
+
+### Fixed
+
+- `TurnLog` recovery reports damage in a fragment that crosses into a sector where a later
+  fragment of its segment verifies, when its own header, or a header of its write before it,
+  proves its first sector. Both sectors are then written, so the failure is damage, not a torn
+  tail: a damaged byte in such a fragment's second sector, in the last turn, no longer drops
+  that acknowledged turn unreported. A fragment that fills the next sector, is the last written
+  there, or has a header the sector boundary cuts with no header of its write before it still
+  reads as a tear ([docs/mechanisms/turn-log-damage.md](docs/mechanisms/turn-log-damage.md)).
+- `TurnLog` recovery no longer reads a tear as damage where the old sector holds another
+  segment's record whose group and sequence equal this segment and epoch. A failing fragment's
+  header proves its sector only with a type and reserved byte a writer emits; one with a bad type
+  or reserved byte is damage only when its checksum verifies with that byte corrected.
+- `TurnLog` recovery no longer reads a tear as damage where the old sector's last bytes equal the
+  first bytes of a fragment whose header the sector boundary cuts, one stale byte in 256 when a
+  single checksum byte lies in the sector. A fragment proves its sector only with its header whole
+  there, for a failing block header and a failing fragment alike.
 
 ## 2026-11-20
 

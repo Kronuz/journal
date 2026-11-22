@@ -173,10 +173,10 @@ struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint6
 using Manifests = std::map<std::pair<std::uint64_t, std::uint32_t>, BlockManifest>;
 // Damage no crash leaves, found where a block's header or a fragment fails to verify. A crash
 // leaves each 512-byte sector old or new, and no earlier use of a recycled file holds bytes
-// bound to this segment, so a sector holding them is this segment's: what it holds of the log
-// verified, unless a sector boundary cuts it.
+// bound to this segment, so a sector holding them is this segment's. Only a fragment whose header
+// the sector holds whole proves it: a cut header leaves as few as one checksum byte there.
 inline bool verifies_in_sector(std::string_view block, std::size_t from, std::size_t end, std::uint64_t segment) {
-	for (auto p = from; p < end && p + framing::fragment_header <= block.size(); ++p) {
+	for (auto p = from; p + framing::fragment_header <= end; ++p) {
 		const auto at = block.substr(p);
 		if (framing::parse_fragment(at, block.size() - p, segment, framing::peek64(at.substr(16))).check == framing::Check::ok) { return true; }
 	}
@@ -185,28 +185,45 @@ inline bool verifies_in_sector(std::string_view block, std::size_t from, std::si
 inline std::size_t sector_end(std::string_view block, std::uint64_t offset, std::size_t at) {
 	return std::min<std::size_t>(block.size(), at + framing::sector_bytes - (offset + at) % framing::sector_bytes);
 }
-// A header that fails while a fragment of this segment starts in its sector.
+// A header that fails while a fragment of this segment verifies in its sector.
 inline bool damaged_header(std::string_view block, std::uint64_t offset, std::uint64_t segment) {
 	return verifies_in_sector(block, framing::header_bytes(0), sector_end(block, offset, 0), segment);
 }
-// A fragment at `at` that fails while its sector is this segment's: its header names this
-// segment and epoch, or a later fragment of the segment starts there. Whole in its sector, with
-// a header no writer emits, or verifying at a length its sector holds whole, it is damage.
-inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch) {
+// A failing fragment is damage when a later fragment of its segment verifies in its sector; when its
+// header names its segment and epoch with a writer's type and reserved byte, and has a length no
+// writer emits or its sector holds it whole; when its header names them and verifies with its length
+// (at one its sector holds whole), type or reserved byte corrected; or when its header, or a header
+// of its write before it in its sector (`written`), proves that sector and a fragment of the segment
+// verifies in the next sector (docs/mechanisms/turn-log-damage.md).
+inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch, bool written) {
 	const auto end = sector_end(block, offset, at);
 	if (verifies_in_sector(block, at + 1, end, segment)) { return true; }
-	if (at + framing::fragment_header > end) { return false; }
 	const auto bytes = block.substr(at);
-	if (framing::peek64(bytes.substr(8)) != segment || framing::peek64(bytes.substr(16)) != epoch) { return false; }
+	const bool names = at + framing::fragment_header <= end && framing::peek64(bytes.substr(8)) == segment && framing::peek64(bytes.substr(16)) == epoch;
 	const std::size_t length = framing::get16(bytes.substr(4)); const auto type = static_cast<std::uint8_t>(bytes[6]);
-	if (!length || framing::fragment_header + length > block.size() - at || type < framing::Full || type > framing::Last || bytes[7]) { return true; }
-	if (at + framing::fragment_header + length <= end) { return true; }
-	// Crossing its sector, it reads as a tear unless its length is what was damaged.
+	const bool fits = length && framing::fragment_header + length <= block.size() - at;
+	// Old bytes can name the segment and epoch, as a stale record's group and sequence do; the
+	// type and reserved byte a writer emits before them are what make the header this write's.
+	const bool named = names && type >= framing::Full && type <= framing::Last && !bytes[7];
+	if (named && (!fits || at + framing::fragment_header + length <= end)) { return true; }
+	// Crossing its sector: a fragment verifying in the next sector proves that sector too.
+	if ((named || written) && end < block.size() && verifies_in_sector(block, end, sector_end(block, offset, end), segment)) { return true; }
+	if (!names) { return false; }
+	// Otherwise it reads as a tear unless one damaged field of its header is all that fails.
 	std::string header(bytes.substr(4, framing::fragment_header - 4));
+	auto verifies = [&](std::size_t payload) {
+		Checksum checksum; checksum.update(header); checksum.update(bytes.substr(framing::fragment_header, payload));
+		return checksum.value() == framing::peek32(bytes);
+	};
 	for (std::size_t whole = 1; at + framing::fragment_header + whole <= end; ++whole) {
 		header[0] = static_cast<char>(whole); header[1] = static_cast<char>(whole >> 8);
-		Checksum checksum; checksum.update(header); checksum.update(bytes.substr(framing::fragment_header, whole));
-		if (checksum.value() == framing::peek32(bytes)) { return true; }
+		if (verifies(whole)) { return true; }
+	}
+	if (named || !fits) { return false; }
+	header[0] = bytes[4]; header[1] = bytes[5]; header[3] = '\0';
+	for (auto fragment : {framing::Full, framing::First, framing::Middle, framing::Last}) {
+		header[2] = static_cast<char>(fragment);
+		if (verifies(length)) { return true; }
 	}
 	return false;
 }
@@ -219,6 +236,8 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		else if (holds) { items.back().last = here; }
 	};
 	std::string block(options.block_bytes, '\0'), partial; bool assembling = false; std::uint64_t partial_epoch = 0, partial_offset = 0;
+	// Where the last header or fragment that verified starts, while it does not end its write.
+	std::optional<std::size_t> in_write;
 	const auto size = std::min(file.size(), options.segment_bytes);
 	for (std::uint64_t offset = 0, index = 0; offset + options.block_bytes <= size; offset += options.block_bytes, ++index) {
 		here = offset;
@@ -231,7 +250,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			if (damage) { items.back().damage = true; }
 			continue;
 		}
-		const auto epoch = header.epoch; const auto count = header.count;
+		const auto epoch = header.epoch; const auto count = header.count; in_write = 0;
 		if (count != framing::no_manifest) {
 			auto& manifest = manifests[{framing::peek64(view.substr(44)), framing::peek32(view.substr(52))}];
 			manifest.segment = segment; manifest.block = static_cast<std::uint32_t>(index); manifest.epoch = epoch;
@@ -243,11 +262,13 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			const auto fragment = framing::parse_fragment(view.substr(position), options.block_bytes - position, segment, epoch);
 			if (fragment.check != framing::Check::ok) {
 				gap(true); assembling = false;
-				if (damaged_fragment(view, offset, position, segment, epoch)) { items.back().damage = true; }
+				const bool written = in_write && (offset + *in_write) / framing::sector_bytes == (offset + position) / framing::sector_bytes;
+				if (damaged_fragment(view, offset, position, segment, epoch, written)) { items.back().damage = true; }
 				break;
 			}
 			const auto type = fragment.type; const auto payload = fragment.payload; const auto length = payload.size();
-			position += framing::fragment_header + length;
+			const auto start = position; position += framing::fragment_header + length;
+			in_write = type == framing::First || type == framing::Middle ? std::optional{start} : std::nullopt;
 			if (type == framing::Full || type == framing::First) {
 				if (assembling) { gap(false); }
 				partial.assign(payload); partial_epoch = epoch; partial_offset = offset + position - framing::fragment_header - length; assembling = type == framing::First;
@@ -262,6 +283,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			std::string_view record(partial);
 			Item item; item.epoch = epoch; item.segment = segment; item.offset = partial_offset; item.kind = static_cast<std::uint8_t>(record[0]); record.remove_prefix(1);
 			item.turn = get64(record); item.group = get64(record); item.sequence = get64(record); item.payload.assign(record);
+			if (item.kind != end_of_turn && item.kind != open_record) { in_write = start; }
 			items.push_back(std::move(item));
 		}
 	}
