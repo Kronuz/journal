@@ -178,10 +178,13 @@ void reopen_empty() {
 		for (const auto& name : old) { check(!node.files(a).contains(name), "no old artifact is back: " + name); }
 	}
 	Node node(disk);
-	check(node.recover(a) == a_new, "a reopened host recovers the new incarnation alone: " + show(node.recover(a)));
-	check(node.recover(b) == b_state, "b keeps every acknowledged record: " + show(node.recover(b)));
-	check(node.status(c) == j::GroupStatus::closed && node.recover(c) == c_state, "c stays closed with its checkpoint: " + show(node.recover(c)));
-	check(node.recover(d) == d_state, "d keeps every acknowledged record: " + show(node.recover(d)));
+	// Read c's status before a recover opens it: check's arguments run in no fixed order.
+	const auto c_status = node.status(c);
+	const auto a_got = node.recover(a), b_got = node.recover(b), c_got = node.recover(c), d_got = node.recover(d);
+	check(a_got == a_new, "a reopened host recovers the new incarnation alone: " + show(a_got));
+	check(b_got == b_state, "b keeps every acknowledged record: " + show(b_got));
+	check(c_status == j::GroupStatus::closed && c_got == c_state, "c stays closed with its checkpoint: " + show(c_got));
+	check(d_got == d_state, "d keeps every acknowledged record: " + show(d_got));
 	node[a].append("a-new-3");
 	check(node[a].turns().sequence(a) > floor + 1, "the new incarnation accepts writes after the reopen");
 }
