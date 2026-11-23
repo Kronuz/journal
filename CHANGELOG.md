@@ -8,6 +8,17 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-23
 
+### Changed
+
+- The turn log's format is `RFTW0002`: every 512-byte sector holds 504 data bytes, the segment's
+  low 32 bits and a CRC-32C over the data, the full segment and the sector's index; fragment
+  headers are 4 bytes and block headers carry no CRC
+  ([docs/mechanisms/turn-log-damage.md](docs/mechanisms/turn-log-damage.md)). Each sector reads
+  alone as current, stale (a recycled file's earlier segment), never written, or damage, so damage
+  to the newest turn is reported instead of dropping it as a torn tail: 36 of 201 newest-tail
+  cases in the cut-header probe dropped silently under `RFTW0001`. A log reads only `RFTW0002`;
+  `RFTW0001` segments do not open. `TurnLogOptions::block_bytes` is a multiple of 512.
+
 ### Fixed
 
 - Turn log recovery reports damage to an acknowledged turn that later turns of its block follow
