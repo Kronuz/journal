@@ -80,6 +80,11 @@ void checkpoint_record(std::string_view bytes) {
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
 	if (!size) { return 0; }
 	const std::string_view bytes(reinterpret_cast<const char*>(data + 1), size - 1);
-	if (data[0] % 2 == 0) { segment(bytes); } else { checkpoint_record(bytes); }
+#ifdef JOURNAL_FUZZ_DECODER
+	const int decoder = JOURNAL_FUZZ_DECODER;  // pinned at build time; data[0] is still consumed
+#else
+	const int decoder = data[0] % 2;
+#endif
+	if (decoder == 0) { segment(bytes); } else { checkpoint_record(bytes); }
 	return 0;
 }

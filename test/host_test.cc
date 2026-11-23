@@ -1227,11 +1227,13 @@ void idle_unmanifested() {
 }
 
 // journal-idle-groups A3, review F3: damage to two blocks of a woken group's batch costs no
-// parked group, and the woken group, whose only post-wake records were there, is reported lost
-// rather than read back as parked.
+// parked group, and the woken group, whose only post-wake records were there, is reported bounded
+// at that batch (docs/mechanisms/lost-bound.md) rather than read back as parked; its reader,
+// holding it through its checkpoint record only, loses it.
 void idle_damage() {
 	fl::filesystem disk;
 	const std::string marker(3000, 'Z');
+	std::uint64_t woke = 0;  // group 1's restaged checkpoint record; its batch is woke + 1
 	{
 		auto host = idle::open(disk, 1);
 		auto& turns = host->driver(0);
@@ -1243,9 +1245,9 @@ void idle_damage() {
 		auto sixth = host->hold(6);
 		check(idle::park(*host) == 5, "five groups park");
 		host->reopen_group(1);
-		const auto at = std::max(host->entry(1)->base, turns.retired(1)) + 1;
-		turns.stage(j::TurnRecord{1, at, j::TurnRecordKind::Checkpoint, "p1", 1});
-		turns.stage(j::TurnRecord{1, at + 1, j::TurnRecordKind::Batch, marker});
+		woke = std::max(host->entry(1)->base, turns.retired(1)) + 1;
+		turns.stage(j::TurnRecord{1, woke, j::TurnRecordKind::Checkpoint, "p1", 1});
+		turns.stage(j::TurnRecord{1, woke + 1, j::TurnRecordKind::Batch, marker});
 		idle::commit(*host);
 		for (std::uint64_t s = 2; s < 6; ++s) { turns.stage(j::TurnRecord{6, s, j::TurnRecordKind::Batch, "later" + std::to_string(s)}); idle::commit(*host); }
 	}
@@ -1263,11 +1265,15 @@ void idle_damage() {
 	}
 	auto host = idle::open(disk, 1);
 	check(host->driver(0).recovered().damaged, "the log reads the damage");
-	check(host->status(1) == j::GroupStatus::lost, "the woken group whose post-wake records the damage took is lost");
+	check(host->status(1) == j::GroupStatus::bounded && host->bound(1) == woke + 1 && host->driver(0).records(1).empty(), "the woken group is bounded at its damaged batch, with no record after it");
 	for (std::uint64_t g = 2; g <= 5; ++g) { check(host->status(g) == j::GroupStatus::closed && host->entry(g)->manifest == "p" + std::to_string(g), "a parked group opens from its table record: group " + std::to_string(g)); }
-	// Group 6's later records share the block of the batch's last fragment, which the damage left
-	// orphaned, so that block's manifest may name it: it keeps every record or is lost, never fewer.
-	check(host->status(6) == j::GroupStatus::lost || host->driver(0).records(6).size() == 5, "the group that wrote after the damage keeps every record or is lost");
+	// Group 6's first later record shares the block of the batch's last fragment, which the damage
+	// left orphaned, so that block's manifest bounds group 6 there: it keeps the records after it.
+	const std::vector<j::TurnRecord> after{{6, 3, j::TurnRecordKind::Batch, "later3"}, {6, 4, j::TurnRecordKind::Batch, "later4"}, {6, 5, j::TurnRecordKind::Batch, "later5"}};
+	check(host->status(6) == j::GroupStatus::bounded && host->bound(6) == 2 && host->driver(0).records(6) == after, "the group that wrote after the damage is bounded at 2 and keeps records 3 to 5");
+	// Group 1's reader holds it through its checkpoint record, below the bound: it loses it.
+	host->lose(1);
+	check(host->status(1) == j::GroupStatus::lost, "a reader below the bound loses the group");
 }
 
 // Review F1, D9's orphan rule: a park whose split fails at its directory sync, after its renames,

@@ -30,10 +30,12 @@
 
 #include "primitives.h"
 #include <algorithm>
-#include <map>
+#include <initializer_list>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace kronuz::journal::framing {
@@ -49,10 +51,52 @@ inline constexpr std::size_t header_bytes(std::uint16_t count) { return header_f
 inline constexpr bool valid_block_bytes(std::uint32_t bytes) { return bytes >= 256 && bytes <= 65535 + fragment_header; }
 
 enum Fragment : std::uint8_t { Full = 1, First, Middle, Last };
+
+// The most groups a block's fragments can name: one per fragment, each at least 25 bytes.
+inline constexpr std::size_t block_groups(std::uint32_t block_bytes) { return (block_bytes - header_bytes(no_manifest)) / (fragment_header + 1); }
+
+// A block's groups and their highest sequences, read in group order. raise() appends and the
+// first read sorts, so filling a block allocates nothing within its reserved capacity. Not for
+// concurrent readers: a read may sort.
+class Groups {
+public:
+	using value_type = std::pair<std::uint64_t, std::uint64_t>;
+	Groups() = default;
+	Groups(std::initializer_list<value_type> entries) { for (const auto& [group, sequence] : entries) { raise(group, sequence); } }
+	// Keeps the highest sequence noted for `group`.
+	void raise(std::uint64_t group, std::uint64_t sequence) {
+		if (!entries_.empty() && entries_.back().first == group) { entries_.back().second = std::max(entries_.back().second, sequence); return; }
+		sorted_ = sorted_ && (entries_.empty() || entries_.back().first < group);
+		entries_.emplace_back(group, sequence);
+	}
+	std::uint64_t& operator[](std::uint64_t group) {
+		settle();
+		auto at = std::lower_bound(entries_.begin(), entries_.end(), group, [](const value_type& entry, std::uint64_t key) { return entry.first < key; });
+		if (at == entries_.end() || at->first != group) { at = entries_.insert(at, {group, 0}); }
+		return at->second;
+	}
+	std::size_t size() const { settle(); return entries_.size(); }
+	bool empty() const noexcept { return entries_.empty(); }
+	std::vector<value_type>::const_iterator begin() const { settle(); return entries_.cbegin(); }
+	std::vector<value_type>::const_iterator end() const { settle(); return entries_.cend(); }
+	void clear() noexcept { entries_.clear(); sorted_ = true; }
+	void reserve(std::size_t count) { entries_.reserve(count); }
+private:
+	// Sorts by group, each group's highest sequence first, and keeps that one.
+	void settle() const {
+		if (sorted_) { return; }
+		std::sort(entries_.begin(), entries_.end(), [](const value_type& a, const value_type& b) { return a.first != b.first ? a.first < b.first : a.second > b.second; });
+		entries_.erase(std::unique(entries_.begin(), entries_.end(), [](const value_type& a, const value_type& b) { return a.first == b.first; }), entries_.end());
+		sorted_ = true;
+	}
+	mutable std::vector<value_type> entries_; mutable bool sorted_ = true;
+};
 // The groups with fragments in a block and their highest sequences, named by the next block's header.
-struct Manifest { bool known = false; std::uint64_t segment = 0; std::uint32_t block = 0; std::map<std::uint64_t, std::uint64_t> groups; };
+struct Manifest { bool known = false; std::uint64_t segment = 0; std::uint32_t block = 0; Groups groups; };
 
 inline void put16(std::string& bytes, std::uint16_t value) { bytes.push_back(static_cast<char>(value)); bytes.push_back(static_cast<char>(value >> 8)); }
+// Stores `value` little-endian in the `size` bytes at `to`.
+inline void store(char* to, std::uint64_t value, unsigned size) { for (unsigned i = 0; i < size; ++i) { to[i] = static_cast<char>(value >> (i * 8)); } }
 inline std::uint16_t get16(std::string_view bytes) { return static_cast<std::uint16_t>(static_cast<unsigned char>(bytes[0]) | static_cast<unsigned char>(bytes[1]) << 8); }
 inline std::uint32_t peek32(std::string_view bytes) { return get32(bytes); }
 inline std::uint64_t peek64(std::string_view bytes) { return get64(bytes); }
@@ -68,59 +112,78 @@ struct Stream {
 };
 
 // Writes records as fragments into blocks from a stream offset, starting a block's header as
-// the stream enters it and padding a block's tail too short for a fragment.
+// the stream enters it and padding a block's tail too short for a fragment. A measuring emitter
+// lays records out, positions and manifests, without writing a byte.
 class Emitter {
 public:
 	// `filling` holds the groups with fragments in the block being filled, which the next
-	// block's header names.
-	Emitter(const Stream& stream, std::uint64_t position, Manifest filling = {})
-		: stream_(stream), position_(position), filling_(std::move(filling)) {}
+	// block's header names. The bytes go to `buffer`, emptied first, so a caller that hands back
+	// its last buffer frames into that capacity.
+	Emitter(const Stream& stream, std::uint64_t position, Manifest filling = {}, std::string buffer = {})
+		: stream_(stream), position_(position), filling_(std::move(filling)), bytes_(std::move(buffer)) { bytes_.clear(); }
+	static Emitter measure(const Stream& stream, std::uint64_t position, Manifest filling = {}) {
+		Emitter emitter(stream, position, std::move(filling)); emitter.measuring_ = true; return emitter;
+	}
 	// Returns the offset of the record's first fragment. A nonzero group is noted in the
 	// manifest of each block the record touches.
-	std::uint64_t record(std::string_view logical, std::uint64_t group = 0, std::uint64_t sequence = 0) {
-		std::string_view rest(logical); bool first = true; std::uint64_t start = 0;
-		const std::uint64_t block = stream_.block_bytes;
-		while (!rest.empty()) {
+	std::uint64_t record(std::string_view logical, std::uint64_t group = 0, std::uint64_t sequence = 0) { return record(logical, std::string_view{}, group, sequence); }
+	// A record of `head` then `body`, framed from both in place.
+	std::uint64_t record(std::string_view head, std::string_view body, std::uint64_t group, std::uint64_t sequence) {
+		return record(head, body.size(), [body](std::string& out, std::size_t count) mutable { out.append(body.substr(0, count)); body.remove_prefix(count); }, group, sequence);
+	}
+	// A record of `head` then `size` bytes that `fill(out, count)` appends to `out` in order, each
+	// piece straight into its fragment. A measuring emitter never calls it.
+	template <class Fill> std::uint64_t record(std::string_view head, std::uint64_t size, Fill&& fill, std::uint64_t group, std::uint64_t sequence) {
+		const std::uint64_t block = stream_.block_bytes, total = head.size() + size;
+		std::uint64_t done = 0, start = 0;
+		while (done < total) {
 			enter_block();
-			auto room = block - position_ % block;
+			const auto room = block - position_ % block;
 			if (room < fragment_header + 1) { pad(room); continue; }
-			auto count = std::min<std::size_t>(rest.size(), room - fragment_header);
-			bool last = count == rest.size();
+			const auto count = std::min<std::uint64_t>(total - done, room - fragment_header);
+			const bool first = done == 0, last = done + count == total;
 			if (first) { start = position_; }
-			if (group) { auto& highest = filling_.groups[group]; highest = std::max(highest, sequence); }
-			fragment(first ? (last ? Full : First) : (last ? Last : Middle), rest.substr(0, count));
-			rest.remove_prefix(count); first = false;
+			if (group) { filling_.groups.raise(group, sequence); }
+			if (!measuring_) {
+				const auto at = bytes_.size();
+				put32(bytes_, 0); put16(bytes_, static_cast<std::uint16_t>(count)); bytes_.push_back(static_cast<char>(first ? (last ? Full : First) : (last ? Last : Middle))); bytes_.push_back('\0');
+				put64(bytes_, stream_.segment); put64(bytes_, stream_.epoch);
+				if (done < head.size()) { bytes_.append(head.substr(done, std::min<std::uint64_t>(count, head.size() - done))); }
+				if (done + count > head.size()) { fill(bytes_, static_cast<std::size_t>(done + count - std::max<std::uint64_t>(done, head.size()))); }
+				if (bytes_.size() != at + fragment_header + count) { throw std::logic_error("framing: a fill wrote other than it was asked"); }
+				store(bytes_.data() + at, crc32c(std::string_view(bytes_).substr(at + 4)), 4);
+			}
+			position_ += fragment_header + count; done += count;
 		}
 		return start;
 	}
-	const std::string& bytes() const noexcept { return bytes_; }
+	const std::string& bytes() const& noexcept { return bytes_; }
+	std::string bytes() && noexcept { return std::move(bytes_); }
 	std::uint64_t position() const noexcept { return position_; }
-	const Manifest& filling() const noexcept { return filling_; }
+	const Manifest& filling() const& noexcept { return filling_; }
+	Manifest filling() && noexcept { return std::move(filling_); }
+	bool measuring() const noexcept { return measuring_; }
 private:
 	void enter_block() {
 		const std::uint64_t block = stream_.block_bytes;
 		if (position_ % block) { return; }
-		auto start = bytes_.size();
-		bytes_.append(stream_.magic); bytes_.append(stream_.identity.data(), stream_.identity.size());
-		put64(bytes_, stream_.segment); put32(bytes_, static_cast<std::uint32_t>(position_ / block)); put64(bytes_, stream_.epoch);
 		// A manifest larger than half a block is not kept: damage there costs conservatively.
-		auto count = stream_.manifests && filling_.known && header_bytes(static_cast<std::uint16_t>(std::min<std::size_t>(filling_.groups.size(), 4096))) <= block / 2 ?
-			static_cast<std::uint16_t>(filling_.groups.size()) : no_manifest;
-		put64(bytes_, count == no_manifest ? 0 : filling_.segment); put32(bytes_, count == no_manifest ? 0 : filling_.block); put16(bytes_, count);
-		if (count != no_manifest) { for (const auto& [group, sequence] : filling_.groups) { put64(bytes_, group); put64(bytes_, sequence); } }
-		put32(bytes_, crc32c(std::string_view(bytes_).substr(start)));
+		const auto groups = filling_.groups.size();
+		auto count = stream_.manifests && filling_.known && header_bytes(static_cast<std::uint16_t>(std::min<std::size_t>(groups, 4096))) <= block / 2 ?
+			static_cast<std::uint16_t>(groups) : no_manifest;
+		if (!measuring_) {
+			auto start = bytes_.size();
+			bytes_.append(stream_.magic); bytes_.append(stream_.identity.data(), stream_.identity.size());
+			put64(bytes_, stream_.segment); put32(bytes_, static_cast<std::uint32_t>(position_ / block)); put64(bytes_, stream_.epoch);
+			put64(bytes_, count == no_manifest ? 0 : filling_.segment); put32(bytes_, count == no_manifest ? 0 : filling_.block); put16(bytes_, count);
+			if (count != no_manifest) { for (const auto& [group, sequence] : filling_.groups) { put64(bytes_, group); put64(bytes_, sequence); } }
+			put32(bytes_, crc32c(std::string_view(bytes_).substr(start)));
+		}
 		position_ += header_bytes(count);
-		filling_ = Manifest{true, stream_.segment, static_cast<std::uint32_t>(position_ / block), {}};
+		filling_.known = true; filling_.segment = stream_.segment; filling_.block = static_cast<std::uint32_t>(position_ / block); filling_.groups.clear();
 	}
-	void pad(std::uint64_t count) { bytes_.append(count, '\0'); position_ += count; }
-	void fragment(Fragment type, std::string_view payload) {
-		std::string header; put16(header, static_cast<std::uint16_t>(payload.size())); header.push_back(static_cast<char>(type)); header.push_back('\0');
-		put64(header, stream_.segment); put64(header, stream_.epoch);
-		Checksum checksum; checksum.update(header); checksum.update(payload);
-		put32(bytes_, checksum.value()); bytes_.append(header); bytes_.append(payload);
-		position_ += fragment_header + payload.size();
-	}
-	Stream stream_; std::uint64_t position_; std::string bytes_; Manifest filling_;
+	void pad(std::uint64_t count) { if (!measuring_) { bytes_.append(count, '\0'); } position_ += count; }
+	Stream stream_; std::uint64_t position_; Manifest filling_; std::string bytes_; bool measuring_ = false;
 };
 
 // Where Emitter::record leaves a stream without manifests after a `size`-byte record written
@@ -145,17 +208,29 @@ enum class Check : std::uint8_t { ok, bad, cut };
 // The header opening `block`, the bytes from a block start to its end or the end of file.
 // Verifies everything but the epoch, which the header carries.
 struct Header { Check check = Check::bad; std::uint64_t epoch = 0; std::uint16_t count = 0; std::size_t size = 0; };
+// A header's count and size, read from its fixed part: ok when they fit the stream's blocks.
+inline Header header_shape(std::string_view fixed, const Stream& stream) {
+	Header header;
+	header.count = get16(fixed.substr(56)); header.size = header_bytes(header.count);
+	if (!stream.manifests && header.count != no_manifest) { return header; }
+	if (header.count == no_manifest && (peek64(fixed.substr(44)) || peek32(fixed.substr(52)))) { return header; }  // the emitter writes zeros
+	if (header.size + fragment_header >= stream.block_bytes) { return header; }  // a block holds a fragment byte after its header
+	header.check = Check::ok;
+	return header;
+}
+// Whether a header's fixed part names the stream's block `index`.
+inline bool names_block(std::string_view fixed, const Stream& stream, std::uint64_t index) {
+	return fixed.substr(0, 8) == stream.magic && fixed.substr(8, 16) == std::string_view(stream.identity.data(), 16) && peek64(fixed.substr(24)) == stream.segment &&
+		peek32(fixed.substr(32)) == index;
+}
 inline Header parse_header(std::string_view block, const Stream& stream, std::uint64_t index) {
 	Header header;
 	if (block.size() < (stream.manifests ? header_fixed : header_bytes(no_manifest))) { header.check = Check::cut; return header; }
-	header.count = get16(block.substr(56)); header.size = header_bytes(header.count);
-	if (!stream.manifests && header.count != no_manifest) { return header; }
-	if (header.count == no_manifest && (peek64(block.substr(44)) || peek32(block.substr(52)))) { return header; }  // the emitter writes zeros
-	if (header.size + fragment_header >= stream.block_bytes) { return header; }  // a block holds a fragment byte after its header
+	header = header_shape(block, stream);
+	if (header.check != Check::ok) { return header; }
 	if (header.size > block.size()) { header.check = Check::cut; return header; }
-	if (block.substr(0, 8) != stream.magic || block.substr(8, 16) != std::string_view(stream.identity.data(), 16) || peek64(block.substr(24)) != stream.segment ||
-		peek32(block.substr(32)) != index || peek32(block.substr(header.size - 4)) != crc32c(block.substr(0, header.size - 4))) { return header; }
-	header.check = Check::ok; header.epoch = peek64(block.substr(36));
+	if (!names_block(block, stream, index) || peek32(block.substr(header.size - 4)) != crc32c(block.substr(0, header.size - 4))) { header.check = Check::bad; return header; }
+	header.epoch = peek64(block.substr(36));
 	return header;
 }
 
@@ -175,37 +250,80 @@ inline FragmentView parse_fragment(std::string_view at, std::size_t room, std::u
 	return view;
 }
 
-// Reads back the record whose first fragment starts at `offset`, checking each block header and
-// fragment on the way as scan does, so a record of another segment or epoch is corruption.
-inline std::string read_record(File& file, const Stream& stream, std::uint64_t offset) {
-	const std::uint64_t block = stream.block_bytes;
-	auto read = [&file](std::string& to, std::uint64_t at, std::size_t size) {
-		const auto start = to.size(); to.resize(start + size);
-		if (file.read_at(at, std::span<char>(to.data() + start, size)) != size) { throw Corruption("short log read"); }
-	};
-	std::string logical, bytes;
-	for (std::uint64_t position = offset;;) {
-		if (position % block == 0) {
-			bytes.clear(); read(bytes, position, header_fixed);
-			const auto size = header_bytes(get16(std::string_view(bytes).substr(56)));
-			if (size + fragment_header >= block) { throw Corruption("invalid log block header"); }
-			read(bytes, position + header_fixed, size - header_fixed);
-			const auto header = parse_header(bytes, stream, position / block);
-			if (header.check != Check::ok || header.epoch != stream.epoch) { throw Corruption("invalid log block header"); }
-			position += size;
+// Reads back, in order, the record whose first fragment starts at `offset`, checking each block
+// header and fragment on the way as scan does, so a record of another segment or epoch is
+// corruption. Block headers stream through a fixed buffer into their checksum; the record's
+// bytes go where read() puts them.
+class RecordReader {
+public:
+	RecordReader(File& file, const Stream& stream, std::uint64_t offset) : file_(file), stream_(stream), position_(offset) {}
+	// Reads the record's next `count` bytes to `to`; a record that ends first is corruption.
+	void read(char* to, std::size_t count) {
+		while (count) {
+			if (!left_) { next(); }
+			const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(count, left_));
+			fetch(position_, to, n); checksum_.update(to, n);
+			position_ += n; left_ -= n; to += n; count -= n;
+			if (!left_ && checksum_.value() != expected_) { throw Corruption("log record changed since it was written"); }
 		}
-		const auto room = block - position % block;
-		if (room < fragment_header + 1) { position += room; continue; }
-		bytes.clear(); read(bytes, position, fragment_header);
-		const std::size_t length = get16(std::string_view(bytes).substr(4));
-		if (!length || fragment_header + length > room) { throw Corruption("invalid log fragment"); }
-		read(bytes, position + fragment_header, length);
-		const auto fragment = parse_fragment(bytes, room, stream.segment, stream.epoch);
-		const auto type = fragment.type;
-		if (fragment.check != Check::ok || (logical.empty() ? type != Full && type != First : type != Middle && type != Last)) { throw Corruption("log record changed since it was written"); }
-		logical.append(fragment.payload); position += fragment_header + length;
-		if (type == Full || type == Last) { return logical; }
 	}
+	// The bytes its current fragment has left, entering the next one when none: 0 once done.
+	std::uint64_t piece() { if (!left_ && !done()) { next(); } return left_; }
+	// Whether the bytes read end the record.
+	bool done() const noexcept { return !left_ && (type_ == Full || type_ == Last); }
+private:
+	void fetch(std::uint64_t at, char* to, std::size_t count) { if (file_.read_at(at, std::span<char>(to, count)) != count) { throw Corruption("short log read"); } }
+	void next() {
+		if (done()) { throw Corruption("log record shorter than read"); }
+		const std::uint64_t block = stream_.block_bytes;
+		for (;;) {
+			if (position_ % block == 0) { enter_block(); }
+			const auto room = block - position_ % block;
+			if (room >= fragment_header + 1) { break; }
+			position_ += room;
+		}
+		const auto room = block - position_ % block;
+		char header[fragment_header]; fetch(position_, header, fragment_header);
+		const std::string_view view(header, fragment_header);
+		const std::size_t length = get16(view.substr(4)); const auto type = static_cast<std::uint8_t>(header[6]);
+		if (!length || fragment_header + length > room) { throw Corruption("invalid log fragment"); }
+		const bool follows = type_ ? type == Middle || type == Last : type == Full || type == First;
+		if (!follows || header[7] || peek64(view.substr(8)) != stream_.segment || peek64(view.substr(16)) != stream_.epoch) { throw Corruption("log record changed since it was written"); }
+		type_ = type; left_ = length; expected_ = peek32(view);
+		checksum_ = Checksum{}; checksum_.update(view.substr(4));
+		position_ += fragment_header;
+	}
+	// Checks the block header at position_ as parse_header does, its manifest and checksum read
+	// a chunk at a time, and steps past it.
+	void enter_block() {
+		char chunk[1024]; fetch(position_, chunk, header_fixed);
+		const std::string_view fixed(chunk, header_fixed);
+		const auto header = header_shape(fixed, stream_);
+		if (header.check != Check::ok || !names_block(fixed, stream_, position_ / stream_.block_bytes) || peek64(fixed.substr(36)) != stream_.epoch) { throw Corruption("invalid log block header"); }
+		Checksum checksum; checksum.update(fixed);
+		char stored[4] = {};
+		const std::uint64_t end = position_ + header.size, sum = end - 4;
+		for (std::uint64_t at = position_ + header_fixed; at < end;) {
+			const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(sizeof chunk, end - at));
+			fetch(at, chunk, n);
+			const auto body = at < sum ? static_cast<std::size_t>(std::min<std::uint64_t>(n, sum - at)) : 0;
+			checksum.update(chunk, body);
+			for (auto i = body; i < n; ++i) { stored[at + i - sum] = chunk[i]; }
+			at += n;
+		}
+		if (checksum.value() != peek32(std::string_view(stored, 4))) { throw Corruption("invalid log block header"); }
+		position_ = end;
+	}
+	File& file_; Stream stream_; std::uint64_t position_;
+	std::uint64_t left_ = 0; std::uint8_t type_ = 0; std::uint32_t expected_ = 0; Checksum checksum_;
+};
+
+// Reads back the record whose first fragment starts at `offset` (RecordReader).
+inline std::string read_record(File& file, const Stream& stream, std::uint64_t offset) {
+	std::string logical;
+	RecordReader reader(file, stream, offset);
+	while (const auto count = reader.piece()) { const auto at = logical.size(); logical.resize(at + count); reader.read(logical.data() + at, count); }
+	return logical;
 }
 
 // Reads a whole file, a growing log's last block included.

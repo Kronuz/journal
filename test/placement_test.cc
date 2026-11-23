@@ -23,11 +23,12 @@
 // Placement and re-partition (A4): `map` checks each of L loops owns a contiguous run of
 // floor or ceil(4,096 / L) slots; `remap` cuts power after every durable step of four
 // re-partitions of groups over a damaged old generation, where every group's records come back
-// exactly once on its new loop and every lost group stays lost through two more restarts;
-// `repartition_lost`, `repartition_damaged` and `retention` show the table's mark alone keeps a
-// lost id refused once the damage is gone: after a 1->2 re-partition, after a re-partition that
-// first sees the damage, and after retention; `damaged_absent`, a group whose only records the
-// damage took, is lost rather than offered for create. `placement_test [case [shard shards]]`.
+// exactly once on its new loop (a bounded one's after its bound, docs/mechanisms/lost-bound.md)
+// and every lost or bounded group stays so through two more restarts; `repartition_lost`,
+// `repartition_damaged` and `retention` show the table alone keeps a damaged group's bound once
+// the damage is gone: after a 1->2 re-partition, after a re-partition that first sees the
+// damage, and after retention; `damaged_absent`, a group whose only records the damage took, is
+// lost or bounded rather than offered for create. `placement_test [case [shard shards]]`.
 #include "faultlab/faultfs.h"
 #include "journal/host.h"
 #include <algorithm>
@@ -131,9 +132,16 @@ Records populate(fl::filesystem& disk, std::uint64_t count, std::set<std::uint64
 	return written;
 }
 
-// Every group not lost has its records, exactly once, on its own loop; every lost one is
-// refused by the table and by its loop's log.
-void verify(j::Host& host, const Records& written, const std::set<std::uint64_t>& lost, std::uint32_t loops, const std::string& at) {
+using Bounds = std::map<std::uint64_t, std::uint64_t>;
+// The groups an open bounded, at their bounds (TurnRecovery::bounded, kept by the host).
+Bounds bounds(j::Host& host) {
+	Bounds found;
+	for (std::uint32_t l = 0; l < host.loops(); ++l) { for (const auto& [g, b] : host.driver(l).recovered().bounded) { if (host.bound(g)) { found[g] = b.bound; } } }
+	return found;
+}
+// Every group not lost has its records, exactly once, on its own loop: a bounded one, at its
+// bound, those after it; every lost one is refused by the table and by its loop's log.
+void verify(j::Host& host, const Records& written, const std::set<std::uint64_t>& lost, const Bounds& bounded, std::uint32_t loops, const std::string& at) {
 	check(host.loops() == loops, "the host runs the requested loops: " + at);
 	for (const auto& [g, records] : written) {
 		if (lost.contains(g)) {
@@ -141,9 +149,14 @@ void verify(j::Host& host, const Records& written, const std::set<std::uint64_t>
 			check(refused(host, g), "its loop refuses its id: group " + std::to_string(g) + " " + at);
 			continue;
 		}
+		auto expected = records;
+		if (auto found = bounded.find(g); found != bounded.end()) {
+			check(host.status(g) == j::GroupStatus::bounded && host.bound(g) == found->second, "a bounded group stays bounded at its bound: group " + std::to_string(g) + " " + at);
+			std::erase_if(expected, [&](const j::TurnRecord& record) { return record.sequence <= found->second; });
+		}
 		for (std::uint32_t l = 0; l < host.loops(); ++l) {
 			const bool home = l == host.loop(g);
-			check(home ? host.driver(l).records(g) == records : !host.driver(l).has_group(g),
+			check(home ? host.driver(l).records(g) == expected : !host.driver(l).has_group(g),
 				"group " + std::to_string(g) + " has its records on its own loop only: " + at);
 		}
 	}
@@ -172,19 +185,19 @@ void remap() {
 	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 400, victims);
-	std::set<std::uint64_t> lost;
+	std::set<std::uint64_t> lost; Bounds bounded;
 	{
 		auto host = open(disk, 1);
-		lost = host->driver(0).recovered().lost;
-		for (auto g : victims) { check(lost.contains(g), "the damage loses its victim " + std::to_string(g)); }
-		check(lost.size() <= 5 * victims.size(), "damage costs the groups of its blocks, not every group");
-		verify(*host, written, lost, 1, "first open");
+		lost = host->driver(0).recovered().lost; bounded = bounds(*host);
+		for (auto g : victims) { check(lost.contains(g) || bounded.contains(g), "the damage costs its victim " + std::to_string(g)); }
+		check(lost.size() + bounded.size() <= 5 * victims.size(), "damage costs the groups of its blocks, not every group");
+		verify(*host, written, lost, bounded, 1, "first open");
 	}
 	std::uint64_t points = 0;
 	for (std::uint32_t loops : {3u, 2u, 5u, 4u}) {
 		const fl::filesystem before = disk.snapshot();
 		const auto start = disk.mutations();
-		{ auto host = open(disk, loops); verify(*host, written, lost, loops, "re-partition to " + std::to_string(loops)); }
+		{ auto host = open(disk, loops); verify(*host, written, lost, bounded, loops, "re-partition to " + std::to_string(loops)); }
 		const auto total = disk.mutations() - start;
 		for (std::uint64_t cut = 1; cut <= total; ++cut) {
 			if ((cut - 1) % shards != shard) { continue; }
@@ -195,7 +208,7 @@ void remap() {
 			try { open(crashed, loops); } catch (const std::exception& error) { check(crashed.powered_off(), "only the power cut fails the re-partition: " + at + ": " + error.what()); }
 			crashed.crash(loops * 7919 + cut, sector_cut);
 			for (int restart = 0; restart < 3; ++restart) {
-				try { auto host = open(crashed, loops); verify(*host, written, lost, loops, at + " restart " + std::to_string(restart)); }
+				try { auto host = open(crashed, loops); verify(*host, written, lost, bounded, loops, at + " restart " + std::to_string(restart)); }
 				catch (const std::exception& error) { check(false, at + ": " + error.what()); }
 			}
 		}
@@ -203,40 +216,41 @@ void remap() {
 	std::cout << "remap: " << written.size() << " groups, " << lost.size() << " lost, " << points << " crash points (shard " << shard << " of " << shards << ")\n";
 }
 
-// Journal's own damage scenario: a group lost to a damaged block of the only loop's log, then a
-// 1->2 re-partition. The new logs hold no damage; only the table's mark refuses the id.
+// Journal's own damage scenario: a group bounded by a damaged block of the only loop's log, then
+// a 1->2 re-partition. The new logs hold no damage; only the table keeps the bound.
 void repartition_lost() {
 	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 60, victims);
-	std::set<std::uint64_t> lost;
-	{ auto host = open(disk, 1); lost = host->driver(0).recovered().lost; }
-	check(lost.contains(50), "the damaged group is lost");
+	std::set<std::uint64_t> lost; Bounds bounded;
+	{ auto host = open(disk, 1); lost = host->driver(0).recovered().lost; bounded = bounds(*host); }
+	check(bounded.contains(50), "the damaged group is bounded");
 	auto host = open(disk, 2);
 	check(host->generation() == 2, "the re-partition committed a new generation");
 	for (std::uint32_t l = 0; l < 2; ++l) { check(!host->driver(l).recovered().damaged, "the new generation's logs hold no damage"); }
-	verify(*host, written, lost, 2, "after 1->2");
+	verify(*host, written, lost, bounded, 2, "after 1->2");
 }
 
-// Damage first seen by a re-partition: step 1 marks the lost ids before the new generation,
-// which holds no damage, is written.
+// Damage first seen by a re-partition: step 1 stores the bounds and marks the lost ids before the
+// new generation, which holds no damage, is committed.
 void repartition_damaged() {
 	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 120, victims);
-	std::set<std::uint64_t> lost;
+	std::set<std::uint64_t> lost; Bounds bounded;
 	{
 		fl::filesystem probe = disk.snapshot();  // what the stored generation lost, read on a copy
-		auto host = open(probe, 1); lost = host->driver(0).recovered().lost;
+		auto host = open(probe, 1); lost = host->driver(0).recovered().lost; bounded = bounds(*host);
 	}
-	check(lost.contains(50) && lost.contains(100), "the damage loses its victims");
+	check(bounded.contains(50) && bounded.contains(100), "the damage bounds its victims");
 	auto host = open(disk, 3);
-	verify(*host, written, lost, 3, "a re-partition over fresh damage");
+	verify(*host, written, lost, bounded, 3, "a re-partition over fresh damage");
 }
 
-// A group whose only records a damaged log no longer holds, and that no surviving manifest
-// names, is lost, never offered for create: its checkpoint record's bytes flipped, its segment
-// zeroed past the first block, or the segment gone. It stays lost through another restart.
+// A group whose only records a damaged log no longer holds is never offered for create: bounded
+// at its one record's sequence when a manifest names it (its checkpoint record's bytes flipped),
+// lost when none does (its segment zeroed past the first block, or the segment gone). It stays
+// so through another restart.
 void damaged_absent() {
 	const j::TurnLogOptions options{64 * 1024, 1024, 1, 4, 4096};
 	const std::uint64_t group = 7;
@@ -264,7 +278,8 @@ void damaged_absent() {
 		else { auto io = host_io(disk); io->remove(segment); io->sync_directory(); }
 		for (int restart = 0; restart < 2; ++restart) {
 			auto host = open(disk, 1, options);
-			check(host->status(group) == j::GroupStatus::lost && refused(*host, group), "the group is lost" + at);
+			const bool bounded = mode == 0 && host->status(group) == j::GroupStatus::bounded && host->bound(group) == 1 && host->driver(0).records(group).empty();
+			check((bounded || host->status(group) == j::GroupStatus::lost) && refused(*host, group), "the group is lost, or bounded with nothing after its bound" + at);
 			bool created = false;
 			try { host->create_group(group); created = true; } catch (const std::logic_error&) {}
 			check(!created, "create refuses it" + at);
@@ -272,23 +287,22 @@ void damaged_absent() {
 	}
 }
 
-// A lost id stays lost once retention recycled the damaged segment.
+// A bound stays once retention recycled the damaged segment.
 void retention() {
 	fl::filesystem disk;
 	std::set<std::uint64_t> victims;
 	const auto written = populate(disk, 60, victims, small_segments);
-	std::set<std::uint64_t> lost;
+	std::uint64_t bound = 0;
 	{
 		auto host = open(disk, 1, small_segments);
-		lost = host->driver(0).recovered().lost;
-		check(lost.contains(50) && host->driver(0).recovered().damaged, "the damaged group is lost");
+		bound = host->bound(50);
+		check(bound && host->driver(0).recovered().damaged, "the damaged group is bounded");
 		std::uint64_t sequence = written.at(1).back().sequence;
 		for (int turn = 0; turn < 200; ++turn) { host->driver(0).stage({1, ++sequence, j::TurnRecordKind::Batch, std::string(900, 'r')}); commit(*host); }
 	}
 	auto host = open(disk, 1, small_segments);
 	check(!host->driver(0).recovered().damaged, "retention recycled the damaged segment");
-	check(host->status(50) == j::GroupStatus::lost, "the table still holds the group lost");
-	check(refused(*host, 50), "its id stays refused");
+	check(host->status(50) == j::GroupStatus::bounded && host->bound(50) == bound, "the table still holds the group bounded");
 }
 }  // namespace
 

@@ -591,6 +591,9 @@ private:
 			hold_ = host_->hold(group_);
 			const auto status = host_->status(group_);
 			if (status == GroupStatus::lost) { throw Corruption("the turn log lost this group"); }
+			// A Store holds its group through its latest checkpoint record, which a bounded group's
+			// log lost: no record after the bound is one (Host::open would have cleared the bound).
+			if (status == GroupStatus::bounded) { host_->lose(group_); throw Corruption("the turn log lost this group"); }
 			if (status == GroupStatus::none) { throw Corruption("the group has no checkpoint record"); }
 			// Neither recovered at the host's open nor closed into the table: held and released here.
 			const bool released = !turns_->has_group(group_) && turns_->holds(group_);

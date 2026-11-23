@@ -1,6 +1,7 @@
-> Status: CURRENT (2026-11-17) how `TurnDriver::seal` in `include/journal/turn_driver.h` works,
-> repeat calls per turn (journal-seal-repeat) and the one-segment bound on staged records
-> (journal-turn-bound) included.
+> Status: CURRENT (2026-11-20) how `TurnDriver::seal` in `include/journal/turn_driver.h` works,
+> repeat calls per turn (journal-seal-repeat), the one-segment bound on staged records
+> (journal-turn-bound) and the turn's own buffers (journal-turn-buffers, strata
+> `docs/design/rocksdb-parity.md` D3) included.
 > Consumer: strata `docs/design/standalone-turn-log.md` revision 1 (D3, D4, D5; review R3), at
 > strata:8e919415, and the shim it replaces, strata:efe25bcd `include/strata/core/turn_seal.hh`.
 > Format: `RFTW0001`, unchanged.
@@ -16,7 +17,8 @@ several closed records included, with one `pwrite` and one data barrier through 
 
 ```cpp
 using Sealer = std::function<std::optional<TurnRecord>(std::uint64_t room, bool first)>;
-std::uint64_t TurnDriver::seal(std::uint64_t group, Sealer fn, const void* owner = nullptr);
+using Recycler = std::function<void(std::string&& payload)>;
+std::uint64_t TurnDriver::seal(std::uint64_t group, Sealer fn, const void* owner = nullptr, Recycler recycle = {});
 void TurnDriver::unseal(std::uint64_t group, const void* owner) noexcept;  // any thread
 void TurnDriver::wake() noexcept;  // any thread
 ```
@@ -213,6 +215,53 @@ Why the group's later records fail too, and not only the oversized one:
 A record that large means the segment is too small for the group's commands or manifests: the
 first record's budget above names the segment size a command needs.
 
+## The turn's buffers
+
+A sealed body is copied once, into the turn's bytes (strata `docs/design/rocksdb-parity.md`, D3).
+
+- **The seal moves the body.** A sealer returns its `TurnRecord` by value; the driver moves it into
+  its pending records and `TurnLog::stage` reads its payload in place. A consumer encodes the body
+  once into the payload it hands over, leaving room at its front for any header of its own, so
+  sealing copies nothing. The log's 25-byte record header needs no room there: the emitter takes
+  it as a separate piece.
+- **Framed in place.** `stage()` frames each record's header (`turn_log_detail::header`, on the
+  stack) and payload straight into fragments of the turn's buffer (`framing::Emitter::record(head,
+  body, ...)`), with no `logical()` string first. A forward copy reads its original back through
+  `framing::RecordReader` straight into the copy's fragments, verifying the original's fragments,
+  its record header (kind, group, sequence) and its size (`Live` keeps each live record's payload
+  size in its padding).
+- **Laid out, not written.** Whether forward copies fit an empty segment (`fits()`, `fitting()`)
+  is answered by a measuring emitter, which places fragments and manifests without a byte or a
+  read. A turn past the current segment's rest is written once more, at the next segment's start.
+- **Reused.** One turn's bytes, notes, manifest and `next` map, and the live index's map nodes,
+  pass to the next turn emptied, so a warm turn allocates nothing. The spare map nodes never
+  outnumber what their map held at its largest. Measuring lays a turn out in the turn's own
+  manifest, and a forward copy's block headers stream through a stack buffer, so the log keeps no
+  buffer beside the turn's.
+
+- **Handed back.** A sealer registered with a recycler gets each sealed record's payload back,
+  cleared with its capacity kept, so it encodes its next body into the same buffer and a warm
+  sealer allocates nothing across turns. The driver keeps a sealed payload in flight and hands it
+  back in `completed()`, after the log's completion and the waiters' resumption: the turn is
+  durable before the buffer can be reused, and before anything citing it publishes. A recycler
+  runs as a sealer call does, on the loop with no driver lock held and `unseal()` waiting for it;
+  it cannot stage records, and its throw fails the driver once the turn's records are
+  acknowledged, as a repeat sealer call's does. A payload whose sealer was unsealed or replaced
+  while its turn was in flight, or whose sealer has no recycler, is freed; a failed turn hands
+  nothing back. A staged record's payload is freed once `stage()` has framed it, as before.
+  An unsealed sealer's function and recycler, with their captures, stay alive until the turn in
+  flight completes: an owner that `unseal()`s must not count on its captures being released then.
+- **The driver's own buffers.** Its pending and in-flight vectors, the turn's record list and
+  the sealing order keep their capacity across turns, one buffer each, so a warm turn through the
+  driver allocates nothing in `begin()` or `completed()`. What they keep is sized by the largest
+  turn, never by the groups a host has held: a parked group costs the host no heap.
+
+Measured (`test/turn_buffers_probe.cc`, the same source built against journal:178030b and this
+code, faultfs, one `strict` job, 261120-201407-998e89, three alternations): a warm turn of 32
+records from 8 groups, 384,800 body bytes, allocated 122.5 times and 1.91 MB in `stage()` and
+`completed()` before, about five times its bodies, and took 155-170 us at the fastest of 96;
+it now allocates nothing and takes 58-61 us, 2.6 times less.
+
 ## Asking for a turn
 
 A turn starts when a record is pending, as before; when `wake()` was called since the last turn
@@ -282,5 +331,18 @@ staged records' bound:
 | `forget` | Forgetting a refused group retires through the open record past the refused ones (3 after a refused 2), as a plain group's through 2: a wait on it fails `group_closed`, and the reopened incarnation's first record does not acknowledge it |
 | `crash` | Power cut at every I/O operation of two waves, 6 seeds, cuts between two turns of one wave counted: recovery keeps every acknowledged record and the in-flight turn whole or absent |
 
+`test/turn_buffers_test.cc`, one CTest entry per case (`journal_turn_buffers_<case>`), covers the
+turn's buffers:
+
+| Case | Shows |
+|---|---|
+| `bytes` | Every record kind, 15 size classes, 6 start positions and manifests empty, small, past half a block and past 4096 groups, at 256-byte to 32 KiB blocks: the head-and-body path, the fill path in uneven pieces and the one-piece path write main's bytes (journal:178030b's emitter and `logical()`, kept in the test), offsets and manifests; a measuring emitter lays them out at the same positions and writes nothing |
+| `turns` | 400 turns on 16 KiB segments, many rolling into a new segment: each turn's bytes and offset are main's, and the log recovers every record |
+| `warm` | Rounds of 32 records from 8 groups (100 B to 40 KiB) and 8 checkpoints: once warm, `stage()` and `completed()` allocate nothing, the bytes are main's, and the payload bytes appended are the bodies' |
+| `seal` | Four sealers hand over 128 KiB bodies through `TurnDriver::begin()`: once warm, sealing and staging allocate under a quarter of one body; every record recovers |
+| `recycle` | Four sealers encode 128 KiB bodies into buffers their recyclers take back, beside a sealer without one: each buffer returns once per turn, cleared with its capacity, only after its turn is durable, and the next body is encoded into it; once warm, `begin()` (sealing, encoding, staging) and `completed()` allocate nothing; a group unsealed in flight gets nothing back; a recycler's throw fails the driver after its turn is acknowledged; every record recovers |
+| `forward` | Four idle groups' checkpoints move forward one per turn: each copy reads back as its original, and once warm a forwarding `stage()` allocates nothing |
+| `power` | Power cut at every mutating I/O operation of runs at 512-byte and 4 KiB blocks whose records cross blocks, roll into new segments and move forward: recovery holds exactly the acknowledged records and the in-flight turn whole or not at all |
+
 `test/turn_seal_mutants.sh` applies each guard's mutant (`one-call`, `framing`, `staged`, `rotation`,
-`unsealed-again`, `repeat-throw`, `deferred-ignored` and the earlier ones); the case named beside it fails at each.
+`unsealed-again`, `repeat-throw`, `deferred-ignored`, `seal-copy`, `stage-copy`, `forward-string`, `drop-recycled` and the earlier ones); the case named beside it fails at each.
