@@ -873,7 +873,10 @@ private:
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
 		opened_.resize(loops_); released_.resize(loops_); dirty_.resize(loops_);
-		auto groups = known(loops_);
+		// The drivers recover against the table as it was before settle_damage stored their verdict,
+		// so each reports the same bounds and losses.
+		const auto groups = known(loops_);
+		settle_damage(groups);
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
 			loop_views_.push_back(view);
@@ -881,13 +884,13 @@ private:
 			drivers_.back()->retire_with([this](std::uint64_t group) { return retired_floor(group); });
 			drivers_.back()->before_turn([this, loop] { commit_transitions(loop); });
 		}
+		// A bounded group's table entry stores its bound before anything serves, so the bound
+		// outlives the damage; the log then keeps its records after the bound, and it is not lost.
 		std::set<std::uint64_t> lost; std::map<std::uint64_t, std::uint64_t> bounded;
 		for (const auto& turns : drivers_) {
 			lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end());
 			for (const auto& [id, found] : turns->recovered().bounded) { bounded[id] = found.bound; }
 		}
-		// A bounded group's table entry stores its bound before anything serves, so the bound
-		// outlives the damage; the log then keeps its records after the bound, and it is not lost.
 		for (auto id : mark_bounds(bounded)) { driver_of(id).keep(id); lost.erase(id); }
 		mark_lost(lost);
 		// The log's groups of a damaged shard are lost with it: their incarnation and serials, which
@@ -920,6 +923,20 @@ private:
 			nodes_[slot] = std::move(kept);
 		}
 		if (removed) { io_->sync_directory(); }
+	}
+	// The verdict of each log's damage, durable before any driver writes its open record: a new
+	// epoch makes the damaged one an earlier epoch, whose turns past its kept turn the next
+	// recovery ignores (rule 5). A read of each log, which writes nothing, gives it; the table
+	// stores each bounded group's bound and marks the lost ids, as the open does after it.
+	void settle_damage(const std::vector<TurnLogGroups>& groups) {
+		std::set<std::uint64_t> lost; std::map<std::uint64_t, std::uint64_t> bounded;
+		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
+			const auto recovered = TurnLog::read(*loop_io(generation_, loop), identity_, options_.turns, groups[loop]);
+			lost.insert(recovered.lost.begin(), recovered.lost.end());
+			for (const auto& [id, found] : recovered.bounded) { bounded[id] = found.bound; }
+		}
+		for (auto id : mark_bounds(bounded)) { lost.erase(id); }
+		mark_lost(lost);
 	}
 	// Stores each bounded group's bound in its open entry, durably, and clears the bound of an
 	// open group whose log kept a checkpoint after it (which supersedes what the damage held).
