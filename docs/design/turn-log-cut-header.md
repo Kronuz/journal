@@ -7,18 +7,14 @@
 
 ## Abstract
 
-The turn log (`RFTW0001`) writes one turn per write and makes it durable with one data barrier. A
-crash leaves each 512-byte sector old or new. When a fragment of the newest turn fails its
-checksum, recovery must decide whether a crash left one of its sectors old (a tear: drop the
-unacknowledged turn) or the bytes changed after they were written (damage: report it). Today it
-decides from content: a sector counts as new only if it holds a whole fragment header of this
-segment (`damaged_fragment`, `include/journal/turn_log.h`). Four shapes hold no such header, and in
-the newest tail each of them drops an acknowledged turn without a report: 36 of 201 damage cases
-in the probe below.
-
-The cut-header shapes the quest asked about are two of the four, 3 of the 36. A layout where no
-fragment header straddles a sector removes both for 0.15-0.18% more bytes, and leaves 30 of 189.
-Only a check of the sector itself tells a damaged sector from an old one in every shape.
+The turn log (`RFTW0001`) writes one turn per write, durable after one data barrier, and a crash
+leaves each 512-byte sector old or new. When a fragment of the newest turn fails its checksum,
+recovery must tell a tear (a sector left old: drop the unacknowledged turn) from damage (bytes
+changed after the write: report it). It decides from content: a sector counts as new only if it
+holds a whole fragment header of this segment (`damaged_fragment`, `include/journal/turn_log.h`).
+Four shapes hold none, and in the newest tail each drops an acknowledged turn without a report: 36
+of 201 damage cases in the probe below. The two cut-header shapes are 3 of the 36; a layout where no
+header straddles a sector removes them for 0.15-0.18% more bytes and leaves 30 of 189 silent.
 
 **Recommendation: per-sector checks (O3b).** Each sector carries an 8-byte trailer, its segment and
 a CRC-32C over its data, and fragment headers shrink from 24 bytes to 4. Every damaged sector the
@@ -52,13 +48,11 @@ In the newest tail an unproven failure drops the acknowledged turn W as a torn t
 
 **O1, a fragment header never straddles a sector.** The emitter pads to the sector's end when fewer
 than 24 bytes remain there before a fragment header, and every reader skips the same bytes. Closes
-U1 and U2, since every header is whole in its sector; leaves U3 and U4. F's header then proves s by
-naming the segment and epoch after a writer's type and reserved byte, so F3 bears more weight: a
-stale record whose host-chosen group id has byte 6 in 1-4 and byte 7 zero, followed by a sequence
-equal to the segment and a payload starting with the epoch, reads as F's header and turns a tear
-into reported damage. The probe's forged `f3` case reads as damage at every layout. A header-only
-check (epoch cut to 32 bits, a CRC-32C of the header in the other 4) would close F3 at no space
-cost; it is analysed, not prototyped.
+U1 and U2, since every header is whole in its sector; leaves U3 and U4. F's header then proves s alone, so F3
+bears more weight: a stale record whose host-chosen group id reads as a writer's type and reserved
+byte, before a sequence equal to the segment and a payload starting with the epoch, turns a tear
+into reported damage (the probe's forged `f3` case does, at every layout). A header-only CRC in
+half of the epoch's 8 bytes would close F3 at no space cost; it is not prototyped.
 
 **O2, a turn's write ends at a sector boundary.** No two writes share a sector. Closes U1 only where
 F's write starts in s; costs 28-31% more bytes on T9's workload, because each turn pads half a
@@ -75,28 +69,23 @@ stored). A sector then reads four ways, decided by the sector alone:
 | all zeros | never written |
 | anything else | damage: a crash leaves each sector old or new, and both verify |
 
-A write covers whole sectors: it rewrites its first sector's earlier bytes (the log keeps the last
-partial sector in memory) and zero-fills its last sector up to the trailer. A failing fragment needs
-no proof: if every sector it spans verifies, one is an older version, so it is a tear; if one fails,
-that is damage. **O3a** keeps fragments as they are. **O3b** also drops what the sector check makes
+A write covers whole sectors (D3). A failing fragment needs no proof: if every sector it spans
+verifies, one is an older version, a tear; if one fails, that is damage. **O3a** keeps fragments as they are. **O3b** also drops what the sector check makes
 redundant: the fragment's CRC, segment and epoch (one open writes one segment, so the block
 header's epoch serves), and the block header's CRC. A fragment header becomes length (2), type (1),
 reserved (1).
 
-**O4, a per-sector write stamp.** A trailer naming the last write that touched the sector, under a
-check of the stamp alone. It closes the same cases as O3 for one damaged byte at O3a's space, but
-keeps every fragment checksum and needs each failing fragment's write identified. O3b closes them
-with less code and fewer bytes.
+**O4, a per-sector write stamp**, checked alone, closes O3's cases at O3a's space but keeps every
+fragment checksum and needs each failing fragment's write identified: more code, more bytes.
 
 ## What each option closes
 
-Probe `test/cut_header_probe.cc`, built once per layout (`-DJOURNAL_LAYOUT=0`, 1, 2). Newest tail:
-24 seeds at 2048 and 4096-byte blocks; the log opens three times (a power cut mid-turn, a clean
-close, then 0-21 turns and W); a byte is flipped at 3 offsets in each later sector of each W
-fragment that crosses a sector, and the log is recovered. Every subset of W's changed sectors left
-old (1024 random subsets past 10 sectors) must read as a tear. One run of 48, seed 20 at 4096-byte
-blocks, has W open a new segment, which has no old sectors to leave; it is counted and skipped. O3
-is a model: a damaged sector equals none of its written versions, so its check fails there. Each
+Probe `test/cut_header_probe.cc`, built per layout (`-DJOURNAL_LAYOUT=0`, 1, 2): 24 seeds at 2048
+and 4096-byte blocks; the log opens three times (a power cut mid-turn, a clean close, then 0-21
+turns and W); a byte flips at 3 offsets in each later sector of each W fragment crossing a sector.
+Every subset of W's changed sectors left old (1024 random ones past 10) must read as a tear. One
+run of 48 (seed 20, 4096-byte blocks) has W open a new segment, with no old sectors, and is skipped.
+O3 is a model: a damaged sector equals none of its written versions, so its check fails. Each
 layout places fragments differently, so each counts its own cases.
 
 | Newest-tail damage, by shape | O0 (layout 0) | O1 (layout 1) | O2 (layout 2) | O3 (model, layout 0's cases) |
@@ -109,8 +98,8 @@ layout places fragments differently, so each counts its own cases.
 | **silent of all cases** | **36 of 201** | **30 of 189** | **36 of 159** | **0 of 201** |
 | tears read as damage or loss | 0 of 427 | 0 of 417 | 0 of 313 | 0 (a tear leaves each sector a version) |
 
-Jobs: layout 0 PROBE_L0, layout 1 PROBE_L1, layout 2 PROBE_L2 at journal:8485149; layout 0 at
-journal main (journal:a3eecb5 plus the probe, journal:b335b69) PROBE_MAIN, which gives layout 0's
+Jobs: layout 0 261122-211721-cd9e33, layout 1 261122-211725-8b1268, layout 2 261122-211728-5f7c2a at journal:8485149; layout 0 at
+journal main (journal:a3eecb5 plus the probe, journal:b335b69) 261122-212211-6e741f, which gives layout 0's
 counts on the landed code. The durability review's probe counted 36 of 210 on its own seeds.
 
 BLOCKS
@@ -153,9 +142,8 @@ turn (which O3b's in-place emitter avoids), no trailers.
 | 2 | 48.0 | 20.91 ms | 47.8 | 20.95 ms |
 | 3 (O3's write) | 48.0 | 20.94 ms | 47.4 | 20.97 ms |
 
-The barrier, 21 ms, dominates each turn, and the rounds spread 0.1-0.2 ms (p50) and 1-2 turns/s, so
-the bench cannot see a CPU cost under about 0.1 ms; p99 ranges 22-42 ms in every layout, from the
-flush. O3's whole-sector write covers 500-600 bytes more than the turn (table above); both ends lie
+The 21 ms barrier dominates, and rounds spread up to 0.18 ms (p50), so the bench cannot see a CPU
+cost below that; p99 is 22-42 ms in every layout. O3's write covers 500-600 bytes more than the turn,
 in pages the turn already dirties, so the pages written back are the same.
 
 ## Decisions
@@ -181,16 +169,12 @@ in pages the turn already dirties, so the pages written back are the same.
 
 ## Interactions
 
-- **journal-turn-buffers** (landed). It frames each record in place, in pieces, into the turn's
-  buffer, and reads forward copies back through `framing::RecordReader`. O3b keeps both: the
-  emitter's append splits each piece at a sector's 504th byte and leaves the trailer's 8 bytes,
-  sealing each sector's CRC when the turn is complete, so a body is still copied once;
-  `Emitter::measure` works in logical positions unchanged; `RecordReader` reads whole sectors and
-  verifies each before handing its data on. Its `bytes` test compares against a reference emitter
-  byte for byte, so its reference changes with the format.
-- **journal-lost-bound** (landed). It consumes damage reports and block manifests (rules 3-5) and
-  never inspects how damage was found, so no option conflicts with it. Under O3 the shapes that now
-  drop the newest turn silently are reported, so their groups are bounded or lost loudly instead.
+- **journal-turn-buffers** (landed) frames each record in place into the turn's buffer and reads
+  forward copies through `framing::RecordReader`. O3b keeps both: the emitter splits each piece at a
+  sector's 504th byte and seals each sector's CRC when the turn completes, so a body is still copied
+  once; `RecordReader` verifies each sector before handing its data on.
+- **journal-lost-bound** (landed) consumes damage reports and manifests (rules 3-5), never how
+  damage was found, so no option conflicts with it; under O3 the four shapes cost groups loudly.
 - **The turn bound** (`turn_bound`, `turn_room`, docs/mechanisms/turn-seal.md) must scale by 512/504
   and drop the 20 fragment bytes under O3b; under O1 each fragment costs up to 23 more bytes.
 
