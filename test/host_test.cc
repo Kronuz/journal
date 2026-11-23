@@ -1188,6 +1188,13 @@ void park_mid_turn() {
 	check(host->driver(0).records(1).size() == 2 && host->driver(0).records(3).size() == 1, "the turn's group and the held one recover their records");
 }
 
+// A turn-log segment's data: each sector's first 504 bytes, where a record's bytes run unbroken.
+std::string sector_data(std::string_view file) {
+	std::string bytes;
+	for (std::size_t at = 0; at < file.size(); at += j::turn_log_detail::sector_bytes) { bytes.append(file.substr(at, j::turn_log_detail::sector_data)); }
+	return bytes;
+}
+
 // Review F3: as idle_damage, with the second block's header damaged too, so no manifest names
 // the damaged block's groups. Recovery reports the damage, and the woken group, whose table
 // entry is open before its turn (D5), is lost rather than read back as parked.
@@ -1212,9 +1219,8 @@ void idle_unmanifested() {
 		for (std::uint64_t s = 2; s < 6; ++s) { turns.stage(j::TurnRecord{6, s, j::TurnRecordKind::Batch, "later" + std::to_string(s)}); idle::commit(*host); }
 	}
 	std::string segment;
-	for (const auto& name : disk.list("host")) { if (name.starts_with("l") && disk.view("host/" + name).find(marker.substr(0, 900)) != std::string_view::npos) { segment = name; } }
-	const auto view = disk.view("host/" + segment);
-	const auto first = (view.find(marker.substr(0, 900)) / 1024 + 1) * 1024;
+	for (const auto& name : disk.list("host")) { if (name.starts_with("l") && sector_data(disk.view("host/" + name)).find(marker.substr(0, 900)) != std::string::npos) { segment = name; } }
+	const auto first = (j::turn_log_detail::file_offset(sector_data(disk.view("host/" + segment)).find('Z')) / 1024 + 1) * 1024;
 	{
 		auto file = host_io(disk)->open_existing(segment);
 		for (std::uint64_t at : {first + 512, first + 1024, first + 1024 + 512}) { file->write_at(at, std::string(1, 'Y')); }
@@ -1253,10 +1259,9 @@ void idle_damage() {
 	}
 	// The batch's first block holds its fragment header; the two after it are the batch alone.
 	std::string segment;
-	for (const auto& name : disk.list("host")) { if (name.starts_with("l") && disk.view("host/" + name).find(marker.substr(0, 900)) != std::string_view::npos) { segment = name; } }
+	for (const auto& name : disk.list("host")) { if (name.starts_with("l") && sector_data(disk.view("host/" + name)).find(marker.substr(0, 900)) != std::string::npos) { segment = name; } }
 	check(!segment.empty(), "the woken group's batch is in the log");
-	const auto view = disk.view("host/" + segment);
-	const auto first = (view.find(marker.substr(0, 900)) / 1024 + 1) * 1024;
+	const auto first = (j::turn_log_detail::file_offset(sector_data(disk.view("host/" + segment)).find('Z')) / 1024 + 1) * 1024;
 	{
 		auto file = host_io(disk)->open_existing(segment);
 		// A byte of each of two blocks' payloads; idle_unmanifested damages the second's header too.
@@ -1267,10 +1272,11 @@ void idle_damage() {
 	check(host->driver(0).recovered().damaged, "the log reads the damage");
 	check(host->status(1) == j::GroupStatus::bounded && host->bound(1) == woke + 1 && host->driver(0).records(1).empty(), "the woken group is bounded at its damaged batch, with no record after it");
 	for (std::uint64_t g = 2; g <= 5; ++g) { check(host->status(g) == j::GroupStatus::closed && host->entry(g)->manifest == "p" + std::to_string(g), "a parked group opens from its table record: group " + std::to_string(g)); }
-	// Group 6's first later record shares the block of the batch's last fragment, which the damage
-	// left orphaned, so that block's manifest bounds group 6 there: it keeps the records after it.
-	const std::vector<j::TurnRecord> after{{6, 3, j::TurnRecordKind::Batch, "later3"}, {6, 4, j::TurnRecordKind::Batch, "later4"}, {6, 5, j::TurnRecordKind::Batch, "later5"}};
-	check(host->status(6) == j::GroupStatus::bounded && host->bound(6) == 2 && host->driver(0).records(6) == after, "the group that wrote after the damage is bounded at 2 and keeps records 3 to 5");
+	// Group 6's later records follow the batch's last fragment in the block after the damaged ones,
+	// and no manifest of a damaged block names group 6: it keeps every record.
+	const std::vector<j::TurnRecord> later{{6, 2, j::TurnRecordKind::Batch, "later2"}, {6, 3, j::TurnRecordKind::Batch, "later3"}, {6, 4, j::TurnRecordKind::Batch, "later4"}, {6, 5, j::TurnRecordKind::Batch, "later5"}};
+	const auto& sixth = host->driver(0).records(6);
+	check(host->status(6) == j::GroupStatus::stored && sixth.size() == 5 && sixth.front().sequence == 1 && std::vector<j::TurnRecord>(sixth.begin() + 1, sixth.end()) == later, "the group that wrote after the damage keeps every record");
 	// Group 1's reader holds it through its checkpoint record, below the bound: it loses it.
 	host->lose(1);
 	check(host->status(1) == j::GroupStatus::lost, "a reader below the bound loses the group");

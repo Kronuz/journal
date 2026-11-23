@@ -51,16 +51,23 @@ std::shared_ptr<fl::io> host_io(fl::filesystem& disk) {
 }
 std::unique_ptr<j::Host> open(fl::filesystem& disk) { return std::make_unique<j::Host>(host_io(disk), host_identity, j::HostOptions{1, options}); }
 void commit(j::Host& host) { while (!host.driver(0).idle()) { host.driver(0).commit(); } }
-// The segment holding `bytes`, and the offset of their first byte.
+// Positions are data bytes (each sector's first 504), as the log's; a block holds block_data of them.
+const std::uint64_t block_data = j::turn_log_detail::data_bytes(options.block_bytes);
+std::string data(fl::filesystem& disk, const std::string& segment) {
+	const auto file = disk.view("host/" + segment); std::string bytes;
+	for (std::size_t at = 0; at < file.size(); at += j::turn_log_detail::sector_bytes) { bytes.append(file.substr(at, j::turn_log_detail::sector_data)); }
+	return bytes;
+}
+// The segment holding `bytes`, and the position of their first byte.
 std::pair<std::string, std::uint64_t> find(fl::filesystem& disk, const std::string& bytes) {
 	for (const auto& name : disk.list("host")) {
 		if (!name.starts_with("l")) { continue; }
-		if (auto at = disk.view("host/" + name).find(bytes); at != std::string_view::npos) { return {name, at}; }
+		if (auto at = data(disk, name).find(bytes); at != std::string::npos) { return {name, at}; }
 	}
 	return {};
 }
-// The offset just past the last copy of `bytes` in `segment`.
-std::uint64_t end_of(fl::filesystem& disk, const std::string& segment, const std::string& bytes) { return disk.view("host/" + segment).rfind(bytes) + bytes.size(); }
+// The position just past the last copy of `bytes` in `segment`.
+std::uint64_t end_of(fl::filesystem& disk, const std::string& segment, const std::string& bytes) { return data(disk, segment).rfind(bytes) + bytes.size(); }
 void overwrite(fl::filesystem& disk, const std::string& name, std::uint64_t offset, std::string_view bytes) {
 	auto file = host_io(disk)->open_existing(name);
 	file->write_at(offset, bytes); file->sync();
@@ -79,7 +86,7 @@ bool refused(j::Host& host, std::uint64_t group) {
 }
 
 // Groups 1-6 (1 loop, 1 KiB blocks). Turn A puts a 100-byte batch of groups 1-4, each its
-// sequence 2, in one block X, between two batches of group 6 (2,290 and 2,000 bytes) that end in
+// sequence 2, in one block X, between two batches of group 6 (2,450 and 2,000 bytes) that end in
 // X and start in it, so X's manifest names groups 1-4 at 2 and group 6 at 3. After it: group 1 two batches,
 // group 3 a checkpoint, group 4 one batch, groups 5 and 6 a checkpoint; group 2 nothing.
 struct Layout { Records written; std::string segment; std::uint64_t block = 0, damaged = 0; };
@@ -98,7 +105,7 @@ Layout populate(fl::filesystem& disk) {
 		auto host = open(disk);
 		for (std::uint64_t g = 1; g <= 6; ++g) { host->create_group(g); stage(*host, w, g, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)); }
 		commit(*host);
-		stage(*host, w, 6, j::TurnRecordKind::Batch, run('F', 2290)); commit(*host);
+		stage(*host, w, 6, j::TurnRecordKind::Batch, run('F', 2450)); commit(*host);
 		for (std::uint64_t g = 1; g <= 4; ++g) { stage(*host, w, g, j::TurnRecordKind::Batch, run(static_cast<char>('a' + g), 100)); }
 		commit(*host);
 		stage(*host, w, 6, j::TurnRecordKind::Batch, run('G', 2000)); commit(*host);
@@ -108,20 +115,23 @@ Layout populate(fl::filesystem& disk) {
 		stage(*host, w, 1, j::TurnRecordKind::Batch, "one-4"); commit(*host);
 	}
 	const auto [segment, at] = find(disk, run('b', 100));
-	layout.segment = segment; layout.block = at / options.block_bytes;
+	layout.segment = segment; layout.block = at / block_data;
 	for (std::uint64_t g = 1; g <= 4; ++g) {
 		const auto [name, offset] = find(disk, run(static_cast<char>('a' + g), 100));
-		check(name == segment && offset / options.block_bytes == layout.block && (offset + 99) / options.block_bytes == layout.block, "turn A's batch of group " + std::to_string(g) + " is in block X");
+		check(name == segment && offset / block_data == layout.block && (offset + 99) / block_data == layout.block, "turn A's batch of group " + std::to_string(g) + " is in block X");
 	}
 	const auto f = end_of(disk, segment, run('F', 50)), g = find(disk, run('G', 50)).second;
-	check((f - 1) / options.block_bytes == layout.block && g / options.block_bytes == layout.block, "group 6's batches end and start in block X");
-	layout.damaged = at + 50;
+	check((f - 1) / block_data == layout.block && g / block_data == layout.block, "group 6's batches end and start in block X");
+	// A byte in X's second sector, past turn A's first batch: X's header stays readable.
+	layout.damaged = (at / j::turn_log_detail::sector_data + 1) * j::turn_log_detail::sector_data + 50;
+	check(layout.damaged / block_data == layout.block, "the damaged byte is in block X");
 	return layout;
 }
-// A payload byte of a record spanning blocks, past its block's header: the middle of a 3,000-byte
-// payload starting at `offset` is in a block the record fills.
-std::uint64_t middle(std::uint64_t offset) { const auto at = offset + 1500; return at % options.block_bytes < 256 ? at + 300 : at; }
-void damage(fl::filesystem& disk, const std::string& segment, std::uint64_t offset) {
+// A payload byte of a record spanning blocks, past its block's header sector: the middle of a
+// 3,000-byte payload starting at `offset` is in a block the record fills.
+std::uint64_t middle(std::uint64_t offset) { const auto at = offset + 1500; return at % block_data < j::turn_log_detail::sector_data ? at + j::turn_log_detail::sector_data : at; }
+void damage(fl::filesystem& disk, const std::string& segment, std::uint64_t position) {
+	const auto offset = j::turn_log_detail::file_offset(position);
 	const char flipped = static_cast<char>(disk.view("host/" + segment)[offset] ^ 0x5a);
 	overwrite(disk, segment, offset, std::string_view(&flipped, 1));
 }
@@ -173,7 +183,7 @@ void crash() {
 	fl::filesystem base;
 	auto layout = populate(base);
 	damage(base, layout.segment, layout.damaged);
-	const std::string original(1, static_cast<char>(base.view("host/" + layout.segment)[layout.damaged] ^ 0x5a));
+	const std::string original(1, static_cast<char>(base.view("host/" + layout.segment)[j::turn_log_detail::file_offset(layout.damaged)] ^ 0x5a));
 	std::uint64_t total = 0;
 	{
 		fl::filesystem probe = base.snapshot();
@@ -194,7 +204,7 @@ void crash() {
 			auto host = open(disk);
 			check(host->status(1) == j::GroupStatus::bounded && host->bound(1) == 2, "group 1 is bounded at 2 after a cut: " + at);
 		}
-		overwrite(disk, layout.segment, layout.damaged, original);
+		overwrite(disk, layout.segment, j::turn_log_detail::file_offset(layout.damaged), original);
 		auto host = open(disk);
 		check(!host->driver(0).recovered().damaged, "the repaired log shows no damage: " + at);
 		check(host->status(1) == j::GroupStatus::bounded && host->bound(1) == 2 && host->driver(0).records(1) == after(layout.written[1], 2), "the table keeps the bound and the records through it gone: " + at);
@@ -264,7 +274,7 @@ void retention() {
 // sector. A byte flipped in each fragment makes one gap from W into W+1, whose manifest alone
 // names batch 3: group 1 is lost, or bounded at 3 or above, never at 2.
 void spans() {
-	const std::uint64_t block = options.block_bytes, sector = 512;
+	const std::uint64_t block = block_data, sector = j::turn_log_detail::sector_data;
 	for (std::size_t filler = 8; filler < 2000; ++filler) {
 		fl::filesystem disk;
 		Records w;
@@ -278,8 +288,8 @@ void spans() {
 		const auto [segment, q] = find(disk, run('Q', 16));
 		const auto k = find(disk, run('~', 8)).second, z = find(disk, run('Z', 40)).second;
 		if (segment.empty()) { continue; }
-		const auto at = q / block, first = q - j::turn_log_detail::record_header - 24;  // Q's first fragment
-		const bool fits = first / block == at && first % block >= sector && first % block + 24 + j::turn_log_detail::record_header + 700 > block &&
+		const auto at = q / block, first = q - j::turn_log_detail::record_header - j::turn_log_detail::fragment_header;  // Q's first fragment
+		const bool fits = first / block == at && first % block >= sector && first % block + j::turn_log_detail::fragment_header + j::turn_log_detail::record_header + 700 > block &&
 			k / block == at && k < first && z / block == at + 1 && (z + 40) % block < sector && z > (at + 1) * block;
 		if (!fits) { continue; }
 		damage(disk, segment, q + 10); damage(disk, segment, z + 10);
