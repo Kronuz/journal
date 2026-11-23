@@ -20,11 +20,12 @@
  * THE SOFTWARE.
  */
 
-// RFTW0001: one journal of turns shared by every group on a core (strata Track C, D11).
+// RFTW0002: one journal of turns shared by every group on a core (strata Track C, D11).
 // A turn is the records the core's groups staged, written in one write and made durable
 // by one data barrier. Segments are preallocated, so appends never create files or change
-// sizes; blocks and fragments are bound to their segment and epoch, so bytes left by a
-// recycled segment's earlier use never read as current.
+// sizes. Every 512-byte sector carries its segment and a CRC-32C, so recovery tells a sector
+// this segment wrote from a stale one of a recycled file's earlier use, an unwritten one, and
+// a damaged one (docs/mechanisms/turn-log-damage.md).
 
 #pragma once
 
@@ -41,13 +42,14 @@
 #include <set>
 #include <span>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace kronuz::journal {
 
 struct TurnLogOptions {
 	std::uint64_t segment_bytes = std::uint64_t{64} << 20;  // a multiple of block_bytes
-	std::uint32_t block_bytes = 32 << 10;
+	std::uint32_t block_bytes = 32 << 10;  // a multiple of 512
 	std::size_t spare_segments = 1;  // preallocated ahead of need
 	std::size_t retain_segments = 4;  // past this many, live records move forward
 	std::size_t forward_bytes = 1 << 20;  // moved forward per turn
@@ -106,14 +108,232 @@ struct TurnLogStats {
 };
 
 namespace turn_log_detail {
-inline constexpr std::string_view magic{"RFTW0001", 8};
+inline constexpr std::string_view magic{"RFTW0002", 8};
+// A sector is 504 data bytes, then the segment's low 32 bits and a CRC-32C over the data, all
+// 64 bits of the segment and the sector's 32-bit index in it. Positions are data bytes.
+inline constexpr std::size_t sector_bytes = 512, sector_data = 504;
+// A block header: magic (8), identity (16), segment (8), block (4), epoch (8), the manifest's
+// segment (8), block (4) and count (2), then 16 bytes per manifest entry. A fragment header:
+// length (2), type (1), reserved (1); a zero length ends the segment's data.
+inline constexpr std::size_t header_fixed = 58, fragment_header = 4;
+inline constexpr std::uint16_t no_manifest = 0xffff;
+inline constexpr std::size_t header_bytes(std::uint16_t count) { return header_fixed + (count == no_manifest ? 0 : 16 * std::size_t{count}); }
+// The data bytes `bytes` of whole sectors hold, and the file offset of a data position.
+inline constexpr std::uint64_t data_bytes(std::uint64_t bytes) { return bytes / sector_bytes * sector_data; }
+inline constexpr std::uint64_t file_offset(std::uint64_t position) { return position / sector_data * sector_bytes + position % sector_data; }
+// Blocks are whole sectors; a fragment's length is 16 bits.
+inline constexpr bool valid_block_bytes(std::uint32_t bytes) { return bytes >= sector_bytes && bytes % sector_bytes == 0 && data_bytes(bytes) <= 65535 + fragment_header; }
+// The most groups a block's fragments can name: one per fragment, each at least 5 bytes.
+inline constexpr std::size_t block_groups(std::uint32_t block_bytes) { return (data_bytes(block_bytes) - header_fixed) / (fragment_header + 1); }
+
+inline std::uint32_t sector_check(const char* data, std::uint64_t segment, std::uint64_t index) {
+	char bound[12]; framing::store(bound, segment, 8); framing::store(bound + 8, index, 4);
+	Checksum checksum; checksum.update(data, sector_data); checksum.update(bound, sizeof bound);
+	return checksum.value();
+}
+inline void seal(char* sector, std::uint64_t segment, std::uint64_t index) {
+	framing::store(sector + sector_data, segment, 4); framing::store(sector + sector_data + 4, sector_check(sector, segment, index), 4);
+}
+// What a sector holds: a version this segment wrote, a stale sector of the file's earlier use
+// (the nearest lower segment with its stored low bits, 2^32 below when they are this one's), never
+// written, or damage, which no crash leaves.
+enum class Sector : std::uint8_t { current, stale, zero, damaged };
+inline Sector verdict(const char* sector, std::uint64_t segment, std::uint64_t index) {
+	const auto stored = framing::peek32(std::string_view(sector + sector_data + 4, 4));
+	if (sector_check(sector, segment, index) == stored) { return Sector::current; }
+	const std::uint64_t below = segment - ((segment - framing::peek32(std::string_view(sector + sector_data, 4))) & 0xffff'ffffu);
+	const std::uint64_t older = below != segment ? below : segment - (std::uint64_t{1} << 32);  // wraps past 0: none
+	if (older < segment && sector_check(sector, older, index) == stored) { return Sector::stale; }
+	return std::all_of(sector, sector + sector_bytes, [](char c) { return c == '\0'; }) ? Sector::zero : Sector::damaged;
+}
+
+// What every block header of a segment is bound to.
+struct Stream { Identity identity{}; std::uint32_t block_bytes = 0; std::uint64_t segment = 0, epoch = 0; };
+inline Stream stream(const Identity& identity, std::uint32_t block_bytes, std::uint64_t segment, std::uint64_t epoch) { return {identity, block_bytes, segment, epoch}; }
+
+// Writes records as fragments into blocks from a data position, starting a block's header as the
+// stream enters it and padding a block's tail too short for a fragment. Its bytes are whole sectors
+// from the one holding the start, which begins with `partial`, the data the log wrote there
+// before; seal() zero-fills the last sector's data and writes each sector's trailer. A measuring
+// emitter lays records out, positions and manifests, without writing a byte.
+class Emitter {
+public:
+	Emitter(const Stream& stream, std::uint64_t position, framing::Manifest filling = {}, std::string buffer = {}, std::string_view partial = {})
+		: Emitter(stream, position, std::move(filling), false) {
+		bytes_ = std::move(buffer); bytes_.clear();
+		if (partial.size() != position % sector_data) { throw std::logic_error("turn log: the kept sector is not the position's"); }
+		bytes_.append(partial);
+	}
+	static Emitter measure(const Stream& stream, std::uint64_t position, framing::Manifest filling = {}) { return Emitter(stream, position, std::move(filling), true); }
+	// Returns the position of the record's first fragment. A nonzero group is noted in the
+	// manifest of each block the record touches.
+	std::uint64_t record(std::string_view head, std::string_view body, std::uint64_t group, std::uint64_t sequence) {
+		return record(head, body.size(), [body](std::string& out, std::size_t count) mutable { out.append(body.substr(0, count)); body.remove_prefix(count); }, group, sequence);
+	}
+	// A record of `head` then `size` bytes that `fill(out, count)` appends to `out` in order, each
+	// piece straight into its sector. A measuring emitter never calls it.
+	template <class Fill> std::uint64_t record(std::string_view head, std::uint64_t size, Fill&& fill, std::uint64_t group, std::uint64_t sequence) {
+		const std::uint64_t total = head.size() + size;
+		std::uint64_t done = 0, start = 0;
+		while (done < total) {
+			enter_block();
+			const auto room = block_ - position_ % block_;
+			if (room < fragment_header + 1) { pad(room); continue; }
+			const auto count = std::min<std::uint64_t>(total - done, room - fragment_header);
+			const bool first = done == 0, last = done + count == total;
+			if (first) { start = position_; }
+			if (group) { filling_.groups.raise(group, sequence); }
+			char header[fragment_header]; framing::store(header, count, 2);
+			header[2] = static_cast<char>(first ? (last ? framing::Full : framing::First) : (last ? framing::Last : framing::Middle)); header[3] = '\0';
+			put(std::string_view(header, fragment_header));
+			if (done < head.size()) { put(head.substr(done, std::min<std::uint64_t>(count, head.size() - done))); }
+			for (std::uint64_t left = done + count > head.size() ? done + count - std::max<std::uint64_t>(done, head.size()) : 0; left;) {
+				const auto piece = std::min<std::uint64_t>(left, sector_data - position_ % sector_data);
+				if (!measuring_) {
+					const auto at = bytes_.size(); fill(bytes_, static_cast<std::size_t>(piece));
+					if (bytes_.size() != at + piece) { throw std::logic_error("turn log: a fill wrote other than it was asked"); }
+				}
+				advance(piece); left -= piece;
+			}
+			done += count;
+		}
+		return start;
+	}
+	// Zero-fills the last sector's data and writes each sector's trailer; the bytes are then the write.
+	void seal() {
+		if (measuring_) { return; }
+		if (const auto used = position_ % sector_data) { bytes_.append(sector_data - used + 8, '\0'); }
+		for (std::size_t at = 0; at < bytes_.size(); at += sector_bytes) { turn_log_detail::seal(bytes_.data() + at, stream_.segment, first_ + at / sector_bytes); }
+	}
+	const std::string& bytes() const& noexcept { return bytes_; }
+	std::string bytes() && noexcept { return std::move(bytes_); }
+	std::uint64_t position() const noexcept { return position_; }
+	const framing::Manifest& filling() const& noexcept { return filling_; }
+	framing::Manifest filling() && noexcept { return std::move(filling_); }
+	bool measuring() const noexcept { return measuring_; }
+private:
+	Emitter(const Stream& stream, std::uint64_t position, framing::Manifest filling, bool measuring)
+		: stream_(stream), block_(data_bytes(stream.block_bytes)), position_(position), first_(position / sector_data), filling_(std::move(filling)), measuring_(measuring) {}
+	// Advances the position past `count` data bytes appended, leaving a trailer's room at a sector's end.
+	void advance(std::uint64_t count) {
+		position_ += count;
+		if (!measuring_ && position_ % sector_data == 0) { bytes_.append(8, '\0'); }
+	}
+	void put(std::string_view bytes) {
+		while (!bytes.empty()) {
+			const auto piece = std::min<std::uint64_t>(bytes.size(), sector_data - position_ % sector_data);
+			if (!measuring_) { bytes_.append(bytes.substr(0, piece)); }
+			advance(piece); bytes.remove_prefix(piece);
+		}
+	}
+	void enter_block() {
+		if (position_ % block_) { return; }
+		// A manifest larger than half a block is not kept: damage there costs conservatively.
+		const auto groups = filling_.groups.size();
+		const auto count = filling_.known && header_bytes(static_cast<std::uint16_t>(std::min<std::size_t>(groups, 4096))) <= block_ / 2 ? static_cast<std::uint16_t>(groups) : no_manifest;
+		if (!measuring_) {
+			char fixed[header_fixed];
+			std::copy_n(magic.data(), 8, fixed); std::copy_n(stream_.identity.data(), 16, fixed + 8);
+			framing::store(fixed + 24, stream_.segment, 8); framing::store(fixed + 32, position_ / block_, 4); framing::store(fixed + 36, stream_.epoch, 8);
+			framing::store(fixed + 44, count == no_manifest ? 0 : filling_.segment, 8); framing::store(fixed + 52, count == no_manifest ? 0 : filling_.block, 4); framing::store(fixed + 56, count, 2);
+			put(std::string_view(fixed, header_fixed));
+			if (count != no_manifest) {
+				for (const auto& [group, sequence] : filling_.groups) { char entry[16]; framing::store(entry, group, 8); framing::store(entry + 8, sequence, 8); put(std::string_view(entry, 16)); }
+			}
+		} else { position_ += header_bytes(count); }
+		filling_.known = true; filling_.segment = stream_.segment; filling_.block = static_cast<std::uint32_t>(position_ / block_); filling_.groups.clear();
+	}
+	void pad(std::uint64_t count) { static constexpr char zeros[fragment_header] = {}; put(std::string_view(zeros, count)); }
+	Stream stream_; std::uint64_t block_, position_, first_; framing::Manifest filling_; std::string bytes_; bool measuring_ = false;
+};
+
+// A segment's sectors, read a run at a time and checked as they are used: only this segment's
+// pass, so a stale, unwritten or damaged one is corruption to a reader of acknowledged records.
+class Sectors {
+public:
+	Sectors(File& file, std::uint64_t segment) : file_(file), segment_(segment) {}
+	// The data bytes at [position, position + count), within one block of `block` data bytes.
+	void read(std::uint64_t position, char* to, std::size_t count, std::uint64_t block) {
+		while (count) {
+			const auto sector = position / sector_data;
+			if (sector < first_ || sector >= first_ + loaded_) { load(sector, block); }
+			auto& checked = checked_[sector - first_];
+			const char* bytes = buffer_.data() + (sector - first_) * sector_bytes;
+			if (!checked) {
+				if (verdict(bytes, segment_, sector) != Sector::current) { throw Corruption("log record changed since it was written"); }
+				checked = true;
+			}
+			const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(count, sector_data - position % sector_data));
+			std::copy_n(bytes + position % sector_data, n, to);
+			position += n; to += n; count -= n;
+		}
+	}
+private:
+	static constexpr std::size_t run = 8;  // sectors read at once, held in the reader
+	// Up to `run` sectors from `sector` to its block's end.
+	void load(std::uint64_t sector, std::uint64_t block) {
+		const auto per_block = block / sector_data, end = (sector / per_block + 1) * per_block;
+		loaded_ = static_cast<std::size_t>(std::min<std::uint64_t>(run, end - sector)); first_ = sector; checked_ = {};
+		if (file_.read_at(sector * sector_bytes, std::span<char>(buffer_.data(), loaded_ * sector_bytes)) != loaded_ * sector_bytes) { loaded_ = 0; throw Corruption("short log read"); }
+	}
+	File& file_; std::uint64_t segment_; std::uint64_t first_ = 0; std::size_t loaded_ = 0; std::array<char, run * sector_bytes> buffer_; std::array<bool, run> checked_{};
+};
+
+// Reads back, in order, the record whose first fragment starts at `offset`, checking each block
+// header, fragment and sector on the way, so a record of another segment or epoch is corruption.
+class RecordReader {
+public:
+	RecordReader(File& file, const Stream& stream, std::uint64_t offset) : sectors_(file, stream.segment), stream_(stream), block_(data_bytes(stream.block_bytes)), position_(offset) {}
+	// Reads the record's next `count` bytes to `to`; a record that ends first is corruption.
+	void read(char* to, std::size_t count) {
+		while (count) {
+			if (!left_) { next(); }
+			const auto n = static_cast<std::size_t>(std::min<std::uint64_t>(count, left_));
+			sectors_.read(position_, to, n, block_);
+			position_ += n; left_ -= n; to += n; count -= n;
+		}
+	}
+	// The bytes its current fragment has left, entering the next one when none: 0 once done.
+	std::uint64_t piece() { if (!left_ && !done()) { next(); } return left_; }
+	bool done() const noexcept { return !left_ && (type_ == framing::Full || type_ == framing::Last); }
+private:
+	void next() {
+		if (done()) { throw Corruption("log record shorter than read"); }
+		for (;;) {
+			if (position_ % block_ == 0) { enter_block(); }
+			if (block_ - position_ % block_ >= fragment_header + 1) { break; }
+			position_ += block_ - position_ % block_;
+		}
+		char header[fragment_header]; sectors_.read(position_, header, fragment_header, block_);
+		const std::size_t length = framing::get16(std::string_view(header, 2)); const auto type = static_cast<std::uint8_t>(header[2]);
+		const bool follows = type_ ? type == framing::Middle || type == framing::Last : type == framing::Full || type == framing::First;
+		if (!length || fragment_header + length > block_ - position_ % block_ || !follows || header[3]) { throw Corruption("invalid log fragment"); }
+		type_ = type; left_ = length; position_ += fragment_header;
+	}
+	void enter_block() {
+		char fixed[header_fixed]; sectors_.read(position_, fixed, header_fixed, block_);
+		const std::string_view view(fixed, header_fixed);
+		const auto count = framing::get16(view.substr(56));
+		if (view.substr(0, 8) != magic || view.substr(8, 16) != std::string_view(stream_.identity.data(), 16) || framing::peek64(view.substr(24)) != stream_.segment ||
+			framing::peek32(view.substr(32)) != position_ / block_ || framing::peek64(view.substr(36)) != stream_.epoch || header_bytes(count) + fragment_header >= block_) {
+			throw Corruption("invalid log block header");
+		}
+		position_ += header_bytes(count);
+	}
+	Sectors sectors_; Stream stream_; std::uint64_t block_, position_; std::uint64_t left_ = 0; std::uint8_t type_ = 0;
+};
+// Reads back the record whose first fragment starts at `offset` (RecordReader).
+inline std::string read_record(File& file, const Stream& stream, std::uint64_t offset) {
+	std::string logical;
+	RecordReader reader(file, stream, offset);
+	while (const auto count = reader.piece()) { const auto at = logical.size(); logical.resize(at + count); reader.read(logical.data() + at, count); }
+	return logical;
+}
+
 // A logical record: kind, turn, group and sequence, then the payload.
 inline constexpr std::size_t record_header = 25;
 inline constexpr std::uint8_t end_of_turn = 0x10, open_record = 0x11;
 
-inline framing::Stream stream(const Identity& identity, std::uint32_t block_bytes, std::uint64_t segment, std::uint64_t epoch) {
-	return {magic, identity, block_bytes, segment, epoch, true};
-}
 using RecordHeader = std::array<char, record_header>;
 inline RecordHeader header(std::uint8_t kind, std::uint64_t turn, std::uint64_t group, std::uint64_t sequence) {
 	RecordHeader bytes; bytes[0] = static_cast<char>(kind);
@@ -126,19 +346,20 @@ inline std::string logical(std::uint8_t kind, std::uint64_t turn, std::uint64_t 
 	std::string bytes(view(header(kind, turn, group, sequence))); bytes.append(payload);
 	return bytes;
 }
-// A bound on a turn's bytes in an empty segment, whatever its manifests: each record costs its
-// payload, its header and 40 bytes (a fragment header, a manifest entry); the end-of-turn record
-// is one more; each block adds at most 126 and the first block's manifest half a block.
-// docs/mechanisms/turn-seal.md derives it.
+// A bound on a turn's bytes in an empty segment, whatever its manifests: each record costs at most
+// its payload, its header and 40 bytes (a fragment header, a manifest entry); the end-of-turn record
+// is one more; each block adds at most 126 data bytes and the first block's manifest half a
+// block's; whole sectors hold the data. docs/mechanisms/turn-seal.md derives it.
 inline constexpr std::uint64_t record_cost(std::uint64_t payload) { return payload + record_header + 40; }
 inline constexpr std::uint64_t block_cost = 126;
 inline std::uint64_t turn_bound(std::uint64_t cost, std::uint32_t block_bytes) {
-	const std::uint64_t b = block_bytes, fixed = cost + record_cost(4) + block_cost + b / 2;
-	return fixed + (fixed * block_cost + (b - block_cost) - 1) / (b - block_cost);
+	const std::uint64_t b = data_bytes(block_bytes), fixed = cost + record_cost(4) + block_cost + b / 2;
+	const auto data = fixed + (fixed * block_cost + (b - block_cost) - 1) / (b - block_cost);
+	return (data + sector_data - 1) / sector_data * sector_bytes;
 }
 // The record cost a turn may carry and still encode within `limit` bytes of an empty segment.
 inline std::uint64_t turn_room(std::uint64_t limit, std::uint32_t block_bytes) {
-	const std::uint64_t b = block_bytes, scaled = limit / b * (b - block_cost) + limit % b * (b - block_cost) / b;
+	const std::uint64_t b = data_bytes(block_bytes), data = data_bytes(limit), scaled = data / b * (b - block_cost) + data % b * (b - block_cost) / b;
 	const std::uint64_t fixed = record_cost(4) + block_cost + b / 2;
 	return scaled > fixed ? scaled - fixed : 0;
 }
@@ -161,148 +382,87 @@ inline std::optional<std::uint64_t> segment_number(std::string_view name) {
 // read back as current (unwritten, stale, or damaged).
 struct Item {
 	bool gap = false, tail = false;  // a tail: a segment's gap after its last record
-	bool damage = false;  // a gap holding damage no crash leaves: damaged_header, damaged_fragment
+	bool damage = false;  // a gap holding a sector that failed, or that the device could not read
 	std::uint64_t epoch = 0;
 	std::uint8_t kind = 0;
 	std::uint64_t turn = 0, group = 0, sequence = 0;
 	std::string payload;
 	std::uint64_t segment = 0, offset = 0;  // the record's first fragment; a gap's block start
 	std::uint64_t last = 0;  // a gap's last block whose bytes may begin a lost record
-	std::uint64_t later = 0;  // a gap's highest turn read past a failure in its block, of `epoch`
 };
 // Per described block: its groups' highest sequences, and where the header naming them is.
 struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0, epoch = 0; std::uint32_t block = 0; };
 using Manifests = std::map<std::pair<std::uint64_t, std::uint32_t>, BlockManifest>;
-// Damage no crash leaves, found where a block's header or a fragment fails to verify. A crash
-// leaves each 512-byte sector old or new, and no earlier use of a recycled file holds bytes
-// bound to this segment, so a sector holding them is this segment's. Only a fragment whose header
-// the sector holds whole proves it: a cut header leaves as few as one checksum byte there.
-inline bool verifies_in_sector(std::string_view block, std::size_t from, std::size_t end, std::uint64_t segment) {
-	for (auto p = from; p + framing::fragment_header <= end; ++p) {
-		const auto at = block.substr(p);
-		if (framing::parse_fragment(at, block.size() - p, segment, framing::peek64(at.substr(16))).check == framing::Check::ok) { return true; }
-	}
-	return false;
-}
-inline std::size_t sector_end(std::string_view block, std::uint64_t offset, std::size_t at) {
-	return std::min<std::size_t>(block.size(), at + framing::sector_bytes - (offset + at) % framing::sector_bytes);
-}
-// A header that fails while a fragment of this segment verifies in its sector.
-inline bool damaged_header(std::string_view block, std::uint64_t offset, std::uint64_t segment) {
-	return verifies_in_sector(block, framing::header_bytes(0), sector_end(block, offset, 0), segment);
-}
-// A failing fragment is damage when a later fragment of its segment verifies in its sector; when its
-// header names its segment and epoch with a writer's type and reserved byte, and has a length no
-// writer emits or its sector holds it whole; when its header names them and verifies with its length
-// (at one its sector holds whole), type or reserved byte corrected; or when its header, or a header
-// of its write before it in its sector (`written`), proves that sector and a fragment of the segment
-// verifies in the next sector (docs/mechanisms/turn-log-damage.md).
-inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::size_t at, std::uint64_t segment, std::uint64_t epoch, bool written) {
-	const auto end = sector_end(block, offset, at);
-	if (verifies_in_sector(block, at + 1, end, segment)) { return true; }
-	const auto bytes = block.substr(at);
-	const bool names = at + framing::fragment_header <= end && framing::peek64(bytes.substr(8)) == segment && framing::peek64(bytes.substr(16)) == epoch;
-	const std::size_t length = framing::get16(bytes.substr(4)); const auto type = static_cast<std::uint8_t>(bytes[6]);
-	const bool fits = length && framing::fragment_header + length <= block.size() - at;
-	// Old bytes can name the segment and epoch, as a stale record's group and sequence do; the
-	// type and reserved byte a writer emits before them are what make the header this write's.
-	const bool named = names && type >= framing::Full && type <= framing::Last && !bytes[7];
-	if (named && (!fits || at + framing::fragment_header + length <= end)) { return true; }
-	// Crossing its sector: a fragment verifying in the next sector proves that sector too.
-	if ((named || written) && end < block.size() && verifies_in_sector(block, end, sector_end(block, offset, end), segment)) { return true; }
-	if (!names) { return false; }
-	// Otherwise it reads as a tear unless one damaged field of its header is all that fails.
-	std::string header(bytes.substr(4, framing::fragment_header - 4));
-	auto verifies = [&](std::size_t payload) {
-		Checksum checksum; checksum.update(header); checksum.update(bytes.substr(framing::fragment_header, payload));
-		return checksum.value() == framing::peek32(bytes);
-	};
-	for (std::size_t whole = 1; at + framing::fragment_header + whole <= end; ++whole) {
-		header[0] = static_cast<char>(whole); header[1] = static_cast<char>(whole >> 8);
-		if (verifies(whole)) { return true; }
-	}
-	if (named || !fits) { return false; }
-	header[0] = bytes[4]; header[1] = bytes[5]; header[3] = '\0';
-	for (auto fragment : {framing::Full, framing::First, framing::Middle, framing::Last}) {
-		header[2] = static_cast<char>(fragment);
-		if (verifies(length)) { return true; }
-	}
-	return false;
-}
-// The epoch and highest turn that records starting in `block` past `from` name, by fragments of
-// this segment that verify there; zero when none does. The scan stops at a failure, so a later
-// write there would go unread: recovery compares this turn with the failing one's.
-inline std::pair<std::uint64_t, std::uint64_t> later_turn(std::string_view block, std::size_t from, std::uint64_t segment) {
-	// Found by the segment number's first nonzero byte, so a block of zeros costs one memchr.
-	char number[8]; framing::store(number, segment, 8);
-	const auto zeros = static_cast<std::size_t>(std::countr_zero(segment) / 8); const std::string_view anchor(number + zeros, 8 - zeros);
-	std::pair<std::uint64_t, std::uint64_t> later{0, 0};
-	for (auto found = block.find(anchor, from + 8 + zeros); found != std::string_view::npos && found - zeros + 16 <= block.size(); found = block.find(anchor, found + 1)) {
-		const auto at = found - zeros - 8;  // where a fragment naming the segment there starts
-		const auto epoch = framing::peek64(block.substr(at + 16));
-		const auto fragment = framing::parse_fragment(block.substr(at), block.size() - at, segment, epoch);
-		const bool starts = fragment.type == framing::Full || fragment.type == framing::First;
-		if (fragment.check != framing::Check::ok || !starts || fragment.payload.size() < 9) { continue; }
-		if (const auto turn = framing::peek64(fragment.payload.substr(1)); turn > later.second) { later = {epoch, turn}; }
-	}
-	return later;
-}
+// Reads a segment block by block. Each sector the parse needs decides alone (D4): this segment's
+// is read; a stale or unwritten one, or data that does not parse, ends the block's data (a tear,
+// or the segment's end); a damaged or unreadable one is damage. A gap merges every unreadable run
+// up to the next record.
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
+	const std::uint64_t block = data_bytes(options.block_bytes), per_block = options.block_bytes / sector_bytes;
 	std::uint64_t here = 0;
-	// A gap merges every unreadable run up to the next record. `holds`: this block's bytes may
-	// begin a lost record (a continuation's record began in a block the gap covers already).
-	auto gap = [&](bool holds) {
+	// `holds`: this block's bytes may begin a lost record (a continuation's record began in a block
+	// the gap covers already).
+	auto gap = [&](bool holds, bool damage = false) {
 		if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = item.last = here; items.push_back(std::move(item)); }
 		else if (holds) { items.back().last = here; }
+		if (damage) { items.back().damage = true; }
 	};
-	// What the block holds past an unproven failure: its records go unread. Past a failure inside a
-	// gap, a later write needs a second fault, so only a gap's first block is read (unwritten blocks
-	// cost nothing).
-	auto past = [&](std::string_view block, std::size_t from) {
-		const auto [epoch, turn] = later_turn(block, from, segment);
-		auto& item = items.back();
-		if (turn > item.later) { item.later = turn; item.epoch = epoch; }
+	std::string raw(options.block_bytes, '\0'), data(block, '\0'), partial; std::vector<std::optional<Sector>> verdicts; std::vector<bool> unreadable(per_block);
+	bool assembling = false; std::uint64_t partial_epoch = 0, partial_offset = 0;
+	// The verdict of the sectors holding the block's data [from, from + count): the first that is not current.
+	auto need = [&](std::uint64_t first_sector, std::size_t from, std::size_t count) {
+		for (auto s = from / sector_data; count && s <= (from + count - 1) / sector_data; ++s) {
+			if (!verdicts[s]) {
+				const char* bytes = raw.data() + s * sector_bytes;
+				verdicts[s] = unreadable[s] ? Sector::damaged : verdict(bytes, segment, first_sector + s);
+				if (verdicts[s] == Sector::current) { std::copy_n(bytes, sector_data, data.data() + s * sector_data); }
+			}
+			if (verdicts[s] != Sector::current) { return *verdicts[s]; }
+		}
+		return Sector::current;
 	};
-	std::string block(options.block_bytes, '\0'), partial; bool assembling = false; std::uint64_t partial_epoch = 0, partial_offset = 0;
-	// Where the last header or fragment that verified starts, while it does not end its write.
-	std::optional<std::size_t> in_write;
 	const auto size = std::min(file.size(), options.segment_bytes);
 	for (std::uint64_t offset = 0, index = 0; offset + options.block_bytes <= size; offset += options.block_bytes, ++index) {
-		here = offset;
-		if (file.read_at(offset, block) != block.size()) { gap(true); assembling = false; continue; }
-		std::string_view view(block);
-		const auto header = framing::parse_header(view, stream(identity, options.block_bytes, segment, 0), index);
-		if (header.check != framing::Check::ok) {
-			const bool damage = damaged_header(view, offset, segment);  // else unwritten, stale or torn
-			const bool first = items.empty() || !items.back().gap;
-			gap(damage); assembling = false;
-			if (damage) { items.back().damage = true; }
-			else if (first) { past(view, 1); }
+		here = index * block;
+		// A block that does not read whole is read a sector at a time: only the sectors the device
+		// cannot read are damage, where the parse needs them.
+		auto read = [&](std::uint64_t at, std::span<char> to) {
+			try { return file.read_at(at, to) == to.size(); } catch (const std::system_error&) { return false; }
+		};
+		const bool whole = read(offset, raw);
+		for (std::uint64_t s = 0; s < per_block; ++s) { unreadable[s] = !whole && !read(offset + s * sector_bytes, std::span<char>(raw.data() + s * sector_bytes, sector_bytes)); }
+		verdicts.assign(per_block, std::nullopt);
+		const auto first_sector = index * per_block;
+		const std::string_view view(data);
+		auto fixed = need(first_sector, 0, header_fixed);
+		const auto count = fixed == Sector::current ? framing::get16(view.substr(56)) : 0;
+		const bool shaped = fixed == Sector::current && view.substr(0, 8) == magic && view.substr(8, 16) == std::string_view(identity.data(), 16) &&
+			framing::peek64(view.substr(24)) == segment && framing::peek32(view.substr(32)) == index && header_bytes(count) + fragment_header < block &&
+			(count != no_manifest || (!framing::peek64(view.substr(44)) && !framing::peek32(view.substr(52))));
+		if (shaped && count != no_manifest) { fixed = need(first_sector, header_fixed, header_bytes(count) - header_fixed); }
+		if (!shaped || fixed != Sector::current) {
+			gap(fixed == Sector::damaged, fixed == Sector::damaged); assembling = false;  // else unwritten, stale, torn or not this segment's
 			continue;
 		}
-		const auto epoch = header.epoch; const auto count = header.count; in_write = 0;
-		if (count != framing::no_manifest) {
+		const auto epoch = framing::peek64(view.substr(36));
+		if (count != no_manifest) {
 			auto& manifest = manifests[{framing::peek64(view.substr(44)), framing::peek32(view.substr(52))}];
 			manifest.segment = segment; manifest.block = static_cast<std::uint32_t>(index); manifest.epoch = epoch;
-			const auto entry = framing::header_fixed;
-			for (std::size_t i = 0; i < count; ++i) { manifest.groups[framing::peek64(view.substr(entry + 16 * i))] = framing::peek64(view.substr(entry + 16 * i + 8)); }
+			for (std::size_t i = 0; i < count; ++i) { manifest.groups[framing::peek64(view.substr(header_fixed + 16 * i))] = framing::peek64(view.substr(header_fixed + 16 * i + 8)); }
 		}
-		std::size_t position = header.size;
-		while (options.block_bytes - position >= framing::fragment_header + 1) {
-			const auto fragment = framing::parse_fragment(view.substr(position), options.block_bytes - position, segment, epoch);
-			if (fragment.check != framing::Check::ok) {
-				gap(true); assembling = false;
-				const bool written = in_write && (offset + *in_write) / framing::sector_bytes == (offset + position) / framing::sector_bytes;
-				if (damaged_fragment(view, offset, position, segment, epoch, written)) { items.back().damage = true; }
-				else { past(view, position + 1); }
-				break;
-			}
-			const auto type = fragment.type; const auto payload = fragment.payload; const auto length = payload.size();
-			const auto start = position; position += framing::fragment_header + length;
-			in_write = type == framing::First || type == framing::Middle ? std::optional{start} : std::nullopt;
+		std::size_t position = header_bytes(count);
+		while (block - position >= fragment_header + 1) {
+			auto check = need(first_sector, position, fragment_header);
+			const std::size_t length = check == Sector::current ? framing::get16(view.substr(position)) : 0;
+			const auto type = check == Sector::current ? static_cast<std::uint8_t>(view[position + 2]) : 0;
+			const bool parses = length && fragment_header + length <= block - position && type >= framing::Full && type <= framing::Last && !view[position + 3];
+			if (parses) { check = need(first_sector, position + fragment_header, length); }
+			if (!parses || check != Sector::current) { gap(true, check == Sector::damaged); assembling = false; break; }  // a zero length: the data's end
+			const auto payload = view.substr(position + fragment_header, length);
+			position += fragment_header + length;
 			if (type == framing::Full || type == framing::First) {
 				if (assembling) { gap(false); }
-				partial.assign(payload); partial_epoch = epoch; partial_offset = offset + position - framing::fragment_header - length; assembling = type == framing::First;
+				partial.assign(payload); partial_epoch = epoch; partial_offset = here + position - fragment_header - length; assembling = type == framing::First;
 				if (assembling) { continue; }
 			} else {
 				if (!assembling || partial_epoch != epoch) { gap(false); assembling = false; continue; }
@@ -314,7 +474,6 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			std::string_view record(partial);
 			Item item; item.epoch = epoch; item.segment = segment; item.offset = partial_offset; item.kind = static_cast<std::uint8_t>(record[0]); record.remove_prefix(1);
 			item.turn = get64(record); item.group = get64(record); item.sequence = get64(record); item.payload.assign(record);
-			if (item.kind != end_of_turn && item.kind != open_record) { in_write = start; }
 			items.push_back(std::move(item));
 		}
 	}
@@ -338,7 +497,7 @@ public:
 		next_segment_ = highest_segment_ + 1;
 		begin_segment();
 		data_segments_.insert(segment_);
-		write([&](framing::Emitter& emitter) { emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::open_record, turn_, 0, 0))); });
+		write([&](turn_log_detail::Emitter& emitter) { emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::open_record, turn_, 0, 0)), {}, 0, 0); });
 	}
 	// What a log holds, read without writing to it: a re-partition reads the stored generation.
 	static TurnRecovery read(IO& io, Identity identity, TurnLogOptions options = {}, const TurnLogGroups& known = {}) {
@@ -435,8 +594,8 @@ public:
 		completed();
 		return write.turn;
 	}
-	// The write a staged turn needs: its bytes at an offset of a segment, then one
-	// File::sync_data. A host driving completion I/O issues them and reports back.
+	// The write a staged turn needs: its bytes, whole sectors, at a file offset of a segment, then
+	// one File::sync_data. A host driving completion I/O issues them and reports back.
 	struct TurnWrite { File* file; std::uint64_t offset; std::string_view bytes; std::uint64_t turn; };
 	// The turn's data barrier, through the IO seam; a driver calls it where it would File::sync_data.
 	void flush(const TurnWrite& write) { detail::sync_data_file(io_, *write.file); }
@@ -466,7 +625,7 @@ public:
 		forward_slice();
 		// Each record's header and payload, and each copy read back from its segment, framed
 		// straight into the turn's buffer.
-		auto emit = [&](framing::Emitter& emitter) {
+		auto emit = [&](turn_log_detail::Emitter& emitter) {
 			std::size_t i = 0;
 			for (const auto& record : records) {
 				const auto head = turn_log_detail::header(static_cast<std::uint8_t>(record.kind), turn.turn, record.group, record.sequence);
@@ -488,7 +647,7 @@ public:
 		if (!copies_.empty() && !fits(emit, turn.filling)) { copies_.clear(); }
 		for (const auto& copy : copies_) { turn.notes.push_back({copy.group, copy.sequence, copy.live.kind, copy.live.bytes, true}); }
 		turn.end = encode(emit, turn.bytes, turn.filling);
-		turn.offset = offset_;
+		turn.offset = turn_log_detail::file_offset(offset_ - offset_ % turn_log_detail::sector_data);
 		staged_ = std::move(turn);
 		return {file_.get(), staged_->offset, staged_->bytes, staged_->turn};
 	}
@@ -498,7 +657,7 @@ public:
 		std::size_t n = 0;  // a turn holds at least each record's logical bytes
 		for (std::uint64_t bytes = 0; n < records.size() && (bytes += turn_log_detail::record_header + records[n].payload.size()) <= options_.segment_bytes; ++n) {}
 		auto fit = [&](std::size_t count) {
-			return fits([&](framing::Emitter& emitter) {
+			return fits([&](turn_log_detail::Emitter& emitter) {
 				for (const auto& record : records.first(count)) { emitter.record(turn_log_detail::view(turn_log_detail::header(static_cast<std::uint8_t>(record.kind), turn_ + 1, record.group, record.sequence)), record.payload, record.group, record.sequence); }
 				char tally[4]; framing::store(tally, count, 4);
 				emitter.record(turn_log_detail::view(turn_log_detail::header(turn_log_detail::end_of_turn, turn_ + 1, 0, 0)), std::string_view(tally, 4), 0, 0);
@@ -513,7 +672,7 @@ public:
 	void completed() {
 		if (!staged_) { throw std::logic_error("no turn in flight"); }
 		auto turn = std::move(*staged_); staged_.reset();
-		offset_ = turn.end; std::swap(filling_, turn.filling); ++stats_.barriers; stats_.bytes_written += turn.bytes.size();
+		offset_ = turn.end; keep_partial(turn.bytes); std::swap(filling_, turn.filling); ++stats_.barriers; stats_.bytes_written += turn.bytes.size();
 		turn_ = turn.turn; ++stats_.turns;
 		for (const auto& [group, sequence] : turn.next) { sequences_[group] = sequence; }
 		for (const auto& n : turn.notes) {
@@ -538,7 +697,7 @@ public:
 	std::uint64_t epoch() const noexcept { return epoch_; }
 	std::uint64_t last_turn() const noexcept { return turn_; }
 	std::uint64_t segment() const noexcept { return segment_; }
-	std::uint64_t position() const noexcept { return offset_; }  // in the current segment
+	std::uint64_t position() const noexcept { return offset_; }  // a data position in the current segment
 	std::uint64_t sequence(std::uint64_t group) const {
 		if (auto found = sequences_.find(group); found != sequences_.end()) { return found->second; }
 		auto found = evicted_.find(group); return found == evicted_.end() ? 0 : found->second.first + found->second.live.size() - 1;
@@ -551,7 +710,7 @@ public:
 private:
 	TurnLog(IO& io, Identity identity, TurnLogOptions options) : io_(io), identity_(identity), options_(options) {}
 	static TurnLogOptions valid(TurnLogOptions options) {
-		if (!options.block_bytes || !framing::valid_block_bytes(options.block_bytes) ||
+		if (!turn_log_detail::valid_block_bytes(options.block_bytes) ||
 			options.segment_bytes < options.block_bytes || options.segment_bytes % options.block_bytes) {
 			throw std::invalid_argument("invalid turn log geometry");
 		}
@@ -592,7 +751,7 @@ private:
 	std::vector<TurnRecord> read_live(std::uint64_t group, const std::vector<std::pair<std::uint64_t, Live>>& positions) {
 		std::vector<TurnRecord> records; records.reserve(positions.size());
 		for (const auto& [sequence, live] : positions) {
-			const auto bytes = framing::read_record(reader(live.segment), turn_log_detail::stream(identity_, options_.block_bytes, live.segment, live.epoch), live.offset);
+			const auto bytes = turn_log_detail::read_record(reader(live.segment), turn_log_detail::stream(identity_, options_.block_bytes, live.segment, live.epoch), live.offset);
 			std::string_view logical(bytes);
 			if (logical.size() < turn_log_detail::record_header || static_cast<std::uint8_t>(logical[0]) != static_cast<std::uint8_t>(live.kind)) { throw Corruption("a live record does not read back as itself"); }
 			logical.remove_prefix(1); get64(logical);  // the kind, then the turn
@@ -612,11 +771,11 @@ private:
 	// Whether a turn fits an empty segment, laid out without writing it in `manifest`, a turn
 	// manifest not in use.
 	template <class Emit> bool fits(Emit&& emit, framing::Manifest& manifest) const {
-		manifest.groups.reserve(framing::block_groups(options_.block_bytes)); manifest = filling_;
-		auto empty = framing::Emitter::measure(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(manifest));
+		manifest.groups.reserve(turn_log_detail::block_groups(options_.block_bytes)); manifest = filling_;
+		auto empty = turn_log_detail::Emitter::measure(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(manifest));
 		emit(empty);
 		manifest = std::move(empty).filling();
-		return empty.position() <= options_.segment_bytes;
+		return empty.position() <= turn_log_detail::data_bytes(options_.segment_bytes);
 	}
 	// A live record forward_slice chose; stage() reads it straight into the turn's buffer.
 	struct Copy { std::uint64_t group, sequence; Live live; };
@@ -645,7 +804,7 @@ private:
 	// A copy's payload, read from its original into the emitter's buffer: the original's header
 	// must name the same record, and its payload end where the copy's does.
 	struct Forward {
-		TurnLog& log; const Copy& copy; std::optional<framing::RecordReader> original;
+		TurnLog& log; const Copy& copy; std::optional<turn_log_detail::RecordReader> original;
 		void operator()(std::string& out, std::size_t count) {
 			open();
 			const auto at = out.size(); out.resize(at + count); original->read(out.data() + at, count);
@@ -697,24 +856,26 @@ private:
 	void begin_segment() {
 		if (spares_.empty()) { spares_.push_back(preallocate()); ++stats_.prepared_inline; }
 		file_ = std::move(spares_.front()); spares_.pop_front();
-		segment_ = next_segment_ - 1 - spares_.size(); offset_ = 0;
+		segment_ = next_segment_ - 1 - spares_.size(); offset_ = 0; partial_.clear();
 		data_segments_.insert(segment_);
 	}
-	// Frames a turn into `bytes` from the current position, and `filling` the manifest after it.
-	// A turn never crosses a segment: one that does not fit starts the next one. Returns its end.
+	// Frames a turn into `bytes`, whole sectors from the one holding the current position, and
+	// `filling` the manifest after it. A turn never crosses a segment: one that does not fit starts
+	// the next one. Returns its end.
 	// The manifest reserves what a block can name, so no turn grows it.
 	template <class Emit> std::uint64_t encode(Emit&& emit, std::string& bytes, framing::Manifest& filling) {
-		filling.groups.reserve(framing::block_groups(options_.block_bytes)); filling = filling_;
-		framing::Emitter emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), offset_, std::move(filling), std::move(bytes));
+		filling.groups.reserve(turn_log_detail::block_groups(options_.block_bytes)); filling = filling_;
+		turn_log_detail::Emitter emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), offset_, std::move(filling), std::move(bytes), partial_);
 		emit(emitter);
-		if (emitter.position() > options_.segment_bytes) {
+		if (emitter.position() > turn_log_detail::data_bytes(options_.segment_bytes)) {
 			filling = std::move(emitter).filling(); bytes = std::move(emitter).bytes();
 			if (!fits(emit, filling)) { throw std::length_error("turn exceeds a segment"); }
 			begin_segment();
 			filling = filling_;
-			emitter = framing::Emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(filling), std::move(bytes));
+			emitter = turn_log_detail::Emitter(turn_log_detail::stream(identity_, options_.block_bytes, segment_, epoch_), 0, std::move(filling), std::move(bytes));
 			emit(emitter);
 		}
+		emitter.seal();
 		const auto end = emitter.position();
 		filling = std::move(emitter).filling(); bytes = std::move(emitter).bytes();
 		return end;
@@ -722,10 +883,15 @@ private:
 	template <class Emit> void write(Emit&& emit) {
 		const auto end = encode(emit, spare_.bytes, spare_.filling);
 		try {
-			if (file_->write_at(offset_, spare_.bytes) != spare_.bytes.size()) { throw std::runtime_error("short turn log write"); }
+			if (file_->write_at(turn_log_detail::file_offset(offset_ - offset_ % turn_log_detail::sector_data), spare_.bytes) != spare_.bytes.size()) { throw std::runtime_error("short turn log write"); }
 			detail::sync_data_file(io_, *file_);
 		} catch (...) { failed_ = true; throw; }
-		offset_ = end; std::swap(filling_, spare_.filling); ++stats_.barriers; stats_.bytes_written += spare_.bytes.size();
+		offset_ = end; keep_partial(spare_.bytes); std::swap(filling_, spare_.filling); ++stats_.barriers; stats_.bytes_written += spare_.bytes.size();
+	}
+	// Keeps the data a write left in its last sector, where the next write starts.
+	void keep_partial(const std::string& bytes) {
+		const auto keep = offset_ % turn_log_detail::sector_data;
+		partial_.assign(keep ? bytes.data() + bytes.size() - turn_log_detail::sector_bytes : bytes.data(), keep);
 	}
 	TurnRecovery recover(const TurnLogGroups& known);
 
@@ -739,6 +905,7 @@ private:
 	std::map<std::uint64_t, Bounded> bounded_;  // bounded lost groups, until keep()
 	std::set<std::uint64_t> data_segments_; std::map<std::uint64_t, std::unique_ptr<File>> readers_;
 	framing::Manifest filling_;  // unknown until the first block this open enters
+	std::string partial_;  // the data before offset_ in its sector, which the next write rewrites
 	struct Note { std::uint64_t group, sequence; TurnRecordKind kind; std::size_t bytes; bool copy; std::uint64_t offset = 0; };
 	struct Staged { std::uint64_t turn = 0, offset = 0, end = 0; std::map<std::uint64_t, std::uint64_t> next; std::vector<Note> notes; framing::Manifest filling; std::string bytes; };
 	std::optional<Staged> staged_;
@@ -753,6 +920,7 @@ private:
 // that open kept; later turns are ignored, and damage at or before it is corruption.
 inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	using namespace turn_log_detail;
+	const auto block_data = data_bytes(options_.block_bytes);
 	// The table's floor for a group: its records through its closed base or its stored bound.
 	auto held = [](const std::map<std::uint64_t, std::uint64_t>& floors, std::uint64_t group) { auto found = floors.find(group); return found == floors.end() ? 0 : found->second; };
 	auto superseded = [&](std::uint64_t group, std::uint64_t sequence) { return sequence <= std::max(held(known.base, group), held(known.bound, group)); };
@@ -810,7 +978,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 		if (!counted.insert(g).second) { return; }
 		damaged = true;
 		const auto& gap = items[g];
-		for (auto block = gap.offset / options_.block_bytes; block <= std::max(gap.offset, gap.last) / options_.block_bytes; ++block) {
+		for (auto block = gap.offset / block_data; block <= std::max(gap.offset, gap.last) / block_data; ++block) {
 			auto found = manifests.find({gap.segment, static_cast<std::uint32_t>(block)});
 			if (found == manifests.end()) { unknown = true; return; }
 			for (const auto& [group, sequence] : found->second.groups) { if (!superseded(group, sequence)) { name(group, sequence); } }
@@ -820,7 +988,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	// Per epoch, the block where its last kept turn ends: a manifest is acknowledged only if
 	// the turn that wrote its header was kept, which in its epoch means at or before there.
 	std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> kept_end;
-	auto keep_end = [&](std::uint64_t epoch, std::size_t i) { kept_end[epoch] = {items[i].segment, items[i].offset / options_.block_bytes}; };
+	auto keep_end = [&](std::uint64_t epoch, std::size_t i) { kept_end[epoch] = {items[i].segment, items[i].offset / block_data}; };
 	for (std::size_t e = 0; e < opens.size(); ++e) {
 		auto& open = opens[e];
 		const bool newest_epoch = e + 1 == opens.size();
@@ -851,7 +1019,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 		auto missing_between = [&](std::size_t from, std::size_t to, std::size_t prefer) {
 			bool found = false;
 			for (auto g : gaps) { if (g >= from && g < to) { gap_damage(g); found = true; } }
-			auto written = [&](std::size_t g) { return manifests.contains({items[g].segment, static_cast<std::uint32_t>(items[g].offset / options_.block_bytes)}); };
+			auto written = [&](std::size_t g) { return manifests.contains({items[g].segment, static_cast<std::uint32_t>(items[g].offset / block_data)}); };
 			for (auto [low, high] : {std::pair{prefer, to}, std::pair{from, prefer}}) {
 				for (auto g : tails) { if (!found && g >= low && g < high && written(g)) { gap_damage(g); found = true; } }
 			}
@@ -895,7 +1063,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			std::uint64_t later = 0;
 			for (auto i = stop; i-- > previous_end;) {
 				auto& item = items[i];
-				if (item.epoch == open.epoch) { later = std::max(later, item.gap ? item.later : item.turn); }
+				if (!item.gap && item.epoch == open.epoch) { later = std::max(later, item.turn); }
 				if (item.gap) { if (later > at_least.back()) { item.damage = true; } at_least.pop_back(); }
 			}
 			bool hidden = false;
@@ -904,6 +1072,10 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 				const auto& item = items[i];
 				if (!item.gap && item.group && item.epoch == open.epoch && item.turn > last_turn && !superseded(item.group, item.sequence)) { name(item.group, item.sequence); }
 			}
+		} else {
+			// A sector that failed past an earlier epoch's last kept turn is damage too: the next
+			// open's record, when it did not read back, or a turn its open did not keep.
+			for (std::size_t i = previous_end; i < stop; ++i) { if (items[i].damage) { gap_damage(i); } }
 		}
 		if (!newest_epoch && last_turn != limit && limit != std::numeric_limits<std::uint64_t>::max()) {
 			damaged = true; missing_between(previous_end, stop, previous_end);
