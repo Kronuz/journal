@@ -221,8 +221,7 @@ void stays_deleted() {
 // The base disk of the crash cases: a closed with two checkpoints' artifacts, b open with batches
 // in its shard, c closed in its shard.
 struct Base { fl::filesystem disk; std::uint64_t a = 0, b = 0, c = 0; std::set<std::string> artifacts; };
-Base base() {
-	Base base;
+void populate(Base& base) {
 	const auto ids = slot_mates(1, 3);
 	base.a = ids[0]; base.b = ids[1]; base.c = ids[2];
 	Node node(base.disk);
@@ -230,7 +229,6 @@ Base base() {
 	node[base.b].checkpoint("b-state"); node[base.b].append("b-1"); node[base.b].append("b-2");
 	node[base.c].checkpoint("c-state"); node[base.c].close();
 	base.artifacts = node.files(base.a);
-	return base;
 }
 // After a cut and a reopen: group a whole (closed, every artifact, its checkpoint recovered) or
 // none of it (status none, a deleted entry, no artifact), and b and c intact. Whether a is gone.
@@ -277,7 +275,7 @@ std::optional<j::GroupEntry> filed(fl::filesystem& disk, std::uint64_t group) {
 // A2. A power cut after each mutation of delete_group, under several crash draws, then a reopen:
 // group a is whole or gone, never part, and b and c keep every record. Both outcomes occur.
 void crash() {
-	auto setup = base();
+	Base setup; populate(setup);
 	const auto total = deleting(setup);
 	check(total > 0, "the delete writes");
 	std::size_t whole = 0, gone = 0;
@@ -300,7 +298,7 @@ void crash() {
 // A2. A delete recorded with its artifacts still on disk (a cut after its first commit), then a
 // power cut after each mutation of the open that finishes it, then a reopen: the group is gone.
 void crash_finish() {
-	auto setup = base();
+	Base setup; populate(setup);
 	const auto total = deleting(setup);
 	std::size_t unfinished = 0;
 	for (std::uint64_t cut = 0; cut < total; ++cut) {
