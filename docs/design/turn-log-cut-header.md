@@ -14,7 +14,8 @@ tear (a sector left old: drop the unacknowledged turn) from damage (bytes change
 report it). It decides from content: a sector counts as new only if it holds a whole fragment
 header of this segment (`damaged_fragment`, `include/journal/turn_log.h:198`). Four shapes hold
 none, and in the newest tail each drops an acknowledged turn without a report: 36 of 201 damage
-cases in the probe below. The two cut-header shapes are 3 of the 36; a layout where no header
+cases in the probe below, and the loss reaches back from the newest turn to any turn of the newest
+block (23 more of 4807 in clean logs). The two cut-header shapes are 3 of the 36; a layout where no header
 straddles a sector removes them for 0.15-0.18% more bytes and leaves 30 of 189 silent.
 
 **Recommendation: per-sector checks (O3b).** Each sector carries an 8-byte trailer, its segment and
@@ -94,8 +95,8 @@ Probe `test/cut_header_probe.cc` on the prototype, built per layout (`-DJOURNAL_
 - **Blocks**, 40 seeds at the same sizes: the same damage in every crossing fragment of a clean
   60-turn log, the newest turn tallied apart.
 
-O3 is a model: a damaged sector equals none of its written versions, so its check fails. Each
-layout places fragments differently, so each counts its own cases.
+O3 is a model: a damaged sector equals none of its written versions. Each layout places fragments
+differently, so each counts its own cases.
 
 | Damage, by shape | O0 (layout 0) | O1 (layout 1) | O2 (layout 2) | O3 (model, layout 0's cases) |
 |---|---|---|---|---|
@@ -109,7 +110,15 @@ layout places fragments differently, so each counts its own cases.
 | blocks, newest turn: silent | 29 of 108 | 24 of 101 | 6 of 75 | 0 of 108 |
 | **blocks, earlier turns: silent** | **23 of 4807** | **16 of 4429** | **11 of 2988** | **0 of 4807** |
 
-BLOCKS_EXPLAIN
+All 23 earlier-turn cases at layout 0 sit in the newest segment, in 12 of the 80 logs (seed 22 at
+2048 bytes, 11 seeds at 4096), each with 1-5 later writes in the segment and no later segment
+(261123-061004-47129e). Recovery reports nothing, and 2 to 6 groups per case come back as of an
+earlier turn: fewer records than were acknowledged, or records an acknowledged checkpoint had
+superseded (seed 6: group 3 holds 19 records instead of 2). In 8 cases 4 to 6 groups differ, more
+than one turn of 1-3 records can touch, so the loss runs past the damaged turn into later
+acknowledged ones. The code says why: the unproven failure ends its block's scan, the later turns
+that block holds go unread, and the damaged turn becomes the newest epoch's incomplete last turn.
+A later turn starting in a later block would make it a reported gap instead.
 
 Layout 1 places no fragment header across a sector in any block of the probe's 80 clean logs (its
 `fr.cut` check). T9, the turn log's power-loss test, run per layout at 40 seeds: layout 1 makes
@@ -123,8 +132,8 @@ closure already.
 Jobs, at journal:8485149 (dba8a7c adds only a print of each silent case): layout 0
 261122-211721-cd9e33, layout 1 261122-211725-8b1268, layout 2 261122-211728-5f7c2a; layout 0 at
 journal main (journal:b335b69, a3eecb5 plus the probe) 261122-212211-6e741f, the same counts on
-the landed rules; the silent cases located, 261123-061004-47129e; all three layouts from the quest
-branch with the prototype as a ref, 261123-062108-d42575. The durability review's probe counted 36
+the landed rules; the silent cases located, 261123-061004-47129e. A2: all three layouts from the quest branch with
+the prototype as a ref, 261123-062108-d42575, counts identical to the three above. The durability review's probe counted 36
 of 210 on its own seeds.
 
 ## Cost
@@ -161,9 +170,9 @@ sector, one extra copy of the turn (which O3b's in-place emitter avoids), no tra
 | 2 | 48.0 | 20.91 ms | 47.8 | 20.95 ms |
 | 3 (O3's write) | 48.0 | 20.94 ms | 47.4 | 20.97 ms |
 
-The 21 ms barrier dominates, and rounds spread up to 0.18 ms (p50), so the bench cannot see a CPU
-cost below that; p99 is 22-42 ms in every layout. O3's write covers 500-600 bytes more than the
-turn, in pages the turn already dirties, so the pages written back are the same.
+The 21 ms barrier dominates and rounds spread up to 0.18 ms (p50), so no CPU cost below that shows;
+p99 is 22-42 ms in every layout. O3's write covers 500-600 bytes more than the turn, in pages the
+turn already dirties.
 
 ## Decisions
 
@@ -206,14 +215,14 @@ turn, in pages the turn already dirties, so the pages written back are the same.
 - A CRC-32C collision lets a damaged sector verify: 2^-32 per damaged sector, as it is per fragment
   today.
 - Until O3 lands (O0), damage in U1-U4 drops acknowledged turns without a report. **This is
-  silent.** LIMIT_SCOPE
+  silent.** It is wider than turn-log-damage.md's Limit states ("in the last turn"): the damaged
+  turn and every acknowledged turn after it drop whenever no later turn starts in a later block (23
+  of 4807 earlier-turn cases at layout 0, up to 5 later turns).
 
 ## Status and next steps
 
-Built only as the scratch prototype: layouts 0-2 run under the probe and T9 at journal:e912a28's
-code, whose rules journal main keeps unchanged (`damaged_header`, `damaged_fragment` and the
-`in_write` tracking are identical at journal:d8453f6); layout 3 is a write-cost emulation without
-trailers or a reader. Nothing of O3 is built. First steps:
+Built only as the scratch prototype (layouts 0-2 under the probe and T9; layout 3 a write-cost
+emulation without trailers or a reader). Nothing of O3 is built. First steps:
 
 1. framing: the sector layer (D2, D3) in the emitter, `RecordReader`, `scan`; fixtures for
    `RFTW0002`; the framing fuzzer.
@@ -226,6 +235,9 @@ Questions for the owner:
 1. **Q1.** Take O3b now as a format quest (recommended), or accept the Limit for good? O1 is the
    third choice, only if a format rewrite is off the table.
 2. **Q2.** D5: both streams at once (recommended), or the turn log first?
+3. **Q3.** Until O3b lands, close the earlier-turn loss in code: a fragment of a later write that
+   verifies past the failing one, anywhere in its segment, proves that write durable, so the failure
+   is damage. Recommended as its own quest (no format change); it leaves the newest turn's 36.
 
 From review:
 
