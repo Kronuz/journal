@@ -8,8 +8,27 @@ Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://gith
 
 ## 2026-11-21
 
+### Changed
+
+- Damage to a turn log bounds a group's loss instead of losing the group
+  ([docs/mechanisms/lost-bound.md](docs/mechanisms/lost-bound.md)). A group the damaged blocks'
+  manifests name keeps its records from a checkpoint it kept after the damage, as if undamaged;
+  without one, recovery reports it in `TurnRecovery::bounded` with its bound (the highest
+  sequence the damage could hold) and its records after it. `Host::open` stores the bound in the
+  group's table entry (`GroupEntry::bound`; the shard's state byte carries `bounded_state`) and
+  keeps the group, which reports `GroupStatus::bounded`. A reader holding the group through
+  `Host::bound(group)` continues it from the records after the bound; one that does not calls
+  `Host::lose(group)`. A `Journal` Store loses a bounded group on recover.
+- A damaged gap that runs on into later blocks costs each of their manifests, through the last
+  block whose bytes may begin a lost record, and is `unknown` when one of them is missing. It
+  cost only its first block's manifest: past the newest epoch's last kept turn, a group a later
+  block named lost a record silently.
+
 ### Added
 
+- `TurnLogGroups::bound`, `TurnLog::keep(group, bound)`, `TurnLog::refuse(group)`,
+  `TurnDriver::keep(group)`, `Host::bound(group)`, `Host::lose(group)`.
+- `lost_bound_test bounds`, `crash`, `second`, `retention` and `spans`.
 - `JOURNAL_FUZZ_DECODER` (`segment` or `checkpoint`) pins `journal_fuzz` to one decoder, so each gets
   fuzzing time of its own; empty keeps the choice by the input's first byte, which is consumed either way.
 

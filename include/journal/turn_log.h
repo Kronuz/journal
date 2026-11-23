@@ -64,26 +64,39 @@ struct TurnRecord {
 		return group == other.group && sequence == other.sequence && kind == other.kind && payload == other.payload;
 	}
 };
-// What recovery kept: each group's records from its latest checkpoint, in sequence order.
-// A group whose sequence has a gap, or whose records damage may have held (every group, where
-// no manifest names the damaged block's), is lost: it rejoins as a new incarnation (D11, D5).
-// When damaged, a group the host holds open (TurnLogGroups::open) that is in neither map is
-// lost too.
+// A lost group whose loss the damage bounds (docs/mechanisms/lost-bound.md): the highest
+// sequence the damage could hold, and the group's records after it, in sequence order.
+struct TurnBound {
+	std::uint64_t bound = 0;
+	std::vector<TurnRecord> records;
+	bool operator==(const TurnBound&) const = default;
+};
+// What recovery kept: each group's records from its latest checkpoint, or from 1, or from its
+// table bound + 1 (TurnLogGroups::bound), in sequence order. A group whose sequence has a gap, or
+// whose records damage may have held (every group, where no manifest names the damaged block's),
+// is lost: it rejoins as a new incarnation (D11, D5), unless a checkpoint it kept after the damage
+// supersedes every record there. A lost group the damaged blocks' manifests name is also bounded:
+// a caller that stores the bound keeps it (TurnLog::keep), and a reader holding the group through
+// the bound continues from the records after it. When damaged, a group the host holds open
+// (TurnLogGroups::open) that is in neither map, nor bounded by the table, is lost too.
 struct TurnRecovery {
 	std::uint64_t epoch = 0;      // the epoch this open started
 	std::uint64_t last_turn = 0;  // the last turn kept
 	std::map<std::uint64_t, std::vector<TurnRecord>> groups;
 	std::set<std::uint64_t> lost;
+	std::map<std::uint64_t, TurnBound> bounded;  // lost groups whose loss is bounded
 	bool damaged = false;
 };
 // What the host's group table knows before a log recovers (one directory per host): a lost id
 // stays lost and refused whatever the log holds, a group's records through its base sequence
 // are superseded by the table's copy, so recovery ignores them, and the open groups are the
-// ones a damaged log loses when it holds nothing of them.
+// ones a damaged log loses when it holds nothing of them. A bound the table stored for a group
+// (TurnRecovery::bounded) supersedes its records through it too: the group continues after it.
 struct TurnLogGroups {
 	std::set<std::uint64_t> lost;
 	std::map<std::uint64_t, std::uint64_t> base;
 	std::vector<std::uint64_t> open;
+	std::map<std::uint64_t, std::uint64_t> bound;
 };
 struct TurnLogStats {
 	std::uint64_t turns = 0, barriers = 0, bytes_appended = 0, bytes_written = 0, segments_prepared = 0, prepared_inline = 0;
@@ -153,6 +166,7 @@ struct Item {
 	std::uint64_t turn = 0, group = 0, sequence = 0;
 	std::string payload;
 	std::uint64_t segment = 0, offset = 0;  // the record's first fragment; a gap's block start
+	std::uint64_t last = 0;  // a gap's last block whose bytes may begin a lost record
 };
 // Per described block: its groups' highest sequences, and where the header naming them is.
 struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0, epoch = 0; std::uint32_t block = 0; };
@@ -215,19 +229,25 @@ inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::
 }
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
 	std::uint64_t here = 0;
-	auto gap = [&] { if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = here; items.push_back(std::move(item)); } };
+	// A gap merges every unreadable run up to the next record. `holds`: this block's bytes may
+	// begin a lost record (a continuation's record began in a block the gap covers already).
+	auto gap = [&](bool holds) {
+		if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = item.last = here; items.push_back(std::move(item)); }
+		else if (holds) { items.back().last = here; }
+	};
 	std::string block(options.block_bytes, '\0'), partial; bool assembling = false; std::uint64_t partial_epoch = 0, partial_offset = 0;
 	// Where the last header or fragment that verified starts, while it does not end its write.
 	std::optional<std::size_t> in_write;
 	const auto size = std::min(file.size(), options.segment_bytes);
 	for (std::uint64_t offset = 0, index = 0; offset + options.block_bytes <= size; offset += options.block_bytes, ++index) {
 		here = offset;
-		if (file.read_at(offset, block) != block.size()) { gap(); assembling = false; continue; }
+		if (file.read_at(offset, block) != block.size()) { gap(true); assembling = false; continue; }
 		std::string_view view(block);
 		const auto header = framing::parse_header(view, stream(identity, options.block_bytes, segment, 0), index);
 		if (header.check != framing::Check::ok) {
-			gap(); assembling = false;
-			if (damaged_header(view, offset, segment)) { items.back().damage = true; }
+			const bool damage = damaged_header(view, offset, segment);  // else unwritten, stale or torn
+			gap(damage); assembling = false;
+			if (damage) { items.back().damage = true; }
 			continue;
 		}
 		const auto epoch = header.epoch; const auto count = header.count; in_write = 0;
@@ -241,7 +261,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		while (options.block_bytes - position >= framing::fragment_header + 1) {
 			const auto fragment = framing::parse_fragment(view.substr(position), options.block_bytes - position, segment, epoch);
 			if (fragment.check != framing::Check::ok) {
-				gap(); assembling = false;
+				gap(true); assembling = false;
 				const bool written = in_write && (offset + *in_write) / framing::sector_bytes == (offset + position) / framing::sector_bytes;
 				if (damaged_fragment(view, offset, position, segment, epoch, written)) { items.back().damage = true; }
 				break;
@@ -250,16 +270,16 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			const auto start = position; position += framing::fragment_header + length;
 			in_write = type == framing::First || type == framing::Middle ? std::optional{start} : std::nullopt;
 			if (type == framing::Full || type == framing::First) {
-				if (assembling) { gap(); }
+				if (assembling) { gap(false); }
 				partial.assign(payload); partial_epoch = epoch; partial_offset = offset + position - framing::fragment_header - length; assembling = type == framing::First;
 				if (assembling) { continue; }
 			} else {
-				if (!assembling || partial_epoch != epoch) { gap(); assembling = false; continue; }
+				if (!assembling || partial_epoch != epoch) { gap(false); assembling = false; continue; }
 				partial.append(payload);
 				if (type == framing::Middle) { continue; }
 				assembling = false;
 			}
-			if (partial.size() < record_header) { gap(); continue; }
+			if (partial.size() < record_header) { gap(true); continue; }
 			std::string_view record(partial);
 			Item item; item.epoch = epoch; item.segment = segment; item.offset = partial_offset; item.kind = static_cast<std::uint8_t>(record[0]); record.remove_prefix(1);
 			item.turn = get64(record); item.group = get64(record); item.sequence = get64(record); item.payload.assign(record);
@@ -267,7 +287,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 			items.push_back(std::move(item));
 		}
 	}
-	if (assembling) { gap(); }
+	if (assembling) { gap(false); }
 }
 }  // namespace turn_log_detail
 
@@ -280,6 +300,9 @@ public:
 		recovered = recover(known);
 		epoch_ = recovered.epoch; turn_ = recovered.last_turn;
 		for (const auto& [group, records] : recovered.groups) { if (!records.empty()) { sequences_[group] = records.back().sequence; } }
+		for (const auto& [group, bound] : known.bound) {
+			if (!recovered.lost.contains(group)) { auto& last = sequences_[group]; last = std::max(last, bound); }
+		}
 		for (auto group : recovered.lost) { lost_.insert(group); }
 		next_segment_ = highest_segment_ + 1;
 		begin_segment();
@@ -323,6 +346,27 @@ public:
 		index_.erase(found); sequences_.erase(group);
 	}
 	bool evicted(std::uint64_t group) const { return evicted_.contains(group); }
+	// Refuses the id from now on, as recovery refuses a lost one: a group its host lost after
+	// recovery (Host::lose), once forgotten.
+	void refuse(std::uint64_t group) { lost_.insert(group); }
+	// Keeps a group whose caller stores `bound` for it durably (TurnLogGroups::bound): a bounded
+	// lost group (TurnRecovery::bounded) is no longer lost, its records after the bound are live
+	// again, and it continues after them and the bound, as a re-partition's new log continues it.
+	void keep(std::uint64_t group, std::uint64_t bound) {
+		if (!bound) { throw std::invalid_argument("a kept group needs a bound"); }
+		std::uint64_t last = bound;
+		if (auto found = bounded_.find(group); found != bounded_.end()) {
+			if (found->second.bound != bound) { throw std::logic_error("the group's bound is another"); }
+			if (!found->second.live.empty()) {
+				auto& index = index_[group];
+				for (const auto& [sequence, live] : found->second.live) { index.emplace(sequence, live); ++live_counts_[live.segment]; }
+				last = std::max(last, found->second.live.rbegin()->first);
+			}
+			bounded_.erase(found);
+		}
+		auto& sequence = sequences_[group]; sequence = std::max(sequence, last);
+		lost_.erase(group);
+	}
 	// A group's live records from its latest checkpoint record, read back by position; an evicted
 	// group is restored. A record that does not read back as itself throws Corruption and
 	// changes nothing.
@@ -483,7 +527,11 @@ private:
 		return options;
 	}
 	// A live record's position, kind and payload size, in 32 bytes.
-	struct Live { std::uint64_t segment, epoch, offset; TurnRecordKind kind; std::uint64_t bytes : 56; };
+	// Every field is the constructor's: a Live built without its payload size does not compile.
+	struct Live {
+		Live(std::uint64_t segment, std::uint64_t epoch, std::uint64_t offset, TurnRecordKind kind, std::uint64_t bytes) : segment(segment), epoch(epoch), offset(offset), kind(kind), bytes(bytes) {}
+		std::uint64_t segment, epoch, offset; TurnRecordKind kind; std::uint64_t bytes : 56;
+	};
 	static_assert(sizeof(Live) == 32);
 	// Map nodes the turn path frees, reused by later inserts: a warm turn allocates none. They
 	// never outnumber what the map they came from held at its largest.
@@ -656,6 +704,8 @@ private:
 	std::map<std::uint64_t, std::uint64_t> sequences_; std::set<std::uint64_t> lost_;
 	std::map<std::uint64_t, std::map<std::uint64_t, Live>> index_; std::map<std::uint64_t, std::size_t> live_counts_;
 	std::map<std::uint64_t, Evicted> evicted_;  // groups no writer holds: evict()
+	struct Bounded { std::uint64_t bound = 0; std::map<std::uint64_t, Live> live; };
+	std::map<std::uint64_t, Bounded> bounded_;  // bounded lost groups, until keep()
 	std::set<std::uint64_t> data_segments_; std::map<std::uint64_t, std::unique_ptr<File>> readers_;
 	framing::Manifest filling_;  // unknown until the first block this open enters
 	struct Note { std::uint64_t group, sequence; TurnRecordKind kind; std::size_t bytes; bool copy; std::uint64_t offset = 0; };
@@ -672,7 +722,9 @@ private:
 // that open kept; later turns are ignored, and damage at or before it is corruption.
 inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	using namespace turn_log_detail;
-	auto superseded = [&](std::uint64_t group, std::uint64_t sequence) { auto found = known.base.find(group); return found != known.base.end() && sequence <= found->second; };
+	// The table's floor for a group: its records through its closed base or its stored bound.
+	auto held = [](const std::map<std::uint64_t, std::uint64_t>& floors, std::uint64_t group) { auto found = floors.find(group); return found == floors.end() ? 0 : found->second; };
+	auto superseded = [&](std::uint64_t group, std::uint64_t sequence) { return sequence <= std::max(held(known.base, group), held(known.bound, group)); };
 	std::vector<std::uint64_t> segments;
 	auto cursor = io_.scan_directory();
 	while (auto name = cursor->next()) { if (auto number = segment_number(*name)) { segments.push_back(*number); } }
@@ -718,14 +770,20 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 	// names for the damaged block; where no manifest reads back, it costs every group: a record
 	// after it may be a forwarded copy, which shows nothing of what its group wrote there.
 	struct Turn { std::vector<std::size_t> records; bool complete = false; std::size_t first = 0, end = 0; };
-	std::vector<std::size_t> kept_records; std::set<std::uint64_t> named; std::set<std::size_t> counted;
+	// named: each group damage may have cost, with the highest sequence it may have held.
+	std::vector<std::size_t> kept_records; std::map<std::uint64_t, std::uint64_t> named; std::set<std::size_t> counted;
+	auto name = [&](std::uint64_t group, std::uint64_t sequence) { auto& bound = named[group]; bound = std::max(bound, sequence); };
 	bool unknown = false, damaged = false;  // unknown: damage whose groups no manifest names
+	// A gap costs what every block it covers names, through its last that may begin a lost record.
 	auto gap_damage = [&](std::size_t g) {
 		if (!counted.insert(g).second) { return; }
 		damaged = true;
-		auto found = manifests.find({items[g].segment, static_cast<std::uint32_t>(items[g].offset / options_.block_bytes)});
-		if (found == manifests.end()) { unknown = true; return; }
-		for (const auto& [group, sequence] : found->second.groups) { if (!superseded(group, sequence)) { named.insert(group); } }
+		const auto& gap = items[g];
+		for (auto block = gap.offset / options_.block_bytes; block <= std::max(gap.offset, gap.last) / options_.block_bytes; ++block) {
+			auto found = manifests.find({gap.segment, static_cast<std::uint32_t>(block)});
+			if (found == manifests.end()) { unknown = true; return; }
+			for (const auto& [group, sequence] : found->second.groups) { if (!superseded(group, sequence)) { name(group, sequence); } }
+		}
 	};
 	std::uint64_t last_turn = 0;
 	// Per epoch, the block where its last kept turn ends: a manifest is acknowledged only if
@@ -797,7 +855,7 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			for (std::size_t i = previous_end; i < stop; ++i) { if (items[i].damage) { gap_damage(i); hidden = true; } }
 			for (std::size_t i = previous_end; hidden && i < stop; ++i) {
 				const auto& item = items[i];
-				if (!item.gap && item.group && item.epoch == open.epoch && item.turn > last_turn && !superseded(item.group, item.sequence)) { named.insert(item.group); }
+				if (!item.gap && item.group && item.epoch == open.epoch && item.turn > last_turn && !superseded(item.group, item.sequence)) { name(item.group, item.sequence); }
 			}
 		}
 		if (!newest_epoch && last_turn != limit && limit != std::numeric_limits<std::uint64_t>::max()) {
@@ -805,8 +863,11 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			last_turn = limit;
 		}
 	}
-	// Per group: copies agree, sequences are contiguous from 1 or from a checkpoint, and a
-	// checkpoint supersedes what precedes it.
+	// Per group: copies agree, and sequences are contiguous from where its records start: its
+	// latest checkpoint, else 1 or the table's bound + 1. A checkpoint supersedes what precedes it,
+	// so damage below one the group kept costs it nothing. A group damage named, with no checkpoint
+	// after the damage's bound, is lost and bounded: its records after the bound must start at
+	// bound + 1, since every record of it a damaged block held is at or below the bound.
 	std::map<std::uint64_t, std::map<std::uint64_t, std::size_t>> by_group;
 	for (auto r : kept_records) {
 		const auto& item = items[r];
@@ -818,46 +879,75 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 			it->second = r;  // the later copy is the live one
 		}
 	}
+	auto record_of = [&](std::uint64_t group, std::size_t r) { const auto& item = items[r]; return TurnRecord{group, item.sequence, static_cast<TurnRecordKind>(item.kind), item.payload}; };
+	auto live_of = [&](std::size_t r) { const auto& item = items[r]; return Live{item.segment, item.epoch, item.offset, static_cast<TurnRecordKind>(item.kind), item.payload.size()}; };
+	// bound: a lost group bounded at `bound`, holding its records after it.
+	auto bound = [&](std::uint64_t group, std::uint64_t at, std::vector<TurnRecord> records, std::map<std::uint64_t, Live> live) {
+		result.lost.insert(group);
+		result.bounded[group] = {at, std::move(records)};
+		bounded_[group] = {at, std::move(live)};
+	};
 	for (auto& [group, records] : by_group) {
 		if (result.lost.contains(group)) { continue; }
-		if (named.contains(group) || unknown) { result.lost.insert(group); continue; }
+		if (unknown) { result.lost.insert(group); continue; }
+		const auto damage = named.find(group);
+		const std::uint64_t floor = damage != named.end() ? damage->second : 0;  // named sequences pass the table's floor
+		const auto after = records.upper_bound(floor);
 		auto start = records.end();
-		for (auto it = records.begin(); it != records.end(); ++it) {
+		for (auto it = after; it != records.end(); ++it) {
 			if (items[it->second].kind == static_cast<std::uint8_t>(TurnRecordKind::Checkpoint)) { start = it; }
 		}
-		if (start == records.end()) {
-			if (records.begin()->first != 1) { result.lost.insert(group); continue; }
-			start = records.begin();
+		const bool checkpoint = start != records.end();
+		if (!checkpoint) {
+			start = after;
+			const auto first = damage != named.end() ? floor + 1 : held(known.bound, group) + 1;
+			if (start == records.end()) { bound(group, floor, {}, {}); continue; }  // only damage leaves none after the floor
+			if (start->first != first) { result.lost.insert(group); continue; }
 		}
-		std::vector<TurnRecord> kept; auto expected = start->first;
+		std::vector<TurnRecord> kept; std::map<std::uint64_t, Live> live; auto expected = start->first;
+		bool contiguous = true;
 		for (auto it = start; it != records.end(); ++it, ++expected) {
-			if (it->first != expected) { result.lost.insert(group); break; }
-			const auto& item = items[it->second];
-			kept.push_back({group, item.sequence, static_cast<TurnRecordKind>(item.kind), item.payload});
-			index_[group].emplace(item.sequence, Live{item.segment, item.epoch, item.offset, static_cast<TurnRecordKind>(item.kind), item.payload.size()});
+			if (it->first != expected) { contiguous = false; break; }
+			kept.push_back(record_of(group, it->second)); live.emplace(it->first, live_of(it->second));
 		}
-		if (!result.lost.contains(group)) { result.groups.emplace(group, std::move(kept)); }
-		else { index_.erase(group); }
+		if (!contiguous) { result.lost.insert(group); continue; }
+		if (damage != named.end() && !checkpoint) { bound(group, floor, std::move(kept), std::move(live)); continue; }
+		index_[group] = std::move(live);
+		result.groups.emplace(group, std::move(kept));
+	}
+	// A group damage named that holds nothing after the floor: bounded, its records all gone.
+	for (const auto& [group, at] : named) {
+		if (result.groups.contains(group) || result.lost.contains(group)) { continue; }
+		if (unknown) { result.lost.insert(group); continue; }
+		bound(group, at, {}, {});
 	}
 	// A manifest written by a kept turn names acknowledged records: a group holding less than
-	// it names lost its tail, even where the damage read as a segment's unwritten end.
-	// Manifests a lost turn wrote (the newest epoch's torn tail, or an earlier epoch's turns
-	// past what its next open kept) name nothing acknowledged.
+	// it names lost its tail, even where the damage read as a segment's unwritten end, so it is
+	// bounded there. Manifests a lost turn wrote (the newest epoch's torn tail, or an earlier
+	// epoch's turns past what its next open kept) name nothing acknowledged.
 	for (const auto& [described, manifest] : manifests) {
 		auto end = kept_end.find(manifest.epoch);
 		if (end == kept_end.end() || std::pair<std::uint64_t, std::uint64_t>{manifest.segment, manifest.block} > end->second) { continue; }
 		for (const auto& [group, sequence] : manifest.groups) {
-			if (result.lost.contains(group) || superseded(group, sequence)) { continue; }
-			auto found = result.groups.find(group);
-			if (found == result.groups.end() || found->second.back().sequence < sequence) {
-				damaged = true; result.lost.insert(group);
-				if (found != result.groups.end()) { result.groups.erase(found); index_.erase(group); }
-			}
+			if (superseded(group, sequence)) { continue; }
+			const auto bounded = result.bounded.find(group);
+			if (result.lost.contains(group) && bounded == result.bounded.end()) { continue; }
+			std::optional<std::uint64_t> through;  // the group's last sequence recovery holds
+			if (bounded != result.bounded.end()) { through = bounded->second.records.empty() ? bounded->second.bound : bounded->second.records.back().sequence; }
+			else if (auto found = result.groups.find(group); found != result.groups.end()) { through = found->second.back().sequence; }
+			if (through && *through >= sequence) { continue; }
+			damaged = true;
+			result.groups.erase(group); index_.erase(group);
+			if (unknown) { result.lost.insert(group); result.bounded.erase(group); bounded_.erase(group); continue; }
+			bound(group, std::max(sequence, bounded == result.bounded.end() ? 0 : bounded->second.bound), {}, {});
 		}
 	}
-	for (auto group : named) { if (!result.groups.contains(group)) { result.lost.insert(group); index_.erase(group); } }
-	if (damaged) { for (auto group : known.open) { if (!result.groups.contains(group)) { result.lost.insert(group); } } }
-	for (auto group : known.lost) { result.lost.insert(group); result.groups.erase(group); index_.erase(group); }
+	if (damaged) {
+		for (auto group : known.open) {
+			if (!result.groups.contains(group) && !result.bounded.contains(group) && (unknown || !known.bound.contains(group))) { result.lost.insert(group); }
+		}
+	}
+	for (auto group : known.lost) { result.lost.insert(group); result.groups.erase(group); result.bounded.erase(group); bounded_.erase(group); index_.erase(group); }
 	for (const auto& [group, records] : index_) { for (const auto& [_, live] : records) { ++live_counts_[live.segment]; } }
 	result.damaged = damaged;
 	result.epoch = opens.back().epoch + 1; result.last_turn = last_turn;

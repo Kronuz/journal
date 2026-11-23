@@ -75,14 +75,20 @@ struct GroupEntry {
 	// In memory: a failed close may have reached the disk, so nothing holds the group until the
 	// host reopens and reads which state the disk kept.
 	bool in_doubt = false;
+	// An open group's loss bounded by damage to its log records (docs/mechanisms/lost-bound.md):
+	// the highest sequence the damage could hold; 0 when none. Only a reader holding the group
+	// through it continues the group; the log's records through it are superseded.
+	std::uint64_t bound = 0;
 	bool operator==(const GroupEntry& other) const {
-		return incarnation == other.incarnation && state == other.state && mark == other.mark && high == other.high && base == other.base && manifest == other.manifest;
+		return incarnation == other.incarnation && state == other.state && mark == other.mark && high == other.high && base == other.base && manifest == other.manifest && bound == other.bound;
 	}
 };
 // What a Store does with a group: create it (no entry, or one whose first turn never became
 // durable), recover it (stored, or closed: recovery reopens it), or nothing (lost: it rejoins
-// under a new id).
-enum class GroupStatus { none, stored, closed, lost };
+// under a new id). Bounded: the group's log lost records through Host::bound(group); a reader
+// holding the group through the bound recovers it from the log's records after it, and any other
+// loses it (Host::lose).
+enum class GroupStatus { none, stored, closed, lost, bounded };
 
 namespace host_detail {
 inline constexpr std::string_view layout_magic{"RJHL0001", 8}, table_magic{"RJGT0001", 8};
@@ -194,17 +200,20 @@ inline std::pair<std::uint32_t, std::uint64_t> decode_layout(std::string_view by
 	return {loops, generation};
 }
 // A shard: magic, the host's identity, the entry count, the entries (id, incarnation, state,
-// mark, high, base, manifest length and bytes), then a CRC.
+// mark, high, base, manifest length and bytes), then a CRC. A bounded entry's state byte carries
+// bounded_state, and its bound follows its base.
+inline constexpr std::uint8_t bounded_state = 0x80;
 inline std::size_t shard_bytes(const std::map<std::uint64_t, GroupEntry>& entries) {
 	std::size_t bytes = 32;
-	for (const auto& [_, entry] : entries) { bytes += 45 + entry.manifest.size(); }
+	for (const auto& [_, entry] : entries) { bytes += 45 + (entry.bound ? 8 : 0) + entry.manifest.size(); }
 	return bytes;
 }
 inline std::string encode_shard(const Identity& host, const std::map<std::uint64_t, GroupEntry>& entries) {
 	std::string bytes(table_magic); bytes.append(host.data(), host.size()); put32(bytes, static_cast<std::uint32_t>(entries.size()));
 	for (const auto& [id, entry] : entries) {
-		put64(bytes, id); put64(bytes, entry.incarnation); bytes.push_back(static_cast<char>(entry.state));
+		put64(bytes, id); put64(bytes, entry.incarnation); bytes.push_back(static_cast<char>(static_cast<std::uint8_t>(entry.state) | (entry.bound ? bounded_state : 0)));
 		put64(bytes, entry.mark); put64(bytes, entry.high); put64(bytes, entry.base);
+		if (entry.bound) { put64(bytes, entry.bound); }
 		put32(bytes, static_cast<std::uint32_t>(entry.manifest.size())); bytes += entry.manifest;
 	}
 	put32(bytes, crc32c(bytes));
@@ -219,10 +228,12 @@ inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, 
 		const auto id = get64(bytes);
 		GroupEntry entry; entry.incarnation = get64(bytes);
 		if (bytes.empty()) { throw Corruption("truncated group entry"); }
-		const auto state = static_cast<std::uint8_t>(bytes[0]); bytes.remove_prefix(1);
-		if (state < 1 || state > 3) { throw Corruption("invalid group state"); }
+		const auto byte = static_cast<std::uint8_t>(bytes[0]); bytes.remove_prefix(1);
+		const auto state = static_cast<std::uint8_t>(byte & ~bounded_state);
+		if (state < 1 || state > 3 || (byte & bounded_state && state != static_cast<std::uint8_t>(GroupState::open))) { throw Corruption("invalid group state"); }
 		entry.state = static_cast<GroupState>(state);
 		entry.mark = get64(bytes); entry.high = get64(bytes); entry.base = get64(bytes);
+		if (byte & bounded_state) { entry.bound = get64(bytes); if (!entry.bound) { throw Corruption("invalid group bound"); } }
 		const auto length = get32(bytes);
 		if (length > bytes.size()) { throw Corruption("truncated group entry"); }
 		entry.manifest.assign(bytes.substr(0, length)); bytes.remove_prefix(length);
@@ -381,7 +392,23 @@ public:
 		if (found->state == GroupState::closed) { return GroupStatus::closed; }
 		auto& turns = drivers_.at(loop(group));
 		if (turns->lost(group)) { return GroupStatus::lost; }
+		if (found->bound) { return GroupStatus::bounded; }
 		return opened_[loop(group)].contains(group) || turns->has_group(group) || turns->holds(group) || !found->manifest.empty() ? GroupStatus::stored : GroupStatus::none;
+	}
+	// A bounded group's bound (GroupStatus::bounded), or 0.
+	std::uint64_t bound(std::uint64_t group) const {
+		const auto* found = resident(group);
+		return found && found->state == GroupState::open ? found->bound : 0;
+	}
+	// A reader of a bounded group that does not hold it through its bound loses it: durably, with
+	// its artifacts, as an open marks the ids recovery calls lost; the log forgets it. On its loop.
+	void lose(std::uint64_t group) {
+		if (!bound(group)) { throw std::logic_error("only a bounded group is lost by its reader"); }
+		mark_lost({group});
+		auto& turns = driver_of(group);
+		turns.forget(group, std::numeric_limits<std::uint64_t>::max());
+		turns.log().refuse(group);
+		opened_[loop(group)].erase(group);
 	}
 	// The group's view of the directory: its own names, and a scan that probes its serials. On the
 	// group's loop, which owns the loop's range table (ranges_).
@@ -618,6 +645,7 @@ private:
 			auto& entry = shards_[host_detail::slot(record.group)].at(record.group);
 			before.push_back(entry);
 			settle_mark(record.group, entry); entry.state = GroupState::closed; entry.base = record.sequence; entry.manifest = std::move(record.payload);
+			entry.bound = 0;  // the closing checkpoint covers every batch, so the base supersedes it
 			groups.insert(record.group); slots.insert(host_detail::slot(record.group));
 		}
 		try { commit(groups); }
@@ -766,6 +794,7 @@ private:
 				if (entry.state == GroupState::lost) { loop.lost.insert(id); continue; }
 				if (!entry.manifest.empty()) { loop.base[id] = entry.base; }
 				if (entry.state == GroupState::open) { loop.open.push_back(id); }
+				if (entry.bound) { loop.bound[id] = entry.bound; }
 			}
 		}
 		return groups;
@@ -818,8 +847,14 @@ private:
 			drivers_.back()->retire_with([this](std::uint64_t group) { return retired_floor(group); });
 			drivers_.back()->before_turn([this, loop] { commit_transitions(loop); });
 		}
-		std::set<std::uint64_t> lost;
-		for (const auto& turns : drivers_) { lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end()); }
+		std::set<std::uint64_t> lost; std::map<std::uint64_t, std::uint64_t> bounded;
+		for (const auto& turns : drivers_) {
+			lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end());
+			for (const auto& [id, found] : turns->recovered().bounded) { bounded[id] = found.bound; }
+		}
+		// A bounded group's table entry stores its bound before anything serves, so the bound
+		// outlives the damage; the log then keeps its records after the bound, and it is not lost.
+		for (auto id : mark_bounds(bounded)) { driver_of(id).keep(id); lost.erase(id); }
 		mark_lost(lost);
 		// The log's groups of a damaged shard are lost with it: their incarnation and serials, which
 		// name their artifacts, are unknown.
@@ -852,6 +887,29 @@ private:
 		}
 		if (removed) { io_->sync_directory(); }
 	}
+	// Stores each bounded group's bound in its open entry, durably, and clears the bound of an
+	// open group whose log kept a checkpoint after it (which supersedes what the damage held).
+	// Returns the bounded ids stored; any other (no open entry, or a damaged shard) stays lost.
+	std::set<std::uint64_t> mark_bounds(const std::map<std::uint64_t, std::uint64_t>& bounded) {
+		std::set<std::uint64_t> stored, changed;
+		for (const auto& [id, at] : bounded) {
+			if (damaged(shard_of(id))) { continue; }
+			auto& shard = shards_[host_detail::slot(id)];
+			auto found = shard.find(id);
+			if (found == shard.end() || found->second.state != GroupState::open) { continue; }
+			if (found->second.bound != at) { found->second.bound = at; changed.insert(id); }
+			stored.insert(id);
+		}
+		for (std::uint32_t slot = 0; slot < host_detail::slots && !drivers_.empty(); ++slot) {
+			for (auto& [id, entry] : shards_[slot]) {
+				if (!entry.bound || bounded.contains(id) || entry.state != GroupState::open) { continue; }
+				const auto& records = driver_of(id).records(id);
+				if (!records.empty() && records.front().kind == TurnRecordKind::Checkpoint && records.front().sequence > entry.bound) { entry.bound = 0; changed.insert(id); }
+			}
+		}
+		if (!changed.empty()) { commit(changed); }
+		return stored;
+	}
 	// Every open marks the ids recovery calls lost, durably, before it serves; then their
 	// artifacts go, and the entries keep the ids refused for good.
 	void mark_lost(const std::set<std::uint64_t>& ids) {
@@ -859,7 +917,7 @@ private:
 		for (auto id : ids) {
 			if (damaged(shard_of(id))) { continue; }  // lost with its shard, which is never rewritten
 			auto& entry = shards_[host_detail::slot(id)][id];
-			if (entry.state != GroupState::lost) { entry.state = GroupState::lost; changed.insert(id); }
+			if (entry.state != GroupState::lost) { entry.state = GroupState::lost; entry.bound = 0; changed.insert(id); }
 		}
 		if (!changed.empty()) { commit(changed); }
 		changed.clear(); bool removed = false;
@@ -896,13 +954,25 @@ private:
 			auto view = loop_io(generation_, loop);
 			auto recovered = TurnLog::read(*view, identity_, options_.turns, groups[loop]);
 			lost.insert(recovered.lost.begin(), recovered.lost.end());
-			for (auto& [id, kept] : recovered.groups) {
+			auto carry = [&](std::uint64_t id, std::vector<TurnRecord>& kept) {
 				auto& target = targets[host_detail::loop(host_detail::slot(id), options_.loops)];
 				for (auto& record : kept) {
 					const auto size = record.payload.size() + 64;
 					if (!target.turn.empty() && target.bytes + size > budget) { flush(target); }
 					target.bytes += size; target.turn.push_back(std::move(record));
 				}
+			};
+			for (auto& [id, kept] : recovered.groups) {
+				// A group the table bounds, with no checkpoint since, continues in the new log after its bound.
+				if (auto found = groups[loop].bound.find(id); found != groups[loop].bound.end() && kept.front().kind != TurnRecordKind::Checkpoint) { targets[host_detail::loop(host_detail::slot(id), options_.loops)].log->keep(id, found->second); }
+				carry(id, kept);
+			}
+			// A bounded group's records after its bound, which its stored bound lets the new log start.
+			for (auto& [id, found] : recovered.bounded) {
+				if (mark_bounds({{id, found.bound}}).empty()) { continue; }
+				lost.erase(id);
+				targets[host_detail::loop(host_detail::slot(id), options_.loops)].log->keep(id, found.bound);
+				carry(id, found.records);
 			}
 		}
 		for (auto& target : targets) { flush(target); }
