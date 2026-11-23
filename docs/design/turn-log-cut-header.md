@@ -19,8 +19,10 @@ block (23 more of 4807 in clean logs). The two cut-header shapes are 3 of the 36
 straddles a sector removes them for 0.15-0.18% more bytes and leaves 30 of 189 silent.
 
 **Recommendation: per-sector checks (O3b).** Each sector carries an 8-byte trailer, its segment and
-a CRC-32C over its data, and fragment headers shrink from 24 bytes to 4. Every damaged sector the
-scan reaches is then reported, whatever the shape: 0 of 201 silent in the model. `damaged_fragment`,
+a CRC-32C over its data and all 64 bits of the segment, and fragment headers shrink from 24 bytes
+to 4. Every damaged sector the scan reaches is then reported, whatever the shape: in the durability
+review's executable model of D2-D4 (261123-072901-f7e1ff), 55,069 of 55,069 tears read as tears and
+27,411 of 27,411 flipped bytes in acknowledged sectors are reported. `damaged_fragment`,
 `damaged_header` and their documented Limits go, F3's group-id argument with them. On the turn
 log's workloads it writes 5.6-6.2% fewer bytes per turn for records up to 700 bytes and 1.0% more
 for 4 KiB records, with no latency change the barrier lets a benchmark see. Until it lands, accept
@@ -64,8 +66,9 @@ F's write starts in s; costs 28-31% more bytes on T9's workload, because each tu
 sector on average.
 
 **O3, per-sector checks.** Each 512-byte sector is 504 data bytes and a trailer: the segment's low
-32 bits and a CRC-32C over the data, those 4 bytes and the sector's index in its segment (not
-stored). A sector then reads four ways, decided by the sector alone:
+32 bits and a CRC-32C over the data, the full 64-bit segment and the sector's index in its segment
+(the high bits and the index are not stored: the reader knows its segment and position). A sector
+then reads four ways, decided by the sector alone:
 
 | The sector | Means |
 |---|---|
@@ -95,10 +98,12 @@ Probe `test/cut_header_probe.cc` on the prototype, built per layout (`-DJOURNAL_
 - **Blocks**, 40 seeds at the same sizes: the same damage in every crossing fragment of a clean
   60-turn log, the newest turn tallied apart.
 
-O3 is a model: a damaged sector equals none of its written versions. Each layout places fragments
-differently, so each counts its own cases.
+The O3 column is true by construction, not measured: the probe flags any changed byte as a sector
+check would and runs no O3 reader. The evidence for D4 is the durability review's executable model
+(261123-072901-f7e1ff: 200 seeds at 2048 and 4096-byte blocks, every subset of the newest write's
+sectors left old, a flipped byte in every acknowledged sector, over zeroed and recycled files). Each layout places fragments differently, so each counts its own cases.
 
-| Damage, by shape | O0 (layout 0) | O1 (layout 1) | O2 (layout 2) | O3 (model, layout 0's cases) |
+| Damage, by shape | O0 (layout 0) | O1 (layout 1) | O2 (layout 2) | O3 (by construction, layout 0's cases) |
 |---|---|---|---|---|
 | U1 own header cut | 3 silent | none occur | none occur | 3 flagged |
 | U2 next header cut | none occur | none occur | none occur | none occur |
@@ -181,17 +186,27 @@ turn already dirties.
   replaces it whole), O2 (28-31% more bytes, and as many silent cases), O4 (same closure, more
   bytes and code).
 - **D2.** The bytes on disk, `RFTW0002`: a sector is 504 data bytes, the segment's low 32 bits and
-  a CRC-32C over data, those bits and the 32-bit sector index. A fragment header is length (2),
+  a CRC-32C over the data, the full 64-bit segment and the 32-bit sector index. The reader
+  reconstructs the segment from its own: it checks this segment, then, for a sector that fails, the
+  nearest segment below it with the stored low bits (2^32 below when they match); one that verifies
+  there is stale, one that verifies under neither is damage. Recycled files are not zeroed
+  (`turn_log.h:640-646`, `666-670`), so binding only 32 bits would let a sector from segment
+  S - 2^32 at the same index read as current: 2,042 of 55,069 tears misread in the review's model,
+  0 with all 64 bits bound (f7e1ff). Storing 64 bits (a 12-byte trailer) buys nothing more. The
+  build quest's framing test seals a sector at S - 2^32 and asserts it reads as stale under S.
+  A fragment header is length (2),
   type (1), reserved (1). A block header keeps magic, identity, segment, block, epoch and manifest,
   without its CRC. Blocks are a whole number of sectors: 256-byte and unaligned blocks go, and the
   Limit on unaligned blocks with them. Positions stay logical (data bytes); a file offset is
   `logical / 504 * 512 + logical % 504`.
 - **D3.** A write covers whole sectors; the log keeps its last partial sector to rewrite it; the
   zero-filled rest of a sector is where the next write starts, and a zero length is the end of data.
-- **D4.** Recovery rules replace rules 1 and 2 of turn-log-damage.md: a sector that fails is damage;
-  a fragment whose sectors all verify but which does not parse, or ends in a stale, zero or older
-  sector, is the segment's end. Rules 3-5 (what damage costs) are unchanged, so journal-lost-bound's
-  bounds apply as they are.
+- **D4.** Recovery rules replace rules 1 and 2 of turn-log-damage.md: a sector that fails, or that
+  the device cannot read, is damage; a fragment whose sectors all verify but which does not parse,
+  or ends in a stale, zero or older sector, is the segment's end, unless a later turn reads from a
+  later block of the segment, which proves the end's write durable and makes the end damage (Q3's
+  rule, kept). Rules 3-5 (what damage costs) are unchanged, so journal-lost-bound's bounds apply as
+  they are.
 - **D5.** The sector layer is framing's, so strata's manifest log (`framing::scan`) takes it too and
   its tail rule reduces to the sector verdicts. One shape for both streams.
 
@@ -201,6 +216,8 @@ turn already dirties.
   forward copies through `framing::RecordReader`. O3b keeps both: the emitter splits each piece at a
   sector's 504th byte and seals each sector's CRC when the turn completes, so a body is still copied
   once; `RecordReader` verifies each sector before handing its data on.
+- **journal-earlier-turn-loss** builds Q3's rule on today's format. Under O3b the rule stays in
+  D4, so that quest's shapes stay its tests; its code goes with `damaged_fragment`.
 - **journal-lost-bound** (landed) consumes damage reports and manifests (rules 3-5), never how
   damage was found, so no option conflicts with it; under O3 the four shapes cost groups loudly.
 - **The turn bound** (`turn_bound`, `turn_room`, docs/mechanisms/turn-seal.md) must scale by 512/504
@@ -212,6 +229,10 @@ turn already dirties.
 - Under O3, a rotted sector past the newest write's end that a torn write's later sectors make the
   scan read is reported as damage, and costs the torn turn's groups under rule 5. That needs real
   damage on the device in an unwritten sector.
+- An acknowledged sector that reads back as zeros or as its older version (a lost or remapped
+  write) is outside the crash model: D4 alone reads it as the segment's end and drops every
+  acknowledged turn after it silently (27,411 of 27,411 in the review's model). Q3's rule in D4
+  reports 21,381 of them and leaves 6,030 silent, and reads every tear as a tear (f7e1ff).
 - A CRC-32C collision lets a damaged sector verify: 2^-32 per damaged sector, as it is per fragment
   today.
 - Until O3 lands (O0), damage in U1-U4 drops acknowledged turns without a report. **This is
@@ -237,9 +258,5 @@ Questions for the owner:
 2. **Q2.** D5: both streams at once (recommended), or the turn log first?
 3. **Q3.** Until O3b lands, close the earlier-turn loss in code: a fragment of a later write that
    verifies past the failing one, anywhere in its segment, proves that write durable, so the failure
-   is damage. Recommended as its own quest (no format change); it leaves the newest turn's 36.
-
-From review:
-
-1. Whether D4's four sector verdicts are complete under the crash model.
-2. Whether the trailer should carry all 64 bits of the segment (12 bytes) rather than 32.
+   is damage. Taken as journal-earlier-turn-loss (no format change); it leaves the newest turn's 36,
+   and D4 keeps the rule.
