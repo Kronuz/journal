@@ -25,11 +25,14 @@
 // a group through its bound continues from the records after it; one that does not loses it; a
 // checkpoint kept after the damage loses nothing. The table stores the bound before the host
 // serves, so it outlives a crash, a repair of the block and retention, and a second damage only
-// raises it. `lost_bound_test [case]`.
+// raises it, and a power cut during the first open after damage past the newest epoch's last kept
+// turn keeps its verdict. `lost_bound_test [case]`.
 #include "faultlab/faultfs.h"
 #include "journal/host.h"
 #include <algorithm>
 #include <iostream>
+#include <optional>
+#include <tuple>
 
 namespace j = kronuz::journal;
 namespace fl = kronuz::faultlab;
@@ -292,11 +295,120 @@ void spans() {
 	}
 	check(false, "a filler lays the gap over two blocks");
 }
+
+// spans()'s layout, for the first open's cuts: group 1's batch 3 damaged, and with `both` group
+// 2's batch 2 first fragment too. With `later`, a later turn (group 2's batch 3, 1,500 bytes)
+// writes the gap's manifests. Nothing when no filler lays the batches so.
+std::optional<fl::filesystem> gap(bool both, bool later = false) {
+	const std::uint64_t block = options.block_bytes, sector = 512;
+	for (std::size_t filler = 8; filler < 2000; ++filler) {
+		fl::filesystem attempt;
+		Records w;
+		{
+			auto host = open(attempt);
+			for (std::uint64_t g = 1; g <= 2; ++g) { host->create_group(g); stage(*host, w, g, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)); }
+			commit(*host);
+			stage(*host, w, 1, j::TurnRecordKind::Batch, run('~', filler)); commit(*host);
+			stage(*host, w, 2, j::TurnRecordKind::Batch, run('Q', 700)); stage(*host, w, 1, j::TurnRecordKind::Batch, run('Z', 40)); commit(*host);
+			if (later) { stage(*host, w, 2, j::TurnRecordKind::Batch, run('L', 1500)); commit(*host); }
+		}
+		const auto [segment, q] = find(attempt, run('Q', 16));
+		const auto k = find(attempt, run('~', 8)).second, z = find(attempt, run('Z', 40)).second;
+		if (segment.empty()) { continue; }
+		const auto at = q / block, first = q - j::turn_log_detail::record_header - 24;  // Q's first fragment
+		const bool fits = first / block == at && first % block >= sector && first % block + 24 + j::turn_log_detail::record_header + 700 > block &&
+			k / block == at && k < first && z / block == at + 1 && (z + 40) % block < sector && z > (at + 1) * block;
+		if (!fits) { continue; }
+		if (both) { damage(attempt, segment, q + 10); }
+		damage(attempt, segment, z + 10);
+		return std::optional<fl::filesystem>(attempt.snapshot());
+	}
+	return std::nullopt;
+}
+
+// What an open reports of groups 1 and 2: status, bound, and the next sequence of each it keeps.
+struct Verdict {
+	j::GroupStatus status[2]; std::uint64_t bound[2], next[2];
+	bool operator==(const Verdict&) const = default;
+};
+Verdict verdict(j::Host& host) {
+	Verdict v{};
+	for (std::uint64_t g = 1; g <= 2; ++g) {
+		v.status[g - 1] = host.status(g); v.bound[g - 1] = host.bound(g);
+		v.next[g - 1] = v.status[g - 1] == j::GroupStatus::lost ? 0 : host.driver_of(g).log().sequence(g) + 1;
+	}
+	return v;
+}
+std::string describe(const Verdict& v) {
+	std::string text;
+	for (int g = 0; g < 2; ++g) { text += (g ? ", group 2 " : "group 1 ") + std::to_string(static_cast<int>(v.status[g])) + " bound " + std::to_string(v.bound[g]) + " next " + std::to_string(v.next[g]); }
+	return text;
+}
+
+// Group 1's batch 2 (3,000 bytes), then group 2's batch 2 (1,500 bytes) in the newest turn, a
+// byte in group 1's middle block flipped: the later turn proves the damage (rule 6), and rule 5
+// drops both turns, which bound groups 1 and 2 at 2.
+std::optional<fl::filesystem> dropped() {
+	fl::filesystem disk;
+	Records w;
+	{
+		auto host = open(disk);
+		for (std::uint64_t g = 1; g <= 2; ++g) { host->create_group(g); stage(*host, w, g, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)); }
+		commit(*host);
+		stage(*host, w, 1, j::TurnRecordKind::Batch, run('N', 3000)); commit(*host);
+		stage(*host, w, 2, j::TurnRecordKind::Batch, run('M', 1500)); commit(*host);
+	}
+	const auto [segment, offset] = find(disk, run('N', 200));
+	damage(disk, segment, middle(offset));
+	return std::optional<fl::filesystem>(disk.snapshot());
+}
+
+// Rule-5 damage, and a power cut at every mutation of the first open after it: the open's new
+// epoch makes the damaged one an earlier epoch, whose turns past its kept turn recovery ignores,
+// so the table must hold the verdict before the open record. Every cut reopens to the uncut
+// open's bounds and losses, twice. A gap whose last block is the newest has no manifest yet and
+// loses both groups; with a later turn, or a damage rule 2 proves, the dropped turns bound them.
+void first_open() {
+	const std::vector<std::tuple<std::string, std::optional<fl::filesystem> (*)(), j::GroupStatus>> layouts{
+		{"batch 3", [] { return gap(false); }, j::GroupStatus::lost},
+		{"both fragments", [] { return gap(true); }, j::GroupStatus::lost},
+		{"dropped turns", dropped, j::GroupStatus::bounded},
+		{"gap, later turn", [] { return gap(true, true); }, j::GroupStatus::bounded},
+	};
+	for (const auto& [damaged, layout, expected] : layouts) {
+		auto base = layout();
+		if (!base) { check(false, "a filler lays the gap over two blocks"); return; }
+		Verdict reference{}; std::uint64_t total = 0;
+		{
+			fl::filesystem probe = base->snapshot();
+			const auto start = probe.mutations();
+			{
+				auto host = open(probe); reference = verdict(*host);
+				check(host->driver(0).recovered().damaged, "the uncut open reports the damage: " + damaged);
+			}
+			total = probe.mutations() - start;
+		}
+		check(reference.status[0] == expected, damaged + ": the uncut open " + (expected == j::GroupStatus::lost ? "loses" : "bounds") + " group 1: " + describe(reference));
+		check(total > 0, "the open writes");
+		for (std::uint64_t cut = 0; cut < total; ++cut) {
+			fl::filesystem disk = base->snapshot();
+			disk.power_off_after(cut);
+			try { open(disk); } catch (const std::exception&) {}
+			disk.crash(cut * 7919 + 1);
+			const auto at = damaged + ", cut at " + std::to_string(cut) + " of " + std::to_string(total) + ": ";
+			for (int reopen = 0; reopen < 2; ++reopen) {
+				auto host = open(disk);
+				const auto after = verdict(*host);
+				check(after == reference, at + describe(after) + ", uncut " + describe(reference));
+			}
+		}
+	}
+}
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
-	const std::vector<std::pair<std::string, void (*)()>> cases{{"bounds", bounds}, {"crash", crash}, {"second", second}, {"retention", retention}, {"spans", spans}};
+	const std::vector<std::pair<std::string, void (*)()>> cases{{"bounds", bounds}, {"crash", crash}, {"second", second}, {"retention", retention}, {"spans", spans}, {"first_open", first_open}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }
