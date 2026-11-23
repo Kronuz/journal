@@ -61,14 +61,16 @@ struct HostOptions {
 };
 
 // A group's table entry. Serials [mark, high) of its incarnation are the only names its
-// artifacts may have, so reclamation and admission probe them by name and never scan.
-enum class GroupState : std::uint8_t { open = 1, closed = 2, lost = 3 };
+// artifacts may have, so reclamation and admission probe them by name and never scan. A deleted
+// entry (Host::delete_group) keeps its incarnation and floor and frees the id for the next one.
+enum class GroupState : std::uint8_t { open = 1, closed = 2, lost = 3, deleted = 4 };
 struct GroupEntry {
 	std::uint64_t incarnation = 0;
 	GroupState state = GroupState::open;
 	std::uint64_t mark = 0, high = 0;
 	// The checkpoint record the table holds once the group closed: its sequence and bytes. The
-	// log's records of the group through `base` are superseded by it.
+	// log's records of the group through `base` are superseded by it. A deleted entry, and the
+	// incarnation created after it, keep `base` with no bytes: the deleted incarnation's floor.
 	std::uint64_t base = 0;
 	std::string manifest;
 	std::uint64_t next = 0;  // in memory: the next serial, from a fresh block after every open
@@ -201,7 +203,7 @@ inline std::pair<std::uint32_t, std::uint64_t> decode_layout(std::string_view by
 }
 // A shard: magic, the host's identity, the entry count, the entries (id, incarnation, state,
 // mark, high, base, manifest length and bytes), then a CRC. A bounded entry's state byte carries
-// bounded_state, and its bound follows its base.
+// bounded_state, and its bound follows its base. A deleted entry is state 4 with no manifest.
 inline constexpr std::uint8_t bounded_state = 0x80;
 inline std::size_t shard_bytes(const std::map<std::uint64_t, GroupEntry>& entries) {
 	std::size_t bytes = 32;
@@ -230,7 +232,7 @@ inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, 
 		if (bytes.empty()) { throw Corruption("truncated group entry"); }
 		const auto byte = static_cast<std::uint8_t>(bytes[0]); bytes.remove_prefix(1);
 		const auto state = static_cast<std::uint8_t>(byte & ~bounded_state);
-		if (state < 1 || state > 3 || (byte & bounded_state && state != static_cast<std::uint8_t>(GroupState::open))) { throw Corruption("invalid group state"); }
+		if (state < 1 || state > 4 || (byte & bounded_state && state != static_cast<std::uint8_t>(GroupState::open))) { throw Corruption("invalid group state"); }
 		entry.state = static_cast<GroupState>(state);
 		entry.mark = get64(bytes); entry.high = get64(bytes); entry.base = get64(bytes);
 		if (byte & bounded_state) { entry.bound = get64(bytes); if (!entry.bound) { throw Corruption("invalid group bound"); } }
@@ -243,6 +245,9 @@ inline std::map<std::uint64_t, GroupEntry> decode_shard(std::string_view bytes, 
 	if (!bytes.empty()) { throw Corruption("trailing group table bytes"); }
 	return entries;
 }
+
+// An entry only its shard file holds once committed: a closed or deleted one.
+inline bool filed(const GroupEntry& entry) noexcept { return entry.state == GroupState::closed || entry.state == GroupState::deleted; }
 
 // Splits a shard's entries by the next bit of their path until each part encodes in leaf_bytes,
 // holds one entry, or sits at max_depth. Both children of a split are written, so a slot's
@@ -390,6 +395,7 @@ public:
 		if (!found) { return GroupStatus::none; }
 		if (found->state == GroupState::lost) { return GroupStatus::lost; }
 		if (found->state == GroupState::closed) { return GroupStatus::closed; }
+		if (found->state == GroupState::deleted) { return GroupStatus::none; }
 		auto& turns = drivers_.at(loop(group));
 		if (turns->lost(group)) { return GroupStatus::lost; }
 		if (found->bound) { return GroupStatus::bounded; }
@@ -507,21 +513,24 @@ public:
 	// memory and mark its slot: the slot commits before the next turn of the group's loop
 	// (TurnDriver::before_turn), so each is durable before the turn carrying the group's first
 	// record (docs/design/idle-groups.md D5). Close and park are durable when they return.
-	// A new incarnation of the group: a group the table does not hold, or one whose first turn
-	// never became durable, whose artifacts go first. Its first serial block is reserved by its
-	// first artifact (next_artifact), durably, so no artifact is named by an undurable block.
+	// A new incarnation of the group: a group the table does not hold, one whose first turn never
+	// became durable, or a deleted one; the earlier incarnation's artifacts go first. Its first
+	// serial block is reserved by its first artifact (next_artifact), durably, so no artifact is
+	// named by an undurable block. It keeps a deleted incarnation's floor (base): its records
+	// follow that incarnation's in the log, from TurnDriver::retired on.
 	void create_group(std::uint64_t group) {
 		if (status(group) != GroupStatus::none) { throw std::logic_error("the group exists, is closed, or is lost"); }
+		load(group);
 		auto& entry = shards_[host_detail::slot(group)][group];
 		if (remove_artifacts(group, entry)) { io_->sync_directory(); }
-		entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, 0, 0, {}, 0};
+		entry = GroupEntry{entry.incarnation + 1, GroupState::open, 0, 0, entry.base, {}, 0};
 		dirty_[loop(group)].insert(group);
 		opened_[loop(group)].insert(group);
 		publish(group, entry);  // its views name nothing until its first block
 	}
 	// A closed or parked group opens again; its table record is staged again by its holder.
 	void reopen_group(std::uint64_t group) {
-		if (!resident(group)) { if (auto closed = stored(group)) { shards_[host_detail::slot(group)].emplace(group, std::move(*closed)); } }
+		load(group);
 		auto& entry = held(group, GroupState::closed);
 		entry.state = GroupState::open;
 		dirty_[loop(group)].insert(group);
@@ -542,6 +551,26 @@ public:
 		}
 		std::vector<TurnRecord> closing{{group, sequence, TurnRecordKind::Checkpoint, std::move(manifest)}};
 		close_into_table(closing);
+	}
+	// Deletes a closed group no Store holds, so its next create_group starts it empty
+	// (docs/mechanisms/host-delete.md). Its entry commits deleted first, without the checkpoint
+	// record and keeping the floor that supersedes its records in the log; then its artifacts go
+	// and a second commit moves its mark past them. A power cut keeps the whole closed group or
+	// none of it: an open finishes a recorded delete. Refused with std::logic_error unless the
+	// group is closed, and with std::system_error(EWOULDBLOCK) while a hold of it is live; the
+	// first commit's failure leaves it closed, a later one deleted, whose rest the next open or
+	// create removes. Synchronous, on the group's loop, right after close_group with no handoff.
+	void delete_group(std::uint64_t group) {
+		if (status(group) != GroupStatus::closed) { throw std::logic_error("only a closed group is deleted"); }
+		if (holding(group)) { throw std::system_error(EWOULDBLOCK, std::generic_category(), "a Store holds the group"); }
+		load(group);
+		auto deleted = shards_[host_detail::slot(group)].at(group);
+		deleted.state = GroupState::deleted; deleted.manifest = {};
+		update(group, [&](GroupEntry& entry) { entry = deleted; });
+		if (deleted.mark == deleted.high) { return; }
+		auto& entry = shards_[host_detail::slot(group)].emplace(group, std::move(deleted)).first->second;
+		if (remove_artifacts(group, entry)) { io_->sync_directory(); }
+		update(group, [](GroupEntry&) {});
 	}
 	// Parks the loop's idle groups (docs/design/idle-groups.md D2): every group no consumer has
 	// open (no Store holds it, no sealer is registered), with nothing staged and one live record, a
@@ -625,6 +654,11 @@ private:
 		holds_.erase(group);
 		try { released_[loop(group)].push_back(group); } catch (...) {}  // unsettled: its records stay indexed
 	}
+	// Brings the group's entry into memory when only its shard file holds it (closed or deleted).
+	void load(std::uint64_t group) {
+		if (resident(group)) { return; }
+		if (auto filed = stored(group)) { shards_[host_detail::slot(group)].emplace(group, std::move(*filed)); }
+	}
 	GroupEntry& held(std::uint64_t group, GroupState state) {
 		auto& shard = shards_[host_detail::slot(group)];
 		auto found = shard.find(group);
@@ -657,7 +691,7 @@ private:
 			throw;
 		}
 		for (const auto& record : records) { driver_of(record.group).forget(record.group, record.sequence + 1); opened_[loop(record.group)].erase(record.group); }
-		for (auto slot : slots) { std::erase_if(shards_[slot], [](const auto& item) { return item.second.state == GroupState::closed; }); }
+		for (auto slot : slots) { std::erase_if(shards_[slot], [](const auto& item) { return host_detail::filed(item.second); }); }
 	}
 	bool remove_artifacts(std::uint64_t group, GroupEntry& entry) {
 		bool removed = false;
@@ -682,7 +716,7 @@ private:
 			if (before) { entry = std::move(*before); } else { shard.erase(group); }
 			throw;
 		}
-		std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; });
+		std::erase_if(shard, [](const auto& item) { return host_detail::filed(item.second); });
 	}
 	// Replaces the shards the groups' entries fall in: writes each `.pending`, syncs them all with
 	// one call, renames them, then syncs the directory once; the groups' views see their ranges. A
@@ -699,7 +733,7 @@ private:
 			if (damaged(shard)) { throw Corruption("damaged group table shard: its groups are lost"); }
 			auto entries = stored_shard(shard);
 			const auto& resident = shards_[shard.first];
-			std::erase_if(entries, [&](const auto& item) { return item.second.state != GroupState::closed || resident.contains(item.first); });
+			std::erase_if(entries, [&](const auto& item) { return !host_detail::filed(item.second) || resident.contains(item.first); });
 			for (const auto& [id, entry] : resident) { if (host_detail::holds(shard.second, id)) { entries.insert_or_assign(id, entry); } }
 			std::vector<std::pair<std::uint64_t, host_detail::Entries>> parts;
 			// A slot's first file is its root, whole: only a stored node splits (host_detail::resolve).
@@ -792,7 +826,7 @@ private:
 			auto& loop = groups[host_detail::loop(slot, loops)];
 			for (const auto& [id, entry] : shards_[slot]) {
 				if (entry.state == GroupState::lost) { loop.lost.insert(id); continue; }
-				if (!entry.manifest.empty()) { loop.base[id] = entry.base; }
+				if (entry.base) { loop.base[id] = entry.base; }
 				if (entry.state == GroupState::open) { loop.open.push_back(id); }
 				if (entry.bound) { loop.bound[id] = entry.bound; }
 			}
@@ -863,7 +897,7 @@ private:
 			for (const auto& [id, _] : turns->recovered().groups) { if (damaged(shard_of(id))) { orphaned.push_back(id); } }
 			for (auto id : orphaned) { turns->forget(id, std::numeric_limits<std::uint64_t>::max()); }
 		}
-		for (auto& shard : shards_) { std::erase_if(shard, [](const auto& item) { return item.second.state == GroupState::closed; }); }
+		for (auto& shard : shards_) { std::erase_if(shard, [](const auto& item) { return host_detail::filed(item.second); }); }
 		ranges_.resize(loops_);  // last: the open's commits publish to no table
 	}
 	// Reads each slot's stored shards: an interrupted commit's files go first (host_detail::resolve),
@@ -911,7 +945,8 @@ private:
 		return stored;
 	}
 	// Every open marks the ids recovery calls lost, durably, before it serves; then their
-	// artifacts go, and the entries keep the ids refused for good.
+	// artifacts go, and the entries keep the ids refused for good. A recorded delete's artifacts
+	// go with them (delete_group).
 	void mark_lost(const std::set<std::uint64_t>& ids) {
 		std::set<std::uint64_t> changed;
 		for (auto id : ids) {
@@ -923,7 +958,7 @@ private:
 		changed.clear(); bool removed = false;
 		for (std::uint32_t slot = 0; slot < host_detail::slots; ++slot) {
 			for (auto& [id, entry] : shards_[slot]) {
-				if (entry.state == GroupState::lost && entry.mark < entry.high) { removed |= remove_artifacts(id, entry); changed.insert(id); }
+				if ((entry.state == GroupState::lost || entry.state == GroupState::deleted) && entry.mark < entry.high) { removed |= remove_artifacts(id, entry); changed.insert(id); }
 			}
 		}
 		if (removed) { io_->sync_directory(); }

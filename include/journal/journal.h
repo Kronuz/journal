@@ -572,6 +572,7 @@ private:
 			host_->create_group(group_);
 			owner_->lock = io_.acquire_owner(false);
 			frontier_ = Frontier{}; frontier_.identity = identity;
+			record_sequence_ = turns_->retired(group_);  // past a deleted incarnation's (Host::delete_group)
 			const auto covers = record_sequence_;  // the group's first record: nothing before it
 			turns_->stage(TurnRecord{group_, ++record_sequence_, TurnRecordKind::Checkpoint, encode_manifest(frontier_), covers});
 			ready_ = true;
