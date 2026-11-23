@@ -2,8 +2,8 @@
 
 How damage to a turn log bounds a group's loss instead of losing the group, where the bound is
 stored, and who may continue past it. The code is `TurnLog::recover` and `TurnLog::keep` in
-`include/journal/turn_log.h`, `TurnDriver::keep`, and `Host::open`, `mark_bounds`, `status`,
-`bound` and `lose` in `include/journal/host.h`. Damage detection itself is
+`include/journal/turn_log.h`, `TurnDriver::keep`, and `Host::open`, `settle_damage`,
+`mark_bounds`, `status`, `bound` and `lose` in `include/journal/host.h`. Damage detection itself is
 [turn-log-damage.md](turn-log-damage.md).
 
 ## The bound
@@ -33,19 +33,27 @@ Damage no manifest names (`unknown`) still loses every group: no bound is known.
 A bound must outlive the damage. Retention reclaims the damaged segment once the group's records
 there are no longer live, and a repaired or re-partitioned log no longer shows the damage, so the
 log alone forgets it. The host stores it in the group's open table entry (`GroupEntry::bound`; in
-the shard, the state byte's `bounded_state` bit, then 8 bytes after the base) before anything
-serves: `Host::open` collects every loop's bounded groups, commits their bounds (`mark_bounds`),
-and only then keeps them in the log (`TurnDriver::keep`), so their records after the bound are
-live again and the group continues after them. A re-partition stores them before its layout
-commit and starts each bounded group in the new log after its bound (`TurnLog::keep`).
+the shard, the state byte's `bounded_state` bit, then 8 bytes after the base). The verdict is stored
+before the open record: `Host::open` first reads each loop's log without writing to it
+(`settle_damage`, through `TurnLog::read`), commits every bounded group's bound (`mark_bounds`) and
+marks the lost ids (`mark_lost`). Only then do the drivers start, each writing its new epoch's open
+record, and the open keeps the bounded groups in the log (`TurnDriver::keep`), so their records
+after the bound are live again and the group continues after them. The drivers recover against the
+table as it was before those commits, so they report the same verdict and the open's second pass
+stores nothing new. The verdict costs one more read of each log at every open, damaged or not. A
+re-partition stores the bounds before its layout commit and starts each bounded group in the new log
+after its bound (`TurnLog::keep`).
 
 Each open passes the stored bounds back (`TurnLogGroups::bound`). Recovery treats a group's
 records through its bound as superseded, as it treats those through a closed group's base: they
 are not required, damage among them names nothing, and the group's records may start at
 bound + 1. A second damage names the group only above the stored bound, so the bound only rises.
-A crash before the commit leaves the damage in the log, and the next open finds the same bound,
-for damage a later kept turn acknowledges (mid-log damage). Damage past the newest epoch's last
-kept turn (rule 5) is not kept that way; see Limits.
+A crash before the commit leaves the damage in the log, and the next open finds the same bound:
+no open record was written, so damage past the newest epoch's last kept turn (rule 5) is still
+past it. Once the open record is written, the new epoch makes the damaged one earlier, and its
+turns past the open's kept turn no longer name anything; the table already holds the bound or the
+loss. Power cuts at every mutation of that first open (`lost_bound_test first_open`) reopen to the
+uncut open's bounds and losses at every cut.
 
 The bound clears when the group's log keeps a checkpoint after it (the next open sees it first)
 or when the group closes into the table, whose base then supersedes it.
@@ -63,12 +71,5 @@ recover loses a bounded group and throws `Corruption`.
 ## Limits
 
 - Damage no manifest names loses every group, bounded ones too, as before.
-- Rule-5 damage survives only an open that completes. The open writes its new epoch's open record
-  (`TurnLog`'s constructor) before `Host::open` stores the bound or the loss; after a power cut
-  between the two, the damaged epoch is no longer the newest, recovery ignores its turns past the
-  open's kept turn, and the next open reports no damage: the bound is forgotten and the records
-  the damage took are silently gone. Power cuts at every mutation of that first open disagree at
-  11 of 17 cuts, here and at main before the bound (jobs 261121-141538-9a63b7,
-  261121-141627-fe334f). Storing the verdict before the open record would close it.
 - A group whose damaged block's manifest is itself damaged has no bound until a later source
   (a copy flag, a per-segment roster) gives one.
