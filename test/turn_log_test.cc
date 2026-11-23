@@ -619,14 +619,16 @@ void staged_turns() {
 }  // namespace
 
 // The bytes each turn takes in the log, on the cut-header design's workloads: the data position's
-// advance in file bytes (per sector, 512 for each 504 under RFTW0002), the bytes the log wrote, and
-// the payload. Not a check: `cost` prints them, at any format, for the A4 comparison.
+// advance in file bytes (per sector, 512 for each 504 under RFTW0002), the bytes the log wrote, the
+// 512-byte sectors and 4 KiB pages that write touches (what a device and the page cache write back),
+// and the payload. Not a check: `cost` prints them, at any format, for the A4 comparison.
 void cost() {
 	namespace t = j::testing;
 	struct Load { const char* name; std::uint32_t block; std::size_t bytes; };
 	for (const auto& load : {Load{"T9 workload", 2048, 0}, Load{"T9 workload", 4096, 0}, Load{"T9 workload", 32768, 0}, Load{"turn_bench 16 groups 50% 256 B", 32768, 256}, Load{"turn_bench 16 groups 50% 4096 B", 32768, 4096}}) {
 		const j::TurnLogOptions options{std::uint64_t{16} << 20, load.block, 1, 3, 600};
-		double advance = 0, written = 0, payload = 0, turns = 0;
+		double advance = 0, written = 0, sectors_touched = 0, pages_touched = 0, payload = 0, turns = 0;
+		auto touched = [](std::uint64_t offset, std::size_t size, std::uint64_t unit) { return static_cast<double>(((offset + size + unit - 1) / unit - offset / unit) * unit); };
 		for (std::uint64_t seed = 1; seed <= 8; ++seed) {
 			t::Disk disk; t::MemoryIO io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed);
 			j::TurnLog log(io, identity, recovered, options);
@@ -642,15 +644,18 @@ void cost() {
 					if (batch.empty()) { continue; }
 				}
 				const auto segment = log.segment(), position = log.position(), before = log.stats().bytes_written;
-				log.append(batch);
+				const auto write = log.stage(batch);
+				check(write.file->write_at(write.offset, write.bytes) == write.bytes.size(), "the host writes the staged bytes");
+				write.file->sync_data(); log.completed();
 				check(log.segment() == segment, "the turns stay in one segment");
 				advance += static_cast<double>(log.position() - position); written += static_cast<double>(log.stats().bytes_written - before);
+				sectors_touched += touched(write.offset, write.bytes.size(), 512); pages_touched += touched(write.offset, write.bytes.size(), 4096);
 				for (const auto& r : batch) { payload += static_cast<double>(r.payload.size()); }
 				++turns;
 			}
 		}
 		const double file = sectors ? advance * 512 / 504 : advance;
-		std::cout << "cost " << load.name << ", block " << load.block << ": per turn " << payload / turns << " payload bytes, " << file / turns << " log bytes, " << written / turns << " written\n";
+		std::cout << "cost " << load.name << ", block " << load.block << ": per turn " << payload / turns << " payload bytes, " << file / turns << " log bytes, " << written / turns << " written, " << sectors_touched / turns << " in sectors touched, " << pages_touched / turns << " in pages touched\n";
 	}
 }
 
