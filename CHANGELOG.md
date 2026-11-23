@@ -6,6 +6,19 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-22
+
+### Added
+
+- `Host::delete_group(group)` deletes a closed group no Store holds, so a node that left a group
+  can rejoin it empty ([docs/mechanisms/host-delete.md](docs/mechanisms/host-delete.md)). The
+  group's table entry commits `deleted` (`GroupState::deleted`, the shard's state 4) before its
+  artifacts go, and every open finishes a recorded delete. The deleted entry keeps the group's
+  floor, so its old records in the turn log stay superseded; the next `create_group` starts the
+  next incarnation empty, and a shared `Store::create` starts its records after
+  `TurnDriver::retired(group)`. Refused with `std::logic_error` unless the group is closed, and
+  with `std::system_error` (`EWOULDBLOCK`) while a hold of it is live.
+
 ## 2026-11-21
 
 ### Changed
