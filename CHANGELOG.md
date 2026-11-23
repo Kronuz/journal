@@ -6,6 +6,18 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-23
+
+### Fixed
+
+- Turn log recovery reports damage to an acknowledged turn that later turns of its block follow
+  ([docs/mechanisms/turn-log-damage.md](docs/mechanisms/turn-log-damage.md), rule 6). Damage that
+  the sector rules could not prove ended its block's scan, so the damaged turn and every later
+  turn of the block dropped as the torn tail without a report: 23 of 4807 earlier-turn cases in
+  the cut-header probe. A record of a later turn, read after the failure or past it in its block,
+  now proves the failing write durable. Only the newest turn can still drop silently, until a
+  per-sector check. The on-disk format (`RFTW0001`) is unchanged.
+
 ## 2026-11-22
 
 ### Added

@@ -2,7 +2,7 @@
 
 How `TurnLog` recovery tells damage from a crash, so a damaged log reports its damage instead of
 dropping acknowledged records as a torn tail. The code is `scan_segment`, `damaged_header`,
-`damaged_fragment` and `TurnLog::recover` in `include/journal/turn_log.h`.
+`damaged_fragment`, `later_turn` and `TurnLog::recover` in `include/journal/turn_log.h`.
 
 ## The crash model
 
@@ -63,17 +63,29 @@ could prove it, so that sector may be old.
    header merges into a single gap, and that gap is the segment's tail.
 5. **Damage past the newest epoch's last kept turn** costs every group with a record in the turns
    dropped there.
+6. **A failure followed by a later write** is damage, whatever rule 2 proves. A write starts only
+   after every earlier write's barrier returned, so a record of a turn later than the failing
+   fragment's proves that fragment's write durable. Past the newest epoch's last kept turn, a gap
+   is damage when a later record names a later turn than the gap's failure belongs to: at least
+   the first turn not kept, and at least each record's before the gap (the next turn, past a
+   turn's end). The scan stops at a failure, so it reads the rest of that block for fragments of
+   the segment that verify, wherever they start, and keeps the highest turn their records name.
+   A gap's first block is read this way, a failing fragment's or a failing header's; a failure
+   past it in the same gap needs a second fault. Rule 5 then costs the gap and the turns dropped.
 
 ## Limits
 
 - A block whose size is not a multiple of 512 can start mid-sector. The rules then cannot see many
   of its headers.
-- A damaged payload byte in a fragment that crosses its sector, in the last turn, reads as a torn
-  tail when rule 2 cannot prove the sectors it spans: it fills the next sector, it is the last
-  fragment written there, the fragment after it there has a header that the next boundary cuts,
-  or it has a header that the sector boundary cuts and no header of its write before it in its
-  sector.
-  Only a per-sector checksum could tell this damage from a tear.
+- Damage to the newest turn, in a fragment that crosses its sector, reads as a torn tail when
+  rule 2 cannot prove the sectors it spans: it fills the next sector, it is the last fragment
+  written there, the fragment after it there has a header that the next boundary cuts, or it has
+  a header that the sector boundary cuts and no header of its write before it in its sector. No
+  later write follows it, so rule 6 has nothing to read. **The newest turn drops silently**: 36
+  of 201 such cases in the cut-header probe. Only a per-sector checksum (the cut-header design's
+  O3b, a format change) tells this damage from a tear. Damage to any earlier turn is reported
+  (rule 6), and costs the groups rules 3 and 5 name: every group when the damaged block is the
+  newest, whose manifest no later header holds yet.
 - A tear inside a sector, as on pmem without BTT, is outside the model: it reads as damage.
 - Old bytes that hold this segment and epoch after a type byte of 1 to 4 and a zero byte, as a
   stale payload could, read as the fragment's header, so a tear there reads as damage. The log's
@@ -89,6 +101,16 @@ seeds the test makes 1,228,757 checks with 0 failures, on macOS and in the FreeB
 crash points and 155,754 simulated tears report no damage, and its 18,365 damaged crossing
 fragments at 2048 and 4096 bytes report damage; 676 more, whose header the sector boundary cuts,
 are only counted.
+
+`earlier_turn_damage` in `test/turn_log_test.cc` replays rule 6 on the cut-header probe's
+workload (seeds 4 and 6 at 4096-byte blocks, 22 at 2048): a byte in each later sector of each
+crossing fragment of the newest segment before its newest turn, the unproven shapes among them,
+with later writes in the same block and in later blocks. Each is reported, and each group kept
+holds every acknowledged record. `large_header_damage` and `large_header_tear` pin a block header
+larger than its first sector: damage before later turns of its block is reported, and a torn turn
+whose own later sectors survive reads as a tear. The cut-header probe (`test/cut_header_probe.cc`
+on journal:b335b69, built against this header) finds 0 silent of 4807 earlier-turn cases at 40
+seeds, from 23 before rule 6; the newest turn's 36 of 201 and its 427 tears are unchanged.
 
 Each seed below pins one rule:
 
