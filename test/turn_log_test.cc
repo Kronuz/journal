@@ -267,7 +267,8 @@ void double_damage_copy() {
 // probe's workload: a byte in each sector written before the newest write's. Recovery reports it,
 // and a group it keeps holds every acknowledged record.
 void earlier_turn_damage(std::uint32_t block_bytes, std::uint64_t seed) {
-	Directory directory("earlier-turn"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	namespace t = j::testing;
+	t::Disk disk; t::MemoryIO io(disk);
 	const j::TurnLogOptions options{8 * std::uint64_t{block_bytes}, block_bytes, 1, 3, 600};
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(seed);
 	std::uint64_t newest = 0, limit = 0;
@@ -288,11 +289,15 @@ void earlier_turn_damage(std::uint32_t block_bytes, std::uint64_t seed) {
 		}
 	}
 	j::TurnLogGroups known; for (const auto& [group, _] : model) { known.open.push_back(group); }
+	const auto name = j::turn_log_detail::segment_name(newest);
 	for (std::uint64_t from = 0; from < limit; from += sector) {
 		for (const auto offset : {from + sector / 2, from + sector - 1}) {
-			directory.flip(newest, offset);
-			const auto r = j::TurnLog::read(io, identity, options, known);
-			directory.flip(newest, offset);
+			t::Disk damaged = disk; t::MemoryIO damaged_io(damaged);
+			{
+				auto file = damaged_io.open_existing(name); char byte = 0; file->read_at(offset, std::span<char>(&byte, 1));
+				byte = static_cast<char>(byte ^ 0x5a); file->write_at(offset, std::string_view(&byte, 1)); file->sync();
+			}
+			const auto r = j::TurnLog::read(damaged_io, identity, options, known);
 			if (!r.damaged || !kept(r, model)) { std::cerr << "  block_bytes " << block_bytes << " seed " << seed << " segment " << newest << " offset " << offset << '\n'; }
 			check(r.damaged, "damage to an earlier turn is reported");
 			check(kept(r, model), "a group recovery keeps holds every acknowledged record");
