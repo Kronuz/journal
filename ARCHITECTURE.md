@@ -173,21 +173,22 @@ io_uring, and their fallback worker) live in
 
 ## The shared turn log
 
-`RFTW0001` is one log of turns shared by every group on a core (strata Track C, D11). A
+`RFTW0002` is one log of turns shared by every group on a core (strata Track C, D11). A
 turn is the records the core's groups staged, written in one write and made durable by
 one data barrier (`File::sync_data`): one barrier per core per turn, whatever the group
 count.
 
 - **Segments** are preallocated (64 MiB by default, `TurnLogOptions`) ahead of need, so
   appends never create files or change sizes. Reclaimed segments are recycled by renaming.
+- **Sectors** of 512 bytes each hold 504 data bytes, the segment's low 32 bits and a CRC-32C
+  over the data, the full segment and the sector's index. Recovery decides each sector alone:
+  current, stale (a recycled segment's earlier use), never written, or damage, so damage is
+  never read as a crash's torn tail (`docs/mechanisms/turn-log-damage.md`).
 - **Blocks** of 32 KiB start with a header (magic, identity, segment, block, epoch) that
   also carries the manifest of the block written before it: each group with a fragment
-  there and its highest sequence, under one CRC-32C. A damaged block therefore costs only
-  the groups it names.
+  there and its highest sequence. A damaged block therefore costs only the groups it names.
 - **Records** (a group, a per-group sequence, a kind: batch, hard state, or checkpoint,
-  and a payload) are written as fragments into blocks. Fragments are bound to their
-  segment and epoch, so bytes left by a recycled segment's earlier use never read as
-  current.
+  and a payload) are written as fragments into blocks.
 - **Epochs.** Each open starts a new epoch. Recovery reads epoch by epoch; the newest
   epoch's last turn is the torn tail and is kept only if complete, and a torn turn of an
   earlier epoch names nothing acknowledged.

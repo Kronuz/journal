@@ -64,6 +64,24 @@ ends in a zero length, zeros, or a stale sector.
    later turn than the gap's end belongs to: at least the first turn not kept, and at least each
    record's before the gap (the next turn, past a turn's end).
 
+## Cost
+
+Bytes the log grows per turn against `RFTW0001` (`journal_turn_log_test cost`, 8 seeds of 400
+turns, job 261123-104143-3708f8):
+
+| Workload | Block | Payload | `RFTW0001` | `RFTW0002` | Change |
+|---|---|---|---|---|---|
+| T9's (1-3 records up to 700 B) | 2 KiB | 684.8 | 897.3 | 838.2 | -6.59% |
+| T9's | 4 KiB | 684.8 | 869.2 | 816.1 | -6.10% |
+| T9's | 32 KiB | 684.8 | 838.8 | 790.8 | -5.72% |
+| turn_bench, 16 groups, half active, 256 B | 32 KiB | 2042.7 | 2512.4 | 2366.7 | -5.80% |
+| the same, 4 KiB records | 32 KiB | 32683.5 | 33350.7 | 33673.8 | +0.97% |
+
+Shorter fragment headers pay for the trailers below about 700-byte records. Each write covers
+whole sectors, so it writes the partial sector before it again and zeros after it: 1300-1349
+bytes per T9 turn (+50-55%), 2875.7 at 256 B (+14.5%), 34184.6 at 4 KiB (+2.5%), in pages the
+turn already dirties.
+
 ## Limits
 
 - A sector more than 2^32 segments older than the file's segment reads as damage, not as stale:

@@ -20,7 +20,7 @@
  * THE SOFTWARE.
  */
 
-// D14's journal half (strata Track C): one journal of turns per core (RFTW0001) against one
+// D14's journal half (strata Track C): one journal of turns per core (RFTW0002) against one
 // preallocated file per group whose turn is made durable by IO::sync_files, the measured
 // alternative. Each core is a thread with its own directory; each turn carries one record
 // from each group active in it. Reports turns per second per core, the turn's p50 and

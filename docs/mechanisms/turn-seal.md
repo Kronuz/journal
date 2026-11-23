@@ -4,7 +4,7 @@
 > `docs/design/rocksdb-parity.md` D3) included.
 > Consumer: strata `docs/design/standalone-turn-log.md` revision 1 (D3, D4, D5; review R3), at
 > strata:8e919415, and the shim it replaces, strata:efe25bcd `include/strata/core/turn_seal.hh`.
-> Format: `RFTW0001`, unchanged.
+> Format: `RFTW0002` (docs/mechanisms/turn-log-damage.md).
 
 # Sealed records: a group's records per turn
 
@@ -123,24 +123,29 @@ Each turn must fit an empty segment, or
 that holds whatever the block manifests are:
 
 ```
-E <= (C + 126 + B/2) * B / (B - 126),   C = sum over records of (payload + 65), end of turn included
+D = B / 512 * 504                       a block's data bytes
+E_data <= (C + 126 + D/2) * D / (D - 126),   C = sum over records of (payload + 65), end of turn included
+E <= ceil(E_data / 504) * 512           the whole sectors the turn writes
 ```
 
-Each record costs its payload, the 25-byte logical header, a 24-byte fragment header, and a 16-byte
-manifest entry in the next block's header. Each block adds at most 126 bytes: its 62-byte fixed
-header, up to 24 bytes of padding, and one record split across its start (24 + 16). The first
-block's header, which names the groups of the block before it, is at most half a block, because a
-larger manifest is not kept. With `k <= E/B + 1` blocks, `E <= C + 126k + B/2` gives the bound.
-`turn_log_detail::turn_bound` computes it and `turn_room` inverts it; the `bound` case checks both
-against `framing::Emitter` with 256-byte to 32 KiB blocks, many groups and full first manifests.
-For 32 KiB blocks the overhead past the records is about 16.2 KiB plus 0.4%.
+Each record costs its payload, the 25-byte logical header, a 4-byte fragment header, and a 16-byte
+manifest entry in the next block's header: 45 bytes, charged as 65. Each block adds at most 82 data
+bytes, its 58-byte fixed header, up to 4 bytes of padding, and one record split across its start
+(4 + 16), charged as 126. The charges are upper bounds kept from the format before sector checks,
+so a sealer's budget holds as it was. The first block's header, which names the groups of the
+block before it, is at most half a block, because a larger manifest is not kept. With
+`k <= E_data/D + 1` blocks, `E_data <= C + 126k + D/2` gives the bound, and each 504 data bytes
+take a 512-byte sector. `turn_log_detail::turn_bound` computes it and `turn_room` inverts it; the
+`bound` case checks both against the turn log's emitter with 512-byte to 32 KiB blocks, many groups
+and full first manifests. For 32 KiB blocks the overhead past the records is about 16.2 KiB plus
+2.0%.
 
 - **The first sealed record** of a turn (`first`) is offered all that an empty segment has left
   after the pending records (`turn_room(segment_bytes)`), so a full-size record always seals once it is
   first (review R3). The largest record it admits has `payload = turn_room(segment_bytes) - 65`.
   This is the framing bound R3 asks the segment rule to name: with 32 KiB blocks a 64 MiB command
-  seals first in its turn once `segment_bytes` is at least about 64.3 MiB, and seals behind other
-  records within a share once it is at least about 128.5 MiB (`turn_room(segment_bytes / 2) - 65 >=
+  seals first in its turn once `segment_bytes` is at least about 65.3 MiB, and seals behind other
+  records within a share once it is at least about 130.6 MiB (`turn_room(segment_bytes / 2) - 65 >=
   command_bytes`).
 - **Later sealed records**, a group's repeat calls and the other groups' calls alike, share
   `turn_room(segment_bytes / 2)`, each charged its `record_cost` before the next call. When less
@@ -225,11 +230,12 @@ A sealed body is copied once, into the turn's bytes (strata `docs/design/rocksdb
   sealing copies nothing. The log's 25-byte record header needs no room there: the emitter takes
   it as a separate piece.
 - **Framed in place.** `stage()` frames each record's header (`turn_log_detail::header`, on the
-  stack) and payload straight into fragments of the turn's buffer (`framing::Emitter::record(head,
-  body, ...)`), with no `logical()` string first. A forward copy reads its original back through
-  `framing::RecordReader` straight into the copy's fragments, verifying the original's fragments,
-  its record header (kind, group, sequence) and its size (`Live` keeps each live record's payload
-  size in its padding).
+  stack) and payload straight into fragments of the turn's buffer
+  (`turn_log_detail::Emitter::record(head, body, ...)`), with no `logical()` string first, and seals
+  each sector as the turn ends. A forward copy reads its original back through
+  `turn_log_detail::RecordReader` straight into the copy's fragments, verifying the original's
+  sectors, its record header (kind, group, sequence) and its size (`Live` keeps each live record's
+  payload size in its padding).
 - **Laid out, not written.** Whether forward copies fit an empty segment (`fits()`, `fitting()`)
   is answered by a measuring emitter, which places fragments and manifests without a byte or a
   read. A turn past the current segment's rest is written once more, at the next segment's start.
