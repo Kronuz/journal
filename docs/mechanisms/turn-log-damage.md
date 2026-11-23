@@ -67,7 +67,7 @@ ends in a zero length, zeros, or a stale sector.
 ## Cost
 
 Bytes the log grows per turn against `RFTW0001` (`journal_turn_log_test cost`, 8 seeds of 400
-turns, job 261123-104143-3708f8):
+turns):
 
 | Workload | Block | Payload | `RFTW0001` | `RFTW0002` | Change |
 |---|---|---|---|---|---|
@@ -77,10 +77,25 @@ turns, job 261123-104143-3708f8):
 | turn_bench, 16 groups, half active, 256 B | 32 KiB | 2042.7 | 2512.4 | 2366.7 | -5.80% |
 | the same, 4 KiB records | 32 KiB | 32683.5 | 33350.7 | 33673.8 | +0.97% |
 
-Shorter fragment headers pay for the trailers below about 700-byte records. Each write covers
-whole sectors, so it writes the partial sector before it again and zeros after it: 1300-1349
-bytes per T9 turn (+50-55%), 2875.7 at 256 B (+14.5%), 34184.6 at 4 KiB (+2.5%), in pages the
-turn already dirties.
+Shorter fragment headers pay for the trailers below about 700-byte records.
+
+Each write covers whole sectors, so it hands the device the partial sector before it again and
+zeros after it, about 510 bytes more than the log grows. `RFTW0001` hands the write only the
+turn's bytes, but a device writes the sectors they touch and the page cache the pages, so the
+same partial sectors go out under both formats. On those terms, from the same runs:
+
+| Workload | Block | 512 B sectors touched | Change | 4 KiB pages touched | Change |
+|---|---|---|---|---|---|
+| T9's | 2 KiB | 1408.0 -> 1348.6 | -4.22% | 4985.6 -> 4930.6 | -1.10% |
+| T9's | 4 KiB | 1380.0 -> 1325.6 | -3.94% | 4960.0 -> 4905.0 | -1.11% |
+| T9's | 32 KiB | 1349.6 -> 1300.5 | -3.64% | 4930.6 -> 4879.4 | -1.04% |
+| turn_bench, 256 B | 32 KiB | 3022.9 -> 2875.7 | -4.87% | 6603.5 -> 6451.2 | -2.31% |
+| turn_bench, 4 KiB | 32 KiB | 33861.3 -> 34184.6 | +0.95% | 37442.6 -> 37762.6 | +0.85% |
+
+An `RFTW0002` write is exactly the sectors it touches, with no sector past the turn's last, and a
+turn starts in the sector the one before it ends in. `turn_bench`'s "written/appended" counts the
+bytes handed to the write: 1.41 against 1.23 at 256 B and 1.047 against 1.020 at 4 KiB is the
+whole-sector write against an unaligned one, not more sectors on the device.
 
 ## Limits
 
