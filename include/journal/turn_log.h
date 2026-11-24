@@ -247,15 +247,25 @@ private:
 	Stream stream_; std::uint64_t block_, position_, first_; framing::Manifest filling_; std::string bytes_; bool measuring_ = false;
 };
 
+// The sector a turn in flight rewrites and the data its durable version holds, served from memory:
+// the file's copy may be part way through the write.
+struct Held { std::uint64_t sector = ~std::uint64_t{0}; std::string_view data; };
 // A segment's sectors, read a run at a time and checked as they are used: only this segment's
 // pass, so a stale, unwritten or damaged one is corruption to a reader of acknowledged records.
 class Sectors {
 public:
-	Sectors(File& file, std::uint64_t segment) : file_(file), segment_(segment) {}
+	Sectors(File& file, std::uint64_t segment, Held held = {}) : file_(file), segment_(segment), held_(held) {}
 	// The data bytes at [position, position + count), within one block of `block` data bytes.
 	void read(std::uint64_t position, char* to, std::size_t count, std::uint64_t block) {
 		while (count) {
 			const auto sector = position / sector_data;
+			if (sector == held_.sector) {
+				const auto at = position % sector_data, n = std::min<std::uint64_t>(count, sector_data - at);
+				if (at + n > held_.data.size()) { throw Corruption("log record past the data written"); }
+				std::copy_n(held_.data.data() + at, n, to);
+				position += n; to += n; count -= n;
+				continue;
+			}
 			if (sector < first_ || sector >= first_ + loaded_) { load(sector, block); }
 			auto& checked = checked_[sector - first_];
 			const char* bytes = buffer_.data() + (sector - first_) * sector_bytes;
@@ -276,14 +286,14 @@ private:
 		loaded_ = static_cast<std::size_t>(std::min<std::uint64_t>(run, end - sector)); first_ = sector; checked_ = {};
 		if (file_.read_at(sector * sector_bytes, std::span<char>(buffer_.data(), loaded_ * sector_bytes)) != loaded_ * sector_bytes) { loaded_ = 0; throw Corruption("short log read"); }
 	}
-	File& file_; std::uint64_t segment_; std::uint64_t first_ = 0; std::size_t loaded_ = 0; std::array<char, run * sector_bytes> buffer_; std::array<bool, run> checked_{};
+	File& file_; std::uint64_t segment_; Held held_; std::uint64_t first_ = 0; std::size_t loaded_ = 0; std::array<char, run * sector_bytes> buffer_; std::array<bool, run> checked_{};
 };
 
 // Reads back, in order, the record whose first fragment starts at `offset`, checking each block
 // header, fragment and sector on the way, so a record of another segment or epoch is corruption.
 class RecordReader {
 public:
-	RecordReader(File& file, const Stream& stream, std::uint64_t offset) : sectors_(file, stream.segment), stream_(stream), block_(data_bytes(stream.block_bytes)), position_(offset) {}
+	RecordReader(File& file, const Stream& stream, std::uint64_t offset, Held held = {}) : sectors_(file, stream.segment, held), stream_(stream), block_(data_bytes(stream.block_bytes)), position_(offset) {}
 	// Reads the record's next `count` bytes to `to`; a record that ends first is corruption.
 	void read(char* to, std::size_t count) {
 		while (count) {
@@ -323,9 +333,9 @@ private:
 	Sectors sectors_; Stream stream_; std::uint64_t block_, position_; std::uint64_t left_ = 0; std::uint8_t type_ = 0;
 };
 // Reads back the record whose first fragment starts at `offset` (RecordReader).
-inline std::string read_record(File& file, const Stream& stream, std::uint64_t offset) {
+inline std::string read_record(File& file, const Stream& stream, std::uint64_t offset, Held held = {}) {
 	std::string logical;
-	RecordReader reader(file, stream, offset);
+	RecordReader reader(file, stream, offset, held);
 	while (const auto count = reader.piece()) { const auto at = logical.size(); logical.resize(at + count); reader.read(logical.data() + at, count); }
 	return logical;
 }
@@ -751,7 +761,7 @@ private:
 	std::vector<TurnRecord> read_live(std::uint64_t group, const std::vector<std::pair<std::uint64_t, Live>>& positions) {
 		std::vector<TurnRecord> records; records.reserve(positions.size());
 		for (const auto& [sequence, live] : positions) {
-			const auto bytes = turn_log_detail::read_record(reader(live.segment), turn_log_detail::stream(identity_, options_.block_bytes, live.segment, live.epoch), live.offset);
+			const auto bytes = turn_log_detail::read_record(reader(live.segment), turn_log_detail::stream(identity_, options_.block_bytes, live.segment, live.epoch), live.offset, held(live.segment));
 			std::string_view logical(bytes);
 			if (logical.size() < turn_log_detail::record_header || static_cast<std::uint8_t>(logical[0]) != static_cast<std::uint8_t>(live.kind)) { throw Corruption("a live record does not read back as itself"); }
 			logical.remove_prefix(1); get64(logical);  // the kind, then the turn
@@ -837,6 +847,11 @@ private:
 			changed = true;
 		}
 		if (changed) { io_.sync_directory(); }
+	}
+	// While a turn is in flight, the sector its write rewrites reads from partial_.
+	turn_log_detail::Held held(std::uint64_t segment) const {
+		if (!staged_ || segment != segment_ || partial_.empty()) { return {}; }
+		return {offset_ / turn_log_detail::sector_data, partial_};
 	}
 	File& reader(std::uint64_t segment) {
 		auto& file = readers_[segment];

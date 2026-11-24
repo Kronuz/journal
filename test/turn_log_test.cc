@@ -616,6 +616,41 @@ void staged_turns() {
 	j::TurnLog log(io, identity, recovered, small);
 	check(recovered.groups[1] == std::vector{record(1, 1, 100)}, "the completed turn recovers; the failed one does not");
 }
+// Reads while a turn's write is in flight (Host::park mid-turn, a Store's live()): the write is part
+// way through the sector it shares with the turn before, half its new bytes copied, and every
+// group still reads back its acknowledged records.
+void midwrite_reads() {
+	namespace t = j::testing;
+	const std::uint64_t unit = sectors ? 504 : 512;
+	unsigned cases = 0;
+	for (std::uint32_t block : {2048u, 32768u}) {
+		for (std::uint64_t seed = 1; seed <= 4; ++seed) {
+			t::Disk disk; t::MemoryIO io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed); Model model;
+			j::TurnLog log(io, identity, recovered, {64 * std::uint64_t{block}, block, 1, 3, 600});
+			for (unsigned n = 0; n < 100; ++n) {
+				const auto batch = probe_turn(log, random);
+				const auto segment = log.segment(), position = log.position();
+				const auto write = log.stage(batch);
+				std::size_t copied = 0;
+				if (log.segment() == segment && position % unit) {
+					const auto room = unit - position % unit;  // the turn's new data bytes in the shared sector
+					copied = static_cast<std::size_t>((sectors ? position % unit : 0) + std::min<std::uint64_t>(room, write.bytes.size()) / 2);
+					check(write.file->write_at(write.offset, write.bytes.substr(0, copied)) == copied, "the half copy lands");
+					++cases;
+					for (const auto& [group, records] : model) {
+						try { check(log.peek(group) == records, "a read mid-write returns the acknowledged records"); }
+						catch (const std::exception& error) { check(false, std::string("a read mid-write throws: ") + error.what()); }
+					}
+				}
+				check(write.file->write_at(write.offset + copied, write.bytes.substr(copied)) == write.bytes.size() - copied, "the rest lands");
+				write.file->sync_data(); log.completed(); acknowledge(model, batch);
+				for (const auto& [group, records] : model) { check(log.peek(group) == records, "after the barrier every group reads back"); }
+				log.prepare();
+			}
+		}
+	}
+	check(cases > 500, "most turns rewrite a shared sector: " + std::to_string(cases));
+}
 }  // namespace
 
 // The bytes each turn takes in the log, on the cut-header design's workloads: the data position's
@@ -665,7 +700,7 @@ int main(int argc, char** argv) {
 		{"damage", damage}, {"double_damage", double_damage}, {"damaged_header_last_turn", damaged_header_last_turn}, {"double_damage_copy", double_damage_copy},
 		{"earlier_turn_damage", earlier_turn_damage}, {"large_header_damage", large_header_damage}, {"large_header_tear", large_header_tear},
 		{"newest_turn_damage", newest_turn_damage}, {"sector_verdicts", sector_verdicts}, {"stale_alias", stale_alias},
-		{"checkpoints_and_guards", checkpoints_and_guards}, {"stale_bytes", stale_bytes}, {"staged_turns", staged_turns},
+		{"checkpoints_and_guards", checkpoints_and_guards}, {"stale_bytes", stale_bytes}, {"staged_turns", staged_turns}, {"midwrite_reads", midwrite_reads},
 		{"reclamation", [] { for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }}};
 	bool ran = false;
 	if (only == "cost") { cost(); ran = true; }
