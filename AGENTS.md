@@ -23,8 +23,6 @@ include/journal/
   resources.h     Footprint value types and checked arithmetic.
   codec.h         On-disk encodings.
   primitives.h    Shared helpers.
-  memory_io.h     The old power-loss filesystem, kept for consensus and Detent; journal's
-                  tests run on faultlab's faultfs (a test-only FetchContent).
 test/             journal, inventory, admission, turn_log, turn_log_power (T9), driver,
                   shared_store, host, placement, completion, linux_completion.
 fuzz/             libFuzzer target for turn-log segments and checkpoint records, and its replay test.
