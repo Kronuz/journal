@@ -173,7 +173,7 @@ void journal_tail() {
 void open_cost(std::size_t groups) {
 	const auto path = std::filesystem::current_path() / ".scratch" / "sync-seam-open-cost";
 	std::filesystem::remove_all(path); std::filesystem::create_directories(path);
-	auto io = std::make_shared<CountingIO>(std::make_shared<j::PosixIO>(path), true);
+	auto io = std::make_shared<CountingIO>(std::make_shared<j::PosixIO>(path, j::PosixIOOptions{j::FlushMode::full}), true);
 	const auto start = std::chrono::steady_clock::now();
 	{
 		j::Host host(io, host_identity, j::HostOptions{1, turn_options});

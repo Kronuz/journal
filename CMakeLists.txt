@@ -11,7 +11,7 @@ set(TASK_ASIO OFF)
 # completion::task: completion_ref, InlineCompletion and HeldCompletion over task.hh.
 set(COMPLETION_TASK ON)
 set(COMPLETION_ASIO OFF)
-FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG d8b538c6778f0a1b969e42c8428995d1d29d4731)
+FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG b4600a82a8d30d4f63541d9c322a4ac5eceaee95)
 # Fixed-vector reservation accounting shared with managed local storage.
 FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG 07de45d180f23e2552b9504a6b4d506651594d1e)
 # CRC-32C: one implementation, header-only, no dependencies.
@@ -29,7 +29,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
 	# faultlab's faultfs, the crash model the power-loss tests and fuzzers run on; test-only. It
 	# reuses the completion target declared above.
-	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG 5d4df9b04d7064fc978c84d29e7db8e6789bb10c)
+	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG 83fbde73c008e15e64ea7aa73c4c3b9b94e0599c)
 	FetchContent_MakeAvailable(faultlab)
 	set(faultfs_tests journal framing turn_log turn_log_power shared_store driver host host_delete placement turn_seal sync_seam lost_bound)
 	foreach(t journal inventory admission framing turn_log turn_log_power shared_store crc_fixture driver host host_delete placement turn_seal sync_seam lost_bound)
@@ -92,6 +92,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	set_tests_properties(journal_framing PROPERTIES TIMEOUT 120)  # about 27 s under ASan and UBSan at -O0
 	set_tests_properties(journal_crc_fixture PROPERTIES TIMEOUT 120)  # 217 full flushes on macOS: 12-21 s on a busy host
 	set_tests_properties(journal_turn_log_power PROPERTIES TIMEOUT 600)
+	# T9 in plain mode: a process crash loses nothing, a power loss only states a group was in.
+	add_test(NAME journal_turn_log_power_plain COMMAND journal_turn_log_power_test plain)
+	set_tests_properties(journal_turn_log_power_plain PROPERTIES TIMEOUT 600)
 	set_tests_properties(journal_shared_store PROPERTIES TIMEOUT 600)
 	# T8: the shared journal's decoders, replayed over seeded inputs; libFuzzer with JOURNAL_FUZZ.
 	add_executable(journal_fuzz_replay fuzz/fuzz_turn_log.cc fuzz/replay.cc)
@@ -129,6 +132,14 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 		target_link_libraries(journal_completion_test PRIVATE journal::journal)
 		add_test(NAME journal_completion COMMAND journal_completion_test)
 		set_tests_properties(journal_completion PROPERTIES TIMEOUT 30)
+		# The flush mode through completion's sync seam: a host's turns and checkpoint, the full-mode
+		# refusal, and the recorded calls against faultlab's model.
+		add_executable(journal_sync_mode_test test/sync_mode_test.cc)
+		target_link_libraries(journal_sync_mode_test PRIVATE journal::journal faultlab::faultlab)
+		foreach(c host refusal table)
+			add_test(NAME journal_sync_mode_${c} COMMAND journal_sync_mode_test ${c})
+			set_tests_properties(journal_sync_mode_${c} PROPERTIES TIMEOUT 120)
+		endforeach()
 	endif()
 	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		add_executable(journal_linux_completion_test test/linux_completion_test.cc)

@@ -25,9 +25,12 @@
 // may end at any sector boundary (size_pick::sector), and whose namespace changes persist only
 // after a directory sync. Power is cut after every mutating I/O operation of each run, and at
 // every third point again during the recovery that follows. Segments recycle, so stale blocks
-// from an earlier use are present (condition 10).
+// from an earlier use are present (condition 10). The sweep runs in either flush mode, with the
+// calls macOS makes on any host: full loses nothing acknowledged; plain survives a process crash
+// whole, and after a power loss recovers, per group, only a state the group was in.
 #include "faultlab/faultfs.h"
 #include "journal/turn_log.h"
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -56,6 +59,7 @@ j::TurnRecord record(std::uint64_t group, std::uint64_t sequence, std::size_t si
 }
 struct Workload {
 	std::mt19937_64 random; Model acknowledged; std::vector<j::TurnRecord> in_flight;
+	std::map<std::uint64_t, std::vector<std::vector<j::TurnRecord>>> history;  // each group's every acknowledged state
 	explicit Workload(std::uint64_t seed) : random(seed) {}
 	// One turn: one to three groups of six, records up to 700 bytes, one in five a checkpoint;
 	// group 9 writes once and then idles, so its record must move forward.
@@ -74,6 +78,19 @@ struct Workload {
 	}
 	void acknowledge(const std::vector<j::TurnRecord>& batch) {
 		for (const auto& r : batch) { if (r.kind == j::TurnRecordKind::Checkpoint) { acknowledged[r.group].clear(); } acknowledged[r.group].push_back(r); }
+		for (const auto& r : batch) { history[r.group].push_back(acknowledged[r.group]); }
+	}
+	// Plain mode's power loss: every group recovery keeps is in a state it was in, the in-flight
+	// turn's included; nothing recovered was never written.
+	bool consistent(const j::TurnRecovery& recovered) const {
+		auto with = acknowledged; for (const auto& r : in_flight) { if (r.kind == j::TurnRecordKind::Checkpoint) { with[r.group].clear(); } with[r.group].push_back(r); }
+		for (const auto& [group, records] : recovered.groups) {
+			if (recovered.lost.contains(group)) { continue; }
+			const auto found = history.find(group);
+			const bool known = found != history.end() && std::find(found->second.begin(), found->second.end(), records) != found->second.end();
+			if (!known && !(with.contains(group) && with.at(group) == records)) { return false; }
+		}
+		return true;
 	}
 	// Recovery holds every acknowledged record, and the in-flight turn whole or not at all.
 	bool matches(const j::TurnRecovery& recovered) {
@@ -85,15 +102,27 @@ struct Workload {
 };
 // The geometry under test: main runs sector-sized and multi-sector blocks.
 j::TurnLogOptions options{8 * 512, 512, 1, 3, 600};
+// The sweep's flush mode, and how each run's loss ends: a power loss (crash) or, in plain mode, a
+// process crash (power_on), which keeps what a plain sync left in the drive's cache.
+enum class Mode { full, plain };
+enum class Loss { power, process };
+// The disk makes the calls completion's PosixIO makes on macOS in `mode`, on every host.
+void open_mode(fl::filesystem& disk, Mode mode) {
+	disk.set_flush_mode(mode == Mode::full ? fl::flush_mode::full : fl::flush_mode::plain, fl::sync_platform::macos);
+}
+// Plain mode's tally: crash points whose power loss lost an acknowledged record, or reported damage.
+struct PlainLoss { std::uint64_t lost = 0, damaged = 0; };
+PlainLoss plain_loss;
 std::string listing(const fl::filesystem& disk) { std::string names; for (const auto& name : disk.list()) { names += ' ' + name; } return names; }
 
 // Runs `turns` turns, cutting power at mutation `cut` (and at `second` during the recovery
 // that follows), then reopens and continues for `after` more turns. Only the power cut fails a
 // run: any other error is a failure.
-void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned turns, unsigned after) {
-	fl::filesystem disk; fl::io io(disk); Workload work(seed);
+void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned turns, unsigned after, Mode mode, Loss loss) {
+	fl::filesystem disk; open_mode(disk, mode); fl::io io(disk); Workload work(seed);
 	j::TurnRecovery recovered;
-	const auto at = "seed " + std::to_string(seed) + " cut " + std::to_string(cut) + " second " + std::to_string(second);
+	const auto at = std::string(mode == Mode::full ? "full" : "plain") + (loss == Loss::power ? " power" : " process") + " seed " + std::to_string(seed) + " cut " + std::to_string(cut) + " second " + std::to_string(second);
+	auto lose = [&](std::uint64_t crash_seed) { if (loss == Loss::power) { disk.crash(crash_seed, sector_cut); } else { disk.power_on(); } };
 	try {
 		disk.power_off_after(cut - 1);
 		j::TurnLog log(io, identity, recovered, options);
@@ -105,18 +134,24 @@ void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned t
 	} catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails the run: " + at + ": " + error.what()); }
 	// The namespace at each crash, so a failure names the segments it left.
 	auto names = "; before crash" + listing(disk);
-	disk.crash(seed * 7919 + cut, sector_cut);
+	lose(seed * 7919 + cut);
 	names += "; after" + listing(disk);
 	if (second) {
 		disk.power_off_after(second - 1);
 		try { j::TurnLog log(io, identity, recovered, options); }
 		catch (const std::exception& error) { check(disk.powered_off(), "only the power cut fails recovery: " + at + ": " + error.what()); }
 		names += "; before second crash" + listing(disk);
-		disk.crash(seed * 7919 + cut + (second << 32), sector_cut);
+		lose(seed * 7919 + cut + (second << 32));
 		names += "; after" + listing(disk);
 	}
 	try {
 		j::TurnLog log(io, identity, recovered, options);
+		if (mode == Mode::plain && loss == Loss::power) {
+			check(work.consistent(recovered), "plain mode's power loss recovers each group in a state it was in: " + at + names);
+			plain_loss.damaged += recovered.damaged || !recovered.lost.empty();
+			plain_loss.lost += !work.matches(recovered);
+			return;
+		}
 		check(!recovered.damaged && recovered.lost.empty(), "power loss alone damages nothing and loses no group: " + at + names);
 		check(work.matches(recovered), "every acknowledged record survives, and the in-flight turn whole or not at all: " + at);
 		work.in_flight.clear();
@@ -491,25 +526,29 @@ void probe(std::uint64_t seeds, std::uint64_t block_seeds) {
 }  // namespace
 
 int main(int argc, char** argv) {
-	// turn_log_power_test [SEEDS [FIRST_SEED [BLOCK_BYTES]]]: SEEDS seeds from FIRST_SEED, at one
-	// geometry or all. turn_log_power_test probe [SEEDS [BLOCK_SEEDS]]: the cut-header probe's sweeps.
+	// turn_log_power_test [plain] [SEEDS [FIRST_SEED [BLOCK_BYTES]]]: SEEDS seeds from FIRST_SEED,
+	// at one geometry or all, in full mode or plain. turn_log_power_test probe [SEEDS [BLOCK_SEEDS]]:
+	// the cut-header probe's sweeps.
 	if (argc > 1 && std::string_view(argv[1]) == "probe") {
 		probe(argc > 2 ? std::stoull(argv[2]) : 24, argc > 3 ? std::stoull(argv[3]) : 40);
 		std::cout << checks << " checks, " << failures << " failures\n";
 		return failures ? 1 : 0;
 	}
+	const Mode mode = argc > 1 && std::string_view(argv[1]) == "plain" ? Mode::plain : Mode::full;
+	if (mode == Mode::plain) { --argc; ++argv; }
 	const std::uint64_t seeds = argc > 1 ? std::stoull(argv[1]) : 8, first = argc > 2 ? std::stoull(argv[2]) : 1;
 	const std::uint32_t only = argc > 3 ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 0;
 	const std::pair<std::uint32_t, std::uint64_t> geometries[] = {{512, 8}, {4096, 4}, {2048, 8}, {1024, 8}};
-	unreadable();
+	if (mode == Mode::full) { unreadable(); }
 	for (const auto& [block, blocks] : geometries) {
 		if (only && block != only) { continue; }
 		options = j::TurnLogOptions{block * blocks, block, 1, 3, 600};
 		const auto before = failures;
+		const auto loss_before = plain_loss;
 		std::uint64_t points = 0, seconds = 0;
 		for (std::uint64_t seed = first; seed < first + seeds; ++seed) {
 			// How many mutations an uninterrupted run makes.
-			fl::filesystem disk; fl::io io(disk); Workload work(seed); j::TurnRecovery recovered;
+			fl::filesystem disk; open_mode(disk, mode); fl::io io(disk); Workload work(seed); j::TurnRecovery recovered;
 			{
 				j::TurnLog log(io, identity, recovered, options);
 				for (unsigned t = 0; t < 60; ++t) { auto b = work.turn(log); log.append(b); work.acknowledge(b); log.prepare(); }
@@ -518,8 +557,14 @@ int main(int argc, char** argv) {
 			for (std::uint64_t cut = 1; cut <= disk.mutations(); ++cut, ++points) {
 				const std::uint64_t second = cut % 3 == 0 ? cut % 7 + 1 : 0;
 				seconds += second != 0;
-				run(seed, cut, second, 60, 5);
+				run(seed, cut, second, 60, 5, mode, Loss::power);
+				if (mode == Mode::plain) { run(seed, cut, second, 60, 5, mode, Loss::process); }
 			}
+		}
+		if (mode == Mode::plain) {
+			std::cout << "block " << block << ", plain: " << points << " crash points (" << seconds << " with a second loss in recovery), each a power loss and a process crash; "
+				<< plain_loss.lost - loss_before.lost << " power losses lost an acknowledged record, " << plain_loss.damaged - loss_before.damaged << " reported damage, " << failures - before << " failures\n";
+			continue;
 		}
 		std::uint64_t corrupted = 0, both = 0, header = 0, last = 0, sectors = 0, tears = 0;
 		for (std::uint64_t seed = first; seed < first + seeds; ++seed) {
@@ -530,6 +575,8 @@ int main(int argc, char** argv) {
 		std::cout << "block " << block << ": " << points << " crash points (" << seconds << " with a second loss in recovery), " << corrupted << " corrupted blocks, " << both << " doubly damaged boundaries, "
 			<< header << " damaged headers, " << last << " damaged last blocks, " << sectors << " damaged sectors, " << tears << " tears of the newest write, " << failures - before << " failures\n";
 	}
+	// Plain mode is not full mode: its power losses lose acknowledged records the sweep finds.
+	if (mode == Mode::plain) { check(plain_loss.lost > 0, "a plain-mode power loss loses an acknowledged record at some crash point"); }
 	std::cout << checks << " checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
 }

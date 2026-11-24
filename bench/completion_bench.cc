@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
 	std::filesystem::create_directories(directory);
 	::chmod(directory.c_str(), 0700);
 	try {
-		auto io = std::make_shared<PosixIO>(directory);
+		auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full});
 		Journal journal(io, 65536);
 		Identity identity{};
 		identity[0] = 'b';

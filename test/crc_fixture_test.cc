@@ -98,7 +98,7 @@ std::string read_artifact(j::ArtifactReader& reader) {
 
 // Three batches, a checkpoint with one dependency covering them, then the rest.
 void generate_journal(const fs::path& directory) {
-	j::PosixIO io(directory); j::Journal journal(io, 1 << 20);
+	j::PosixIO io(directory, j::PosixIOOptions{j::FlushMode::full}); j::Journal journal(io, 1 << 20);
 	journal.create(journal_identity);
 	for (std::size_t i = 0; i < 3; ++i) { journal.append_batch(batches()[i]); }
 	auto dependency = prepare(journal, dependency_bytes()); auto bundle = prepare(journal, checkpoint_bytes());
@@ -129,7 +129,7 @@ Groups write_turns(j::TurnLog& log) {
 	return model;
 }
 void generate_turn_log(const fs::path& directory) {
-	j::PosixIO io(directory); auto owner = io.acquire_owner(true);
+	j::PosixIO io(directory, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered;
 	j::TurnLog log(io, turn_identity, recovered, turn_options);
 	write_turns(log);
@@ -188,7 +188,7 @@ void journal_fixture() {
 	std::vector<std::string> replayed;
 	j::Frontier frontier;
 	{
-		j::PosixIO io(directory); j::Journal journal(io, 1 << 20);
+		j::PosixIO io(directory, j::PosixIOOptions{j::FlushMode::full}); j::Journal journal(io, 1 << 20);
 		std::string checkpoint, dependency; std::size_t dependencies = 0;
 		frontier = journal.recover([&](auto sequence, std::string_view batch) { check(sequence == replayed.size() + 4, "suffix replay is contiguous"); replayed.emplace_back(batch); },
 			[&](const j::Frontier& selected, j::ArtifactReader& artifact, std::span<j::ArtifactReader> required) {
@@ -251,7 +251,7 @@ void journal_fixture() {
 			fs::remove_all(damaged); fs::copy(directory, damaged, fs::copy_options::recursive);
 			flip(damaged / name, offset);
 			check(throws([&] {
-				j::PosixIO io(damaged); j::Journal journal(io, 1 << 20);
+				j::PosixIO io(damaged, j::PosixIOOptions{j::FlushMode::full}); j::Journal journal(io, 1 << 20);
 				journal.recover([](auto, auto) {}, [](const j::Frontier&, j::ArtifactReader& a, std::span<j::ArtifactReader> r) { read_artifact(a); for (auto& d : r) { read_artifact(d); } });
 			}), "a flipped byte is refused");
 		}
@@ -263,11 +263,11 @@ void journal_fixture() {
 #ifdef JOURNAL_TURN_LOG
 void turn_log_fixture() {
 	auto directory = copy_fixture("turn-log");
-	j::PosixIO io(directory); auto owner = io.acquire_owner(true);
+	j::PosixIO io(directory, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	// The expected records come from the same deterministic workload, replayed into a scratch log.
 	Groups expected;
 	{
-		auto reference = scratch("turn-log-reference"); j::PosixIO reference_io(reference); auto reference_owner = reference_io.acquire_owner(true);
+		auto reference = scratch("turn-log-reference"); j::PosixIO reference_io(reference, j::PosixIOOptions{j::FlushMode::full}); auto reference_owner = reference_io.acquire_owner(true);
 		j::TurnRecovery ignored; j::TurnLog log(reference_io, turn_identity, ignored, turn_options);
 		expected = write_turns(log);
 	}
@@ -298,7 +298,7 @@ void turn_log_fixture() {
 		check(!segments.empty(), "the fixture holds turn-log segments");
 		if (!segments.empty() && fs::file_size(segments.front()) > offset) {
 			flip(segments.front(), offset);
-			j::PosixIO damaged_io(damaged); auto damaged_owner = damaged_io.acquire_owner(true);
+			j::PosixIO damaged_io(damaged, j::PosixIOOptions{j::FlushMode::full}); auto damaged_owner = damaged_io.acquire_owner(true);
 			j::TurnRecovery after; j::TurnLog log(damaged_io, turn_identity, after, turn_options);
 			check(after.damaged || !after.lost.empty() || after.groups != expected, "a damaged turn-log byte does not read back as intact");
 		}

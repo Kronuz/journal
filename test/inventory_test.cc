@@ -103,7 +103,7 @@ void posix() {
 	if (!std::filesystem::create_directory(path)) { throw std::runtime_error("test directory exists"); }
 	::chmod(path.c_str(), 0700);
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{path};
-	PosixIO io(path);
+	PosixIO io(path, PosixIOOptions{FlushMode::full});
 	auto file = io.create_exclusive("file"); file->write_at(1024 * 1024, "x"); file.reset();
 	std::filesystem::rename(path / "file", path / std::string(200, 'f'));
 	std::filesystem::create_symlink("nonexistent-target", path / "link");

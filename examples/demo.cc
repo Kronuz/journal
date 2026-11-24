@@ -25,12 +25,15 @@
 #include <iostream>
 
 int main(int argc, char** argv) {
-	if (argc < 3) {
-		std::cerr << "usage: journal_demo DIRECTORY create|read|append [PAYLOAD]\n";
+	// The flush mode is the caller's: full survives power loss on macOS, plain survives a crash.
+	const std::string_view mode = argc > 1 ? argv[1] : "";
+	if (argc < 4 || (mode != "plain" && mode != "full")) {
+		std::cerr << "usage: journal_demo plain|full DIRECTORY create|read|append [PAYLOAD]\n";
 		return 2;
 	}
+	--argc; ++argv;
 	try {
-		kronuz::journal::PosixIO io(argv[1]);
+		kronuz::journal::PosixIO io(argv[1], kronuz::journal::PosixIOOptions{mode == "full" ? kronuz::journal::FlushMode::full : kronuz::journal::FlushMode::plain});
 		kronuz::journal::Journal journal(io, 1024 * 1024);
 		std::string_view command(argv[2]);
 		kronuz::journal::Frontier frontier;

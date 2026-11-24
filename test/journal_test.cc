@@ -1253,7 +1253,7 @@ void store_posix() {
 	struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
 	std::optional<PublishedArtifactSelection> old_selection;
 	{
-		PosixIO io(directory); Store store(io, store_limits, 1024); store.create(identity()); ready_store(store);
+		PosixIO io(directory, PosixIOOptions{FlushMode::full}); Store store(io, store_limits, 1024); store.create(identity()); ready_store(store);
 		auto append = store.reserve_append(AdmissionClass::Normal, 5); store.append(*append, "first");
 		auto replacement = store.reserve_replacement(128, 128); store_replacement(store, *replacement);
 		auto cancel = store.reserve_replacement(128, 128); store.begin_artifact(*cancel, ArtifactPart::Application); store.write_chunk(*cancel, "orphan"); store.cancel_replacement(*cancel);
@@ -1263,7 +1263,7 @@ void store_posix() {
 		old_selection = store.select_published_dependency(0);
 	}
 	{
-		PosixIO io(directory); Store store(io, store_limits, 1024); std::string bundle, application;
+		PosixIO io(directory, PosixIOOptions{FlushMode::full}); Store store(io, store_limits, 1024); std::string bundle, application;
 		store.recover([](auto, auto) {}, [&](auto&, auto& reader, auto deps) { bundle = read_artifact(reader); application = read_artifact(deps[0]); }); ready_store(store);
 		check(bundle == "bundle" && application == "app" && store.frontier().sequence == 1, "actual POSIX Store reopens acknowledged replacement");
 		check(throws([&] { store.begin_published_verification(*old_selection); }) && !store.fenced(), "POSIX reopen rejects previous selection while acquiring the stable lock");
@@ -1744,14 +1744,14 @@ void posix() {
 	::chmod(directory.c_str(), 0700);
 	struct Cleanup { std::filesystem::path directory; ~Cleanup() { std::filesystem::remove_all(directory); } } cleanup{directory};
 	{
-		PosixIO io(directory); Journal journal(io, 1024);
+		PosixIO io(directory, PosixIOOptions{FlushMode::full}); Journal journal(io, 1024);
 		journal.create(identity()); journal.append_batch("real filesystem");
-		PosixIO second_io(directory); Journal second(second_io);
+		PosixIO second_io(directory, PosixIOOptions{FlushMode::full}); Journal second(second_io);
 		check(throws([&] { second.recover([](auto, auto) {}); }), "POSIX lock excludes another open owner");
 		check(throws([&] { io.create_exclusive("../escape"); }), "POSIX filename cannot escape directory");
 	}
 	{
-		PosixIO io(directory); Journal journal(io, 1024);
+		PosixIO io(directory, PosixIOOptions{FlushMode::full}); Journal journal(io, 1024);
 		std::vector<std::string> batches;
 		journal.recover([&](auto, std::string_view batch) { batches.emplace_back(batch); });
 		check(batches == std::vector<std::string>{"real filesystem"}, "POSIX reopen replays acknowledged batch");
@@ -1760,7 +1760,7 @@ void posix() {
 		journal.publish_checkpoint(bundle, dependencies, 2); journal.append_batch("tail");
 	}
 	{
-		PosixIO io(directory); Journal journal(io, 1024); std::string image, dependency, tail;
+		PosixIO io(directory, PosixIOOptions{FlushMode::full}); Journal journal(io, 1024); std::string image, dependency, tail;
 		auto frontier = journal.recover([&](auto sequence, std::string_view batch) { check(sequence == 3, "POSIX checkpoint suffix sequence continues"); tail = batch; },
 			[&](const Frontier&, ArtifactReader& bundle, std::span<ArtifactReader> dependencies) { image = read_artifact(bundle); dependency = read_artifact(dependencies[0]); });
 		check(frontier.base_sequence == 2 && image == "prefix image" && dependency == "app" && tail == "tail", "POSIX checkpoint generation restores declared artifact and suffix");
@@ -1782,7 +1782,7 @@ void posix() {
 		check(stats.unknown_files == preserved.size(), "POSIX skipped ownership candidates are reported");
 	}
 	std::filesystem::create_symlink("manifest", directory / "symlink");
-	PosixIO io(directory);
+	PosixIO io(directory, PosixIOOptions{FlushMode::full});
 	check(throws([&] { io.open_existing("symlink"); }), "POSIX symlink file is rejected");
 	std::filesystem::create_hard_link(directory / "manifest", directory / "hardlink");
 	check(throws([&] { io.open_existing("hardlink"); }), "POSIX shared inode is rejected");
@@ -2272,12 +2272,12 @@ void park_count() {
 			std::cout << "park_count: the host opens over " << ids << " parked groups in " << files << " table files on " << real << " in";
 			for (int open = 0; open < 3; ++open) {
 				const auto opening = std::chrono::steady_clock::now();
-				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory)), reopen_host, HostOptions{1, turns_options});
+				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full})), reopen_host, HostOptions{1, turns_options});
 				std::cout << " " << std::chrono::duration<double>(std::chrono::steady_clock::now() - opening).count() << " s";
 			}
 			std::cout << "\n";
 			{
-				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory)), reopen_host, HostOptions{1, turns_options});
+				Host copy(std::make_shared<MeteredIO>(std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full})), reopen_host, HostOptions{1, turns_options});
 				transitions(copy, " on " + std::string(real), 100);  // each syncs for real
 			}
 			std::filesystem::remove_all(directory);

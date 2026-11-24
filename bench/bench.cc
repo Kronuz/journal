@@ -20,14 +20,15 @@
  * THE SOFTWARE.
  */
 
-// 64 sequential durable batches per case, through the journal. With --compare, the same batches
-// through the plain loop a caller writes without the library: one write and one durable flush
-// per batch (F_FULLFSYNC on macOS, whose fsync leaves data in the drive's cache; fdatasync on
-// Linux), appended to one file, with no batch header, checksum, manifest or recovery. The
-// comparison checks first that both made the same bytes durable: the journal's recovered
-// batches, the plain file and the batches written are the same byte string.
+// 64 sequential durable batches per case, through the journal in the flush mode named. With
+// --compare, the same batches through the raw loop a caller writes without the library: one
+// write and one flush per batch, the call the mode's File::sync_data makes (macOS: F_FULLFSYNC in
+// full, fsync in plain, which leaves data in the drive's cache; Linux: fdatasync in both),
+// appended to one file, with no batch header, checksum, manifest or recovery. The comparison
+// checks first that both made the same bytes durable: the journal's recovered batches, the raw
+// file and the batches written are the same byte string.
 //
-//   journal_bench [--compare]      run it from the repository root; it writes under .scratch/
+//   journal_bench plain|full [--compare]   run it from the repository root; it writes under .scratch/
 #include "journal/journal.h"
 #include "completion/posix.h"
 #include <algorithm>
@@ -57,35 +58,38 @@ static double cpu_seconds() {
 namespace {
 constexpr unsigned groups = 64;
 
-#ifdef __APPLE__
-constexpr const char* plain_flush_name = "F_FULLFSYNC";
-#elif defined(__linux__)
-constexpr const char* plain_flush_name = "fdatasync";
-#else
-constexpr const char* plain_flush_name = "fsync";
-#endif
+namespace j = kronuz::journal;
 
 [[noreturn]] void fail(const char* what) { throw std::system_error(errno, std::generic_category(), what); }
 
-// The durable flush of the plain loop.
-void plain_flush(int fd) {
+// The raw loop's flush: the call `mode` makes for File::sync_data, as completion's sync_call names it.
+const char* raw_flush_name(j::FlushMode mode) {
+	switch (j::sync_call(j::SyncSite::data, mode)) {
+	case j::SyncCall::full_fsync: return "F_FULLFSYNC";
+	case j::SyncCall::fdatasync: return "fdatasync";
+	default: return "fsync";
+	}
+}
+void raw_flush(int fd, j::FlushMode mode) {
 	int result;
+	switch (j::sync_call(j::SyncSite::data, mode)) {
 #ifdef __APPLE__
-	do { result = ::fcntl(fd, F_FULLFSYNC); } while (result < 0 && errno == EINTR);
-#elif defined(__linux__)
-	do { result = ::fdatasync(fd); } while (result < 0 && errno == EINTR);
-#else
-	do { result = ::fsync(fd); } while (result < 0 && errno == EINTR);
+	case j::SyncCall::full_fsync: do { result = ::fcntl(fd, F_FULLFSYNC); } while (result < 0 && errno == EINTR); break;
 #endif
-	if (result < 0) { fail("plain flush"); }
+#ifdef __linux__
+	case j::SyncCall::fdatasync: do { result = ::fdatasync(fd); } while (result < 0 && errno == EINTR); break;
+#endif
+	default: do { result = ::fsync(fd); } while (result < 0 && errno == EINTR); break;
+	}
+	if (result < 0) { fail("raw flush"); }
 }
 
-void plain_write(int fd, std::string_view bytes) {
+void raw_write(int fd, std::string_view bytes) {
 	while (!bytes.empty()) {
 		auto written = ::write(fd, bytes.data(), bytes.size());
 		if (written < 0) {
 			if (errno == EINTR) { continue; }
-			fail("plain write");
+			fail("raw write");
 		}
 		bytes.remove_prefix(static_cast<std::size_t>(written));
 	}
@@ -143,12 +147,18 @@ struct Scratch {
 }  // namespace
 
 int main(int argc, char** argv) {
+	const std::string_view mode_name = argc > 1 ? argv[1] : "";
+	if ((mode_name != "plain" && mode_name != "full") || argc > 3 || (argc == 3 && std::string_view(argv[2]) != "--compare")) {
+		std::cerr << "usage: journal_bench plain|full [--compare]\n";
+		return 2;
+	}
+	const j::FlushMode mode = mode_name == "full" ? j::FlushMode::full : j::FlushMode::plain;
 	try {
-		bool compare = argc > 1 && std::string_view(argv[1]) == "--compare";
+		bool compare = argc == 3;
 		const auto root = std::filesystem::current_path() / ".scratch";
 		std::filesystem::create_directories(root);
-		std::cout << "opaque operation bytes=256, groups=64; local filesystem microbenchmark\n";
-		if (compare) { std::cout << "writer: journal, or plain = one write and one " << plain_flush_name << " per batch, no framing\n"; }
+		std::cout << "opaque operation bytes=256, groups=64, flush mode " << mode_name << "; local filesystem microbenchmark\n";
+		if (compare) { std::cout << "writer: journal, or raw = one write and one " << raw_flush_name(mode) << " per batch, no framing\n"; }
 		std::cout << (compare ? "writer, " : "") << "ops/group, payload_bytes, wall_s, cpu_s, ops/s, p50_batch_ms, p99_batch_ms\n";
 		for (std::size_t operations : {1u, 32u, 256u}) {
 			const auto stem = "journal-bench-" + std::to_string(::getpid()) + "-" + std::to_string(operations);
@@ -157,7 +167,7 @@ int main(int argc, char** argv) {
 			kronuz::journal::Identity identity{}; identity[0] = 'B';
 			Result journaled{};
 			{
-				kronuz::journal::PosixIO io(directory.path);
+				j::PosixIO io(directory.path, j::PosixIOOptions{mode});
 				kronuz::journal::Journal journal(io, 1024 * 1024);
 				journal.create(identity);
 				journaled = measure(batch, [&](const std::string& bytes) { journal.append_batch(bytes); });
@@ -165,32 +175,32 @@ int main(int argc, char** argv) {
 			print(compare ? "journal" : nullptr, operations, batch.size(), journaled);
 			if (!compare) { continue; }
 
-			Scratch plain_directory(root / (stem + "-plain"));
-			const auto plain_path = plain_directory.path / "log";
-			Result plain{};
+			Scratch raw_directory(root / (stem + "-raw"));
+			const auto raw_path = raw_directory.path / "log";
+			Result raw{};
 			{
-				Descriptor file{::open(plain_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600)};
-				if (file.fd < 0) { fail("plain open"); }
-				plain_flush(file.fd);
-				Descriptor dir{::open(plain_directory.path.c_str(), O_RDONLY)};
-				if (dir.fd < 0 || ::fsync(dir.fd) < 0) { fail("plain directory"); }
-				plain = measure(batch, [&](const std::string& bytes) { plain_write(file.fd, bytes); plain_flush(file.fd); });
+				Descriptor file{::open(raw_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600)};
+				if (file.fd < 0) { fail("raw open"); }
+				raw_flush(file.fd, mode);
+				Descriptor dir{::open(raw_directory.path.c_str(), O_RDONLY)};
+				if (dir.fd < 0 || ::fsync(dir.fd) < 0) { fail("raw directory"); }
+				raw = measure(batch, [&](const std::string& bytes) { raw_write(file.fd, bytes); raw_flush(file.fd, mode); });
 			}
-			print("plain", operations, batch.size(), plain);
+			print("raw", operations, batch.size(), raw);
 
-			// The same bytes: what the journal recovers, what is in the plain file, what was written.
+			// The same bytes: what the journal recovers, what is in the raw file, what was written.
 			std::string recovered;
 			{
-				kronuz::journal::PosixIO io(directory.path);
+				j::PosixIO io(directory.path, j::PosixIOOptions{mode});
 				kronuz::journal::Journal journal(io, 1024 * 1024);
 				auto frontier = journal.recover([&](auto, std::string_view bytes) { recovered.append(bytes); });
 				if (frontier.sequence != groups) { throw std::runtime_error("same-results check failed: the journal recovered the wrong number of batches"); }
 			}
-			std::ifstream stream(plain_path, std::ios::binary);
+			std::ifstream stream(raw_path, std::ios::binary);
 			std::string stored((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
 			auto expected = expected_bytes(batch);
 			if (recovered != expected || stored != expected) { throw std::runtime_error("same-results check failed: the bytes made durable differ"); }
-			std::cout << "# same bytes: " << groups << " batches, " << expected.size() << " bytes in the journal's recovery, the plain file and the input\n";
+			std::cout << "# same bytes: " << groups << " batches, " << expected.size() << " bytes in the journal's recovery, the raw file and the input\n";
 		}
 	} catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

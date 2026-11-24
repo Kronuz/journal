@@ -59,7 +59,7 @@ std::vector<std::uint64_t> active(std::mt19937_64& random, std::uint64_t groups,
 }
 
 Result shared(const std::filesystem::path& dir, std::uint64_t groups, std::size_t bytes, unsigned percent, double seconds, std::uint64_t seed) {
-	j::PosixIO io(fresh(dir)); auto owner = io.acquire_owner(true);
+	j::PosixIO io(fresh(dir), j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; j::TurnLog log(io, {'B', 'E', 'N', 'C', 'H'}, recovered);
 	log.prepare();
 	Result r; std::mt19937_64 random(seed); const std::string payload(bytes, 'x');
@@ -91,7 +91,7 @@ Result shared(const std::filesystem::path& dir, std::uint64_t groups, std::size_
 // One file per group, preallocated; a turn writes each active group's record into its file
 // and makes them durable together with IO::sync_files.
 Result per_group(const std::filesystem::path& dir, std::uint64_t groups, std::size_t bytes, unsigned percent, double seconds, std::uint64_t seed) {
-	j::PosixIO io(fresh(dir)); auto owner = io.acquire_owner(true);
+	j::PosixIO io(fresh(dir), j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	const std::uint64_t file_bytes = std::uint64_t{4} << 20;
 	std::vector<std::unique_ptr<j::File>> files; std::vector<std::uint64_t> offsets(groups + 1, 0);
 	const std::string zeros(file_bytes, '\0');

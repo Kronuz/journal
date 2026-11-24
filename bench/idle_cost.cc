@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
 		const auto process = descriptors();
 		std::size_t host_only = 0, open_idle = 0, closed = 0;
 		{
-			j::Host host(std::make_shared<j::PosixIO>(directory), {'I', 'D', 'L', 'E'}, options);
+			j::Host host(std::make_shared<j::PosixIO>(directory, j::PosixIOOptions{j::FlushMode::full}), {'I', 'D', 'L', 'E'}, options);
 			host_only = descriptors();
 			std::vector<std::unique_ptr<j::Store>> stores;
 			for (std::uint64_t g = 1; g <= count; ++g) {

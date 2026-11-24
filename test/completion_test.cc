@@ -72,7 +72,7 @@ void drive(NativeCompletionQueue &queue, const std::shared_ptr<IOOperation> &ope
 void actual_reclamation(const std::filesystem::path& parent) {
 	for (bool retired : {false, true}) {
 		auto directory = parent / (retired ? "gc-retired" : "gc"); std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
-		auto io = std::make_shared<PosixIO>(directory); std::weak_ptr<PosixIO> backend = io;
+		auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full}); std::weak_ptr<PosixIO> backend = io;
 		AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
 		auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 'g'; store->create(id); while (!store->inventory_step(1).complete) {}
 		auto replacement = store->reserve_replacement(128, 128); store->begin_artifact(*replacement, ArtifactPart::Application); store->write_chunk(*replacement, "orphan"); auto artifact = store->finish_artifact(*replacement); store->cancel_replacement(*replacement);
@@ -92,7 +92,7 @@ void actual_reclamation(const std::filesystem::path& parent) {
 
 void actual_reads(const std::filesystem::path& parent) {
 	auto directory = parent / "reads"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
-	auto io = std::make_shared<PosixIO>(directory); std::weak_ptr<PosixIO> backend = io;
+	auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full}); std::weak_ptr<PosixIO> backend = io;
 	auto journal = std::make_unique<Journal>(io, 1024); Identity id{}; id[0] = 'r'; journal->create(id);
 	std::optional<PreparedArtifact> artifact; std::string payload(150000, 'r');
 	{ auto builder = journal->prepare_artifact();
@@ -112,7 +112,7 @@ void actual_reads(const std::filesystem::path& parent) {
 	auto operation = reader->begin_read_at(0, 65536); queue.submit(operation); reader.reset(); journal.reset(); io.reset();
 	check(!backend.expired(), "accepted read retains backend, exact file and pin after all facades disappear");
 	{
-		PosixIO other(directory); Journal contender(other); check(throws([&] { contender.recover([](auto, auto) {}); }), "outstanding read retains original stable owner lock");
+		PosixIO other(directory, PosixIOOptions{FlushMode::full}); Journal contender(other); check(throws([&] { contender.recover([](auto, auto) {}); }), "outstanding read retains original stable owner lock");
 	}
 	auto completed = await_step(queue); check(operation->complete(std::move(completed.completion)), "retired reader still reaps original native completion");
 	auto bytes = operation->result(); check(bytes.size() == 65536 && std::all_of(bytes.begin(), bytes.end(), [](char value) { return value == 'r'; }), "owned read buffer survives interest cancellation and facade retirement");
@@ -120,7 +120,7 @@ void actual_reads(const std::filesystem::path& parent) {
 }
 
 void actual_backend(const std::filesystem::path &directory) {
-	auto io = std::make_shared<PosixIO>(directory);
+	auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full});
 	Journal journal(io, 1024 * 1024);
 	Identity id{};
 	id[0] = 'c';
@@ -154,7 +154,7 @@ void actual_backend(const std::filesystem::path &directory) {
 			  << " steps=" << steps << '\n';
 }
 void owner_retirement(const std::filesystem::path &directory) {
-	auto io = std::make_shared<PosixIO>(directory);
+	auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full});
 	std::weak_ptr<PosixIO> backend = io;
 	auto journal = std::make_unique<Journal>(io, 1024 * 1024);
 	journal->recover([](auto, auto) {});
@@ -168,7 +168,7 @@ void owner_retirement(const std::filesystem::path &directory) {
 	check(!lifetime.expired() && !backend.expired(),
 		  "accepted backend work retains all lifetimes after caller retirement");
 	{
-		PosixIO other(directory);
+		PosixIO other(directory, PosixIOOptions{FlushMode::full});
 		Journal contender(other);
 		check(throws([&] { contender.recover([](auto, auto) {}); }),
 			  "pending native request retains stable owner lock");
@@ -183,7 +183,7 @@ void owner_retirement(const std::filesystem::path &directory) {
 	}
 	check(lifetime.expired() && backend.expired(),
 		  "terminal drain releases operation backend and lock together");
-	PosixIO recovered(directory);
+	PosixIO recovered(directory, PosixIOOptions{FlushMode::full});
 	Journal reopened(recovered, 1024 * 1024);
 	std::vector<std::string> batches;
 	auto frontier = reopened.recover([&](auto, auto bytes) { batches.emplace_back(bytes); });
@@ -196,7 +196,7 @@ void actual_artifacts(const std::filesystem::path& parent) {
 	auto directory = parent / "artifacts"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
 	ArtifactDescriptor descriptor;
 	{
-		auto io = std::make_shared<PosixIO>(directory); Journal journal(io, 1024);
+		auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full}); Journal journal(io, 1024);
 		Identity id{}; id[0] = 'a'; journal.create(id); NativeCompletionQueue queue;
 		auto creation = journal.begin_artifact_preparation(); drive(queue, creation);
 		auto builder = creation->take_builder(); creation.reset();
@@ -213,7 +213,7 @@ void actual_artifacts(const std::filesystem::path& parent) {
 		auto stats = queue.stats(); check(stats.native_completed >= 3 && stats.fallback_completed >= 1, "artifact creation/payload/seal use native writes and explicit flush/namespace fallback");
 	}
 	{
-		PosixIO io(directory); Journal journal(io, 1024); bool restored = false;
+		PosixIO io(directory, PosixIOOptions{FlushMode::full}); Journal journal(io, 1024); bool restored = false;
 		journal.recover([](auto, auto) {}, [&](const Frontier& frontier, ArtifactReader& reader, auto) {
 			std::string bytes(60000, '\0'); std::size_t consumed = 0;
 			while (consumed < bytes.size()) { consumed += reader.read_at(consumed, std::span<char>(bytes).subspan(consumed)); }
@@ -225,7 +225,7 @@ void actual_artifacts(const std::filesystem::path& parent) {
 void admitted_artifacts(const std::filesystem::path& parent) {
 	auto directory = parent / "admitted-artifacts"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
 	{
-		auto io = std::make_shared<PosixIO>(directory); AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
+		auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full}); AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
 		Store store(io, limits, 1024); Identity id{}; id[0] = 'A'; store.create(id); store.inventory_step(128);
 		auto replacement = store.reserve_replacement(60000, 16); NativeCompletionQueue queue;
 		for (auto part : {ArtifactPart::Application, ArtifactPart::Bundle}) {
@@ -240,7 +240,7 @@ void admitted_artifacts(const std::filesystem::path& parent) {
 		check(publication->result().generation == 2, "native publication owns the complete generation and manifest protocol");
 		check(store.accounting()->tickets == 0 && store.accounting()->outstanding == StorageResources{}, "publication settles the admitted completion-prepared replacement");
 	}
-	PosixIO io(directory); Journal journal(io, 1024); bool restored = false;
+	PosixIO io(directory, PosixIOOptions{FlushMode::full}); Journal journal(io, 1024); bool restored = false;
 	journal.recover([](auto, auto) {}, [&](const Frontier&, ArtifactReader&, std::span<ArtifactReader> dependencies) {
 		std::string bytes(60000, '\0'); std::size_t count = 0;
 		while (count < bytes.size()) { count += dependencies[0].read_at(count, std::span<char>(bytes).subspan(count)); }
@@ -250,7 +250,7 @@ void admitted_artifacts(const std::filesystem::path& parent) {
 }
 void retired_publication(const std::filesystem::path& parent) {
 	auto directory = parent / "retired-publication"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
-	auto io = std::make_shared<PosixIO>(directory); AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
+	auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full}); AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
 	auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 'P'; store->create(id); store->inventory_step(128);
 	auto replacement = store->reserve_replacement(128, 128);
 	for (auto part : {ArtifactPart::Application, ArtifactPart::Bundle}) { store->begin_artifact(*replacement, part); store->write_chunk(*replacement, part == ArtifactPart::Application ? "application" : "first"); store->finish_artifact(*replacement); }
@@ -258,7 +258,7 @@ void retired_publication(const std::filesystem::path& parent) {
 	check(queue.submit(publication), "native publication accepted before facade retirement"); store.reset(); io.reset();
 	{ auto original = await_step(queue); check(publication->complete(std::move(original.completion)), "original native generation creation reaped after facade retirement"); }
 	drive(queue, publication); check(publication->result().generation == 2, "native detached publication finishes full protocol"); publication.reset();
-	PosixIO recovered(directory); Journal journal(recovered, 1024); bool restored = false;
+	PosixIO recovered(directory, PosixIOOptions{FlushMode::full}); Journal journal(recovered, 1024); bool restored = false;
 	journal.recover([](auto, auto) {}, [&](const Frontier& frontier, ArtifactReader& reader, std::span<ArtifactReader> dependencies) {
 		std::array<char, 5> bytes{}; reader.read_at(0, bytes); restored = frontier.generation == 2 && std::string_view(bytes.data(), bytes.size()) == "first" && dependencies.size() == 1;
 	});
@@ -266,7 +266,7 @@ void retired_publication(const std::filesystem::path& parent) {
 }
 void admitted_store(const std::filesystem::path& parent) {
 	auto directory = parent / "store"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
-	auto io = std::make_shared<PosixIO>(directory);
+	auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full});
 	AdmissionLimits limits{{16u << 20, 256}, {1u << 20, 4}, {4u << 20, 4}, 64, 3};
 	auto store = std::make_unique<Store>(io, limits, 1024); Identity id{}; id[0] = 's'; store->create(id);
 	while (!store->inventory_step(1).complete) {}
@@ -286,7 +286,7 @@ void admitted_store(const std::filesystem::path& parent) {
 	auto completed = await_step(queue); draining->complete(std::move(completed.completion));
 	drive(queue, draining); check(draining->result().sequence == 2, "owned Store operation survives facade and accounting facade retirement");
 	draining.reset(); completed.operation.reset();
-	PosixIO recovered(directory); Journal journal(recovered, 1024); std::vector<std::string> batches;
+	PosixIO recovered(directory, PosixIOOptions{FlushMode::full}); Journal journal(recovered, 1024); std::vector<std::string> batches;
 	journal.recover([&](auto, auto bytes) { batches.emplace_back(bytes); });
 	check(batches == std::vector<std::string>({"stored", "retired"}), "Store retirement preserves both terminal durable appends");
 }
@@ -298,9 +298,9 @@ void host_lock(const std::filesystem::path& parent) {
 	auto directory = parent / "host"; std::filesystem::create_directory(directory); ::chmod(directory.c_str(), 0700);
 	const AdmissionLimits limits{{64u << 20, 4096}, {1u << 20, 8}, {8u << 20, 8}, 64, 3};
 	{
-		Host host(std::make_shared<PosixIO>(directory), {'H', 'O', 'S', 'T'}, HostOptions{2, {1u << 20, 32u << 10, 1, 4, 256u << 10}});
+		Host host(std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full}), {'H', 'O', 'S', 'T'}, HostOptions{2, {1u << 20, 32u << 10, 1, 4, 256u << 10}});
 		bool busy = false;
-		try { PosixIO other(directory); auto lock = other.acquire_directory_owner(); }
+		try { PosixIO other(directory, PosixIOOptions{FlushMode::full}); auto lock = other.acquire_directory_owner(); }
 		catch (const std::system_error& error) { busy = error.code() == std::errc::operation_would_block || error.code() == std::errc::resource_unavailable_try_again; }
 		check(busy, "the host holds the directory lock strata's cold tier takes");
 		Store store(host, 42, limits);
@@ -316,7 +316,7 @@ void host_lock(const std::filesystem::path& parent) {
 		for (const auto& entry : std::filesystem::directory_iterator(directory)) { ++entries; flat &= entry.is_regular_file(); }
 		check(flat && entries > 4, "the host's layout, table, logs and artifacts are regular files of one directory");
 	}
-	PosixIO other(directory);
+	PosixIO other(directory, PosixIOOptions{FlushMode::full});
 	auto lock = other.acquire_directory_owner();
 	check(lock != nullptr, "the lock is free once the host closes");
 }

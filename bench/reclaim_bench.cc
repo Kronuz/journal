@@ -52,7 +52,7 @@ int main() {
 			if (!std::filesystem::create_directory(directory)) { throw std::runtime_error("benchmark directory exists"); }
 			::chmod(directory.c_str(), 0700);
 			struct Cleanup { std::filesystem::path path; ~Cleanup() { std::filesystem::remove_all(path); } } cleanup{directory};
-			kronuz::journal::PosixIO io(directory); kronuz::journal::Journal journal(io);
+			kronuz::journal::PosixIO io(directory, kronuz::journal::PosixIOOptions{kronuz::journal::FlushMode::full}); kronuz::journal::Journal journal(io);
 			kronuz::journal::Identity identity{}; identity[0] = 'R'; journal.create(identity); journal.append_batch("covered");
 			for (unsigned generation = 0; generation < 2; ++generation) {
 				auto application = prepare(journal, size); auto bundle = prepare(journal, size);

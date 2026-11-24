@@ -646,7 +646,7 @@ void supersede() {
 	std::filesystem::remove_all(dir); std::filesystem::create_directories(dir);
 	const j::TurnLogOptions small{8 * 512, 512, 1};
 	{
-		j::PosixIO io(dir); auto owner = io.acquire_owner(true);
+		j::PosixIO io(dir, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 		{
 			j::TurnRecovery rec; j::TurnLog log(io, identity, rec, small);
 			log.append(std::vector<j::TurnRecord>{{1, 1, j::TurnRecordKind::Batch, "tx@X (covered by the head)"}});

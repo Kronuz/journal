@@ -105,7 +105,7 @@ std::uint64_t workload(j::TurnLog& log, Model& model, std::mt19937_64& random, u
 }
 
 void round_trip() {
-	Directory directory("round-trip"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("round-trip"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(1);
 	std::uint64_t last = 0;
 	{
@@ -123,7 +123,7 @@ void round_trip() {
 }
 
 void torn_tail() {
-	Directory directory("torn"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("torn"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(2);
 	std::uint64_t segment = 0, start = 0, before = 0;
 	{
@@ -149,7 +149,7 @@ void torn_tail() {
 }
 
 void torn_turn_in_earlier_epoch() {
-	Directory directory("torn-earlier"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("torn-earlier"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(8);
 	std::uint64_t kept = 0;
 	{
@@ -174,7 +174,7 @@ void torn_turn_in_earlier_epoch() {
 }
 
 void damage() {
-	Directory directory("damage"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("damage"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; std::uint64_t at = 0;
 	{
 		j::TurnLog log(io, identity, recovered, small);
@@ -197,7 +197,7 @@ void damage() {
 // A damaged block whose next header, its manifest, is damaged too, hiding every later turn: no
 // crash leaves that header, so recovery reports the damage instead of reading a torn tail.
 void double_damage() {
-	Directory directory("double-damage"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("double-damage"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	const j::TurnLogOptions options{16 * 1024, 1024, 1, 4, 4096};
 	j::TurnRecovery recovered; Model model; std::uint64_t block = 0, end = 0;
 	{
@@ -225,7 +225,7 @@ void double_damage() {
 // Only a header damaged, inside the last turn: the turn is dropped, so a group whose record in it
 // reads back whole is lost with the groups the next header names for the damaged block.
 void damaged_header_last_turn() {
-	Directory directory("damaged-header"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("damaged-header"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; std::uint64_t end = 0;
 	{
 		j::TurnLog log(io, identity, recovered, small);
@@ -243,7 +243,7 @@ void damaged_header_last_turn() {
 // The same double damage before later turns, where a group's only record after it is a
 // forwarded copy of an older one: the copy shows nothing of what the group wrote there.
 void double_damage_copy() {
-	Directory directory("double-damage-copy"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("double-damage-copy"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; std::uint64_t segment = 0, at = 0, s = 0;
 	{
 		j::TurnLog log(io, identity, recovered, small);
@@ -309,7 +309,7 @@ void earlier_turn_damage() { earlier_turn_damage(4096, 4); earlier_turn_damage(4
 // A block header larger than its first sector (a manifest of 28 or more groups): damage to it is
 // reported, and the turns later in its block are kept or their groups lost.
 void large_header_damage() {
-	Directory directory("large-header"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("large-header"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	const j::TurnLogOptions options{32 * 2048, 2048, 1};
 	j::TurnRecovery recovered; Model model;
 	{
@@ -335,7 +335,7 @@ void large_header_damage() {
 // The same header written by a torn newest turn, its second sector left old: the turn is dropped
 // as a tear.
 void large_header_tear() {
-	Directory directory("large-header-tear"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("large-header-tear"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	const j::TurnLogOptions options{32 * 2048, 2048, 1};
 	j::TurnRecovery recovered; Model model;
 	{
@@ -521,7 +521,7 @@ void stale_alias() {
 }
 
 void checkpoints_and_guards() {
-	Directory directory("checkpoints"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("checkpoints"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered;
 	{
 		j::TurnLog log(io, identity, recovered, small);
@@ -537,12 +537,12 @@ void checkpoints_and_guards() {
 	check(recovered.groups[1] == std::vector{record(1, 3, 10, j::TurnRecordKind::Checkpoint), record(1, 4, 10, j::TurnRecordKind::HardState)},
 		"a checkpoint supersedes what precedes it");
 	check(recovered.groups[7].size() == 1 && log.sequence(7) == 40, "a group may start from a checkpoint");
-	check(throws([] { j::TurnLogOptions bad{1000, 512, 1}; Directory d("bad"); j::PosixIO io(d.path); auto o = io.acquire_owner(true); j::TurnRecovery r; j::TurnLog l(io, identity, r, bad); }),
+	check(throws([] { j::TurnLogOptions bad{1000, 512, 1}; Directory d("bad"); j::PosixIO io(d.path, j::PosixIOOptions{j::FlushMode::full}); auto o = io.acquire_owner(true); j::TurnRecovery r; j::TurnLog l(io, identity, r, bad); }),
 		"a segment is a whole number of blocks");
 }
 
 void stale_bytes() {
-	Directory directory("stale"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("stale"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(3);
 	{
 		j::TurnLog log(io, identity, recovered, small);
@@ -562,7 +562,7 @@ void stale_bytes() {
 // Groups that checkpoint let their segments go; an idle group's record moves forward
 // instead of pinning the oldest segment; reopening after reclamation reads the same state.
 void reclamation(std::uint64_t seed) {
-	Directory directory("reclaim"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("reclaim"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(seed);
 	j::TurnLogOptions options = small; options.retain_segments = 3; options.forward_bytes = 600;
 	auto run = [&](j::TurnLog& log, unsigned turns) {
@@ -597,7 +597,7 @@ void reclamation(std::uint64_t seed) {
 // The two-step append a completion driver uses: one turn in flight; nothing visible until
 // its barrier returns; a failed write fails the log.
 void staged_turns() {
-	Directory directory("staged"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+	Directory directory("staged"); j::PosixIO io(directory.path, j::PosixIOOptions{j::FlushMode::full}); auto owner = io.acquire_owner(true);
 	j::TurnRecovery recovered;
 	{
 		j::TurnLog log(io, identity, recovered, small);

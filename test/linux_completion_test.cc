@@ -112,7 +112,7 @@ void permanent_faults(const std::filesystem::path &directory) {
 		check(child >= 0, "spawn ownership fault witness");
 		if (!child) {
 			std::set_terminate([] { ::_exit(termination_code); });
-			auto io = std::make_shared<PosixIO>(child_directory);
+			auto io = std::make_shared<PosixIO>(child_directory, PosixIOOptions{FlushMode::full});
 			auto owner = io->acquire_owner(true);
 			std::shared_ptr<File> file = io->create_exclusive("original");
 			LinuxCompletionQueue queue(
@@ -147,7 +147,7 @@ void permanent_faults(const std::filesystem::path &directory) {
 	}
 }
 void schedules(const std::filesystem::path &directory) {
-	auto io = std::make_shared<PosixIO>(directory);
+	auto io = std::make_shared<PosixIO>(directory, PosixIOOptions{FlushMode::full});
 	auto owner = io->acquire_owner(true);
 	const std::string source(128, 's'), destination(128, 'd');
 	std::shared_ptr<File> file = io->create_exclusive(source);

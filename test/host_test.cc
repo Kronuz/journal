@@ -466,7 +466,7 @@ void loop_slots() {
 		if (loop < 2 && side[loop].size() < 40) { side[loop].push_back(group); }
 	}
 	{
-		j::Host host(std::make_shared<j::PosixIO>(directory), host_identity, j::HostOptions{3, j::TurnLogOptions{64 * 1024, 1024, 1, 2, 4096}});
+		j::Host host(std::make_shared<j::PosixIO>(directory, j::PosixIOOptions{j::FlushMode::full}), host_identity, j::HostOptions{3, j::TurnLogOptions{64 * 1024, 1024, 1, 2, 4096}});
 		std::thread threads[2];
 		for (int loop = 0; loop < 2; ++loop) {
 			threads[loop] = std::thread([&, loop] { for (auto group : side[loop]) { host.create_group(group); } host.commit_transitions(static_cast<std::uint32_t>(loop)); });
@@ -493,7 +493,7 @@ void loop_views() {
 		if (made[loop].size() < created) { made[loop].push_back(group); } else if (seen[loop].size() < viewed) { seen[loop].push_back(group); }
 	}
 	{
-		j::Host host(std::make_shared<j::PosixIO>(directory), host_identity, j::HostOptions{2, j::TurnLogOptions{64 * 1024, 1024, 1, 2, 4096}});
+		j::Host host(std::make_shared<j::PosixIO>(directory, j::PosixIOOptions{j::FlushMode::full}), host_identity, j::HostOptions{2, j::TurnLogOptions{64 * 1024, 1024, 1, 2, 4096}});
 		std::atomic<bool> go{false};
 		std::atomic<int> done{0};
 		std::vector<std::shared_ptr<j::IO>> views[2], held[2];
