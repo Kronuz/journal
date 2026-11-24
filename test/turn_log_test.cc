@@ -424,7 +424,7 @@ void newest_turn_damage(std::uint32_t block_bytes, std::uint64_t seed, std::map<
 	if (k <= 5) { for (std::uint64_t m = 0; m + 1 < (std::uint64_t{1} << k); ++m) { masks.push_back(m); } }
 	else { for (int i = 0; i < 32; ++i) { masks.push_back(random() & ((k >= 64 ? ~0ull : (1ull << k) - 1) & ~(1ull << (random() % k)))); } }
 	for (const auto mask : masks) {  // the sectors in the mask reach the disk; the others stay as before W
-		auto torn = pre.snapshot(); fl::io torn_io(torn);
+		auto torn = pre->snapshot(); fl::io torn_io(torn);
 		for (std::size_t i = 0; i < k; ++i) {
 			const auto& [name, s] = changed[i];
 			if (mask >> i & 1) { put(torn_io, name, s * sector, std::string_view(after.at(name)).substr(s * sector, sector)); }
@@ -465,7 +465,7 @@ void sector_verdicts() {
 	// The host holds every group open: damage loses those recovery holds nothing of.
 	j::TurnLogGroups known; for (const auto& [group, _] : with) { known.open.push_back(group); }
 	auto read = [&](const std::function<void(j::IO&)>& change) {
-		auto copy = pre.snapshot(); fl::io copy_io(copy);
+		auto copy = pre->snapshot(); fl::io copy_io(copy);
 		for (auto s = first; s <= last; ++s) { put(copy_io, name, s * sector, std::string_view(after.at(name)).substr(s * sector, sector)); }
 		change(copy_io);
 		return j::TurnLog::read(copy_io, identity, options, known);
