@@ -36,17 +36,14 @@ log alone forgets it. The host stores it in the group's open table entry (`Group
 the shard, the state byte's `bounded_state` bit, then 8 bytes after the base). The verdict is stored
 before the open record, since the open's new epoch makes the damaged one an earlier epoch: recovery
 still reports a sector that fails past an earlier epoch's kept turn, but a lost write (a sector that
-reads as never written) shows only through a later turn, in the newest epoch alone. `Host::open` first reads each loop's log without writing to it
-(`settle_damage`, through `TurnLog::read`), commits every bounded group's bound (`mark_bounds`) and
-marks the lost ids (`mark_lost`). Only then do the drivers start, each writing its new epoch's open
-record, and the open keeps the bounded groups in the log (`TurnDriver::keep`), so their records
-after the bound are live again and the group continues after them. The drivers recover against the
-table as it was before those commits, so they report the same verdict and the open's second pass
-stores nothing new. The verdict costs one more read of each log at every open, damaged or not: on a
-192 MiB log, open time goes from 733 and 743 ms to 1,332 and 1,292 ms (median of 7, two rounds,
-exclusive), +78%: the second recovery's scan and its copy of every record. A re-partition stores
-the bounds before its layout commit and starts each bounded group in the new log after its bound
-(`TurnLog::keep`).
+reads as never written) shows only through a later turn, in the newest epoch alone. Each driver's
+recovery hands the host its verdict before the log writes the open record (`TurnLogGroups::settle`):
+the host commits every bounded group's bound (`mark_bounds`) and marks the lost ids (`mark_lost`),
+and only then does that log write its new epoch's open record. Once every driver runs, the open
+keeps the bounded groups in the log (`TurnDriver::keep`), so their records after the bound are live
+again and the group continues after them; its second pass finds the verdict stored. Each log is
+read once. A re-partition stores the bounds before its layout commit and starts each bounded group
+in the new log after its bound (`TurnLog::keep`).
 
 Each open passes the stored bounds back (`TurnLogGroups::bound`). Recovery treats a group's
 records through its bound as superseded, as it treats those through a closed group's base: they

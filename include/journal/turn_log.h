@@ -35,6 +35,7 @@
 #include <bit>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -95,11 +96,14 @@ struct TurnRecovery {
 // are superseded by the table's copy, so recovery ignores them, and the open groups are the
 // ones a damaged log loses when it holds nothing of them. A bound the table stored for a group
 // (TurnRecovery::bounded) supersedes its records through it too: the group continues after it.
+// `settle`, when set, gets the recovery before the log writes its open record, which makes the
+// recovered epoch an earlier one: what the caller stores there, a verdict, outlives that record.
 struct TurnLogGroups {
 	std::set<std::uint64_t> lost;
 	std::map<std::uint64_t, std::uint64_t> base;
 	std::vector<std::uint64_t> open;
 	std::map<std::uint64_t, std::uint64_t> bound;
+	std::function<void(const TurnRecovery&)> settle;
 };
 struct TurnLogStats {
 	std::uint64_t turns = 0, barriers = 0, bytes_appended = 0, bytes_written = 0, segments_prepared = 0, prepared_inline = 0;
@@ -498,6 +502,7 @@ public:
 	TurnLog(IO& io, Identity identity, TurnRecovery& recovered, TurnLogOptions options = {}, const TurnLogGroups& known = {})
 		: io_(io), identity_(identity), options_(valid(options)) {
 		recovered = recover(known);
+		if (known.settle) { known.settle(recovered); }
 		epoch_ = recovered.epoch; turn_ = recovered.last_turn;
 		for (const auto& [group, records] : recovered.groups) { if (!records.empty()) { sequences_[group] = records.back().sequence; } }
 		for (const auto& [group, bound] : known.bound) {

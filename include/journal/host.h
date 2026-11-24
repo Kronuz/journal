@@ -873,10 +873,9 @@ private:
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
 		opened_.resize(loops_); released_.resize(loops_); dirty_.resize(loops_);
-		// The drivers recover against the table as it was before settle_damage stored their verdict,
-		// so each reports the same bounds and losses.
-		const auto groups = known(loops_);
-		settle_damage(groups);
+		// Each driver's recovery stores its verdict before the driver writes its open record.
+		auto groups = known(loops_);
+		for (auto& loop : groups) { loop.settle = [this](const TurnRecovery& recovered) { settle_damage(recovered); }; }
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
 			loop_views_.push_back(view);
@@ -924,17 +923,13 @@ private:
 		}
 		if (removed) { io_->sync_directory(); }
 	}
-	// The verdict of each log's damage, durable before any driver writes its open record: a new
-	// epoch makes the damaged one an earlier epoch, whose turns past its kept turn the next
-	// recovery ignores (rule 5). A read of each log, which writes nothing, gives it; the table
-	// stores each bounded group's bound and marks the lost ids, as the open does after it.
-	void settle_damage(const std::vector<TurnLogGroups>& groups) {
-		std::set<std::uint64_t> lost; std::map<std::uint64_t, std::uint64_t> bounded;
-		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
-			const auto recovered = TurnLog::read(*loop_io(generation_, loop), identity_, options_.turns, groups[loop]);
-			lost.insert(recovered.lost.begin(), recovered.lost.end());
-			for (const auto& [id, found] : recovered.bounded) { bounded[id] = found.bound; }
-		}
+	// A log's verdict, durable before its driver writes the open record (TurnLogGroups::settle):
+	// the new epoch makes the damaged one an earlier epoch, past whose kept turn a lost write no
+	// longer shows (rule 5). The table stores each bounded group's bound and marks the lost ids;
+	// the open's pass once every driver runs finds them stored.
+	void settle_damage(const TurnRecovery& recovered) {
+		std::set<std::uint64_t> lost = recovered.lost; std::map<std::uint64_t, std::uint64_t> bounded;
+		for (const auto& [id, found] : recovered.bounded) { bounded[id] = found.bound; }
 		for (auto id : mark_bounds(bounded)) { lost.erase(id); }
 		mark_lost(lost);
 	}
@@ -951,7 +946,7 @@ private:
 			if (found->second.bound != at) { found->second.bound = at; changed.insert(id); }
 			stored.insert(id);
 		}
-		for (std::uint32_t slot = 0; slot < host_detail::slots && !drivers_.empty(); ++slot) {
+		for (std::uint32_t slot = 0; slot < host_detail::slots && drivers_.size() == loops_; ++slot) {  // every driver runs
 			for (auto& [id, entry] : shards_[slot]) {
 				if (!entry.bound || bounded.contains(id) || entry.state != GroupState::open) { continue; }
 				const auto& records = driver_of(id).records(id);
