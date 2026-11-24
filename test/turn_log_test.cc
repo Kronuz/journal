@@ -626,7 +626,7 @@ void midwrite_reads() {
 	for (std::uint32_t block : {2048u, 32768u}) {
 		for (std::uint64_t seed = 1; seed <= 4; ++seed) {
 			t::Disk disk; t::MemoryIO io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed); Model model;
-			j::TurnLog log(io, identity, recovered, {64 * std::uint64_t{block}, block, 1, 3, 600});
+			j::TurnLog log(io, identity, recovered, {8 * std::uint64_t{block}, block, 1, 3, 600});
 			for (unsigned n = 0; n < 100; ++n) {
 				const auto batch = probe_turn(log, random);
 				const auto segment = log.segment(), position = log.position();
