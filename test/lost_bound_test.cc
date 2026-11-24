@@ -25,11 +25,14 @@
 // a group through its bound continues from the records after it; one that does not loses it; a
 // checkpoint kept after the damage loses nothing. The table stores the bound before the host
 // serves, so it outlives a crash, a repair of the block and retention, and a second damage only
-// raises it. `lost_bound_test [case]`.
+// raises it, and a power cut during the first open after damage past the newest epoch's last kept
+// turn keeps its verdict. `lost_bound_test [case]`.
 #include "faultlab/faultfs.h"
 #include "journal/host.h"
 #include <algorithm>
 #include <iostream>
+#include <optional>
+#include <tuple>
 
 namespace j = kronuz::journal;
 namespace fl = kronuz::faultlab;
@@ -134,6 +137,12 @@ void damage(fl::filesystem& disk, const std::string& segment, std::uint64_t posi
 	const auto offset = j::turn_log_detail::file_offset(position);
 	const char flipped = static_cast<char>(disk.view("host/" + segment)[offset] ^ 0x5a);
 	overwrite(disk, segment, offset, std::string_view(&flipped, 1));
+}
+// The sector holding `position` reads as never written: a write the device acknowledged and lost,
+// which no sector check catches, so only a later turn shows it (rule 6).
+void zero(fl::filesystem& disk, const std::string& segment, std::uint64_t position) {
+	const auto sector = j::turn_log_detail::sector_bytes;
+	overwrite(disk, segment, j::turn_log_detail::file_offset(position) / sector * sector, std::string(sector, '\0'));
 }
 
 // A1: bounds per group, with values. Readers: group 1 holds through 2, groups 2 and 4 through 1.
@@ -269,44 +278,164 @@ void retention() {
 }
 
 // One gap over two blocks, past the newest epoch's last kept turn (rule 5). Block W holds group
-// 1's batch 2 (turn K), then the first fragment of group 2's 700-byte batch (turn T) in W's
-// second sector; W+1 holds that batch's last fragment, then group 1's batch 3 in W+1's first
-// sector. A byte flipped in each fragment makes one gap from W into W+1, whose manifest alone
-// names batch 3: group 1 is lost, or bounded at 3 or above, never at 2.
-void spans() {
-	const std::uint64_t block = block_data, sector = j::turn_log_detail::sector_data;
+// 1's batch 2 (turn K), then the first fragment of group 2's 700-byte batch (turn T) past W's
+// first sector; W+1 holds that batch's last fragment, then group 1's batch 3 in W+1's second
+// sector. A byte flipped in batch 3, and with `both` in the first fragment too, or with `zeroed`
+// their sectors zeroed; with `later`, a later turn (group 2's batch 3, 1,500 bytes) writes the
+// gap's manifests. Damage costs its sector, and W+1's first sector holds W's manifest, so neither
+// touches a block's first sector. Nothing when no filler lays the batches so.
+std::optional<fl::filesystem> gap(bool both, bool later = false, bool zeroed = false) {
+	namespace d = j::turn_log_detail;
+	const std::uint64_t block = block_data, sector = d::sector_data;
 	for (std::size_t filler = 8; filler < 2000; ++filler) {
-		fl::filesystem disk;
+		fl::filesystem attempt;
 		Records w;
 		{
-			auto host = open(disk);
+			auto host = open(attempt);
 			for (std::uint64_t g = 1; g <= 2; ++g) { host->create_group(g); stage(*host, w, g, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)); }
 			commit(*host);
 			stage(*host, w, 1, j::TurnRecordKind::Batch, run('~', filler)); commit(*host);
 			stage(*host, w, 2, j::TurnRecordKind::Batch, run('Q', 700)); stage(*host, w, 1, j::TurnRecordKind::Batch, run('Z', 40)); commit(*host);
+			if (later) { stage(*host, w, 2, j::TurnRecordKind::Batch, run('L', 1500)); commit(*host); }
 		}
-		const auto [segment, q] = find(disk, run('Q', 16));
-		const auto k = find(disk, run('~', 8)).second, z = find(disk, run('Z', 40)).second;
+		const auto [segment, q] = find(attempt, run('Q', 16));
+		const auto k = find(attempt, run('~', 8)).second, z = find(attempt, run('Z', 40)).second;
 		if (segment.empty()) { continue; }
-		const auto at = q / block, first = q - j::turn_log_detail::record_header - j::turn_log_detail::fragment_header;  // Q's first fragment
-		const bool fits = first / block == at && first % block >= sector && first % block + j::turn_log_detail::fragment_header + j::turn_log_detail::record_header + 700 > block &&
-			k / block == at && k < first && z / block == at + 1 && (z + 40) % block < sector && z > (at + 1) * block;
+		const auto at = q / block, first = q - d::record_header - d::fragment_header;  // Q's first fragment
+		const bool fits = first / block == at && first % block >= sector && first % block + d::fragment_header + d::record_header + 700 > block &&
+			k / block == at && k < first && z / block == at + 1 && z % block >= sector && z % block + 40 <= block;
 		if (!fits) { continue; }
-		damage(disk, segment, q + 10); damage(disk, segment, z + 10);
-		auto host = open(disk);
-		check(host->driver(0).recovered().damaged, "the two-block damage is reported");
-		const auto status = host->status(1);
-		check(status == j::GroupStatus::lost || (status == j::GroupStatus::bounded && host->bound(1) >= 3),
-			"group 1, whose batch 3 the gap's second block held, is lost or bounded at 3 or above (bound " + std::to_string(host->bound(1)) + ")");
-		return;
+		// The positions are the log's: W and W+1 carry its headers, Q's first fragment fills W from
+		// `first`, its last opens W+1's data, and Z's record is whole right after it.
+		const auto bytes = data(attempt, segment);
+		const std::string_view w0 = std::string_view(bytes).substr(at * block), w1 = std::string_view(bytes).substr((at + 1) * block);
+		const auto last = (at + 1) * block + d::header_bytes(j::framing::get16(w1.substr(56))), zf = z - d::record_header - d::fragment_header;
+		const auto fragment = [&](std::uint64_t position, std::uint8_t type, std::uint64_t length) {
+			const auto f = std::string_view(bytes).substr(position);
+			return static_cast<std::uint8_t>(f[2]) == type && j::framing::get16(f) == length;
+		};
+		const auto record = [&](std::uint64_t position, std::uint64_t group, std::uint64_t sequence) {
+			const auto r = std::string_view(bytes).substr(position + d::fragment_header);
+			return r[0] == static_cast<char>(j::TurnRecordKind::Batch) && j::framing::peek64(r.substr(9)) == group && j::framing::peek64(r.substr(17)) == sequence;
+		};
+		const auto head = block - first % block - d::fragment_header;
+		check(w0.substr(0, 8) == d::magic && j::framing::peek32(w0.substr(32)) == at && w1.substr(0, 8) == d::magic && j::framing::peek32(w1.substr(32)) == at + 1, "W and W+1 are the log's blocks " + std::to_string(at) + " and " + std::to_string(at + 1));
+		check(fragment(first, j::framing::First, head) && record(first, 2, 2), "group 2's batch 2 opens at " + std::to_string(first) + " and fills W");
+		check(fragment(last, j::framing::Last, d::record_header + 700 - head) && last + d::fragment_header + d::record_header + 700 - head == zf, "its last fragment opens W+1's data, right before batch 3");
+		check(fragment(zf, j::framing::Full, d::record_header + 40) && record(zf, 1, 3), "group 1's batch 3 is whole at " + std::to_string(zf));
+		const auto spoil = zeroed ? zero : damage;
+		if (both) { spoil(attempt, segment, q + 10); }
+		spoil(attempt, segment, z + 10);
+		return std::optional<fl::filesystem>(attempt.snapshot());
 	}
-	check(false, "a filler lays the gap over two blocks");
+	return std::nullopt;
+}
+
+// gap()'s layout with both fragments damaged: one gap from W into W+1, which alone holds batch 3:
+// group 1 is lost, or bounded at 3 or above, never at 2.
+void spans() {
+	auto disk = gap(true);
+	if (!disk) { check(false, "a filler lays the gap over two blocks"); return; }
+	auto host = open(*disk);
+	check(host->driver(0).recovered().damaged, "the two-block damage is reported");
+	const auto status = host->status(1);
+	check(status == j::GroupStatus::lost || (status == j::GroupStatus::bounded && host->bound(1) >= 3),
+		"group 1, whose batch 3 the gap's second block held, is lost or bounded at 3 or above (bound " + std::to_string(host->bound(1)) + ")");
+}
+
+// What an open reports of groups 1 and 2: status, bound, and the next sequence of each it keeps.
+struct Verdict {
+	j::GroupStatus status[2]; std::uint64_t bound[2], next[2];
+	bool operator==(const Verdict&) const = default;
+};
+Verdict verdict(j::Host& host) {
+	Verdict v{};
+	for (std::uint64_t g = 1; g <= 2; ++g) {
+		v.status[g - 1] = host.status(g); v.bound[g - 1] = host.bound(g);
+		v.next[g - 1] = v.status[g - 1] == j::GroupStatus::lost ? 0 : host.driver_of(g).log().sequence(g) + 1;
+	}
+	return v;
+}
+std::string describe(const Verdict& v) {
+	std::string text;
+	for (int g = 0; g < 2; ++g) { text += (g ? ", group 2 " : "group 1 ") + std::to_string(static_cast<int>(v.status[g])) + " bound " + std::to_string(v.bound[g]) + " next " + std::to_string(v.next[g]); }
+	return text;
+}
+
+// Group 1's batch 2 (3,000 bytes), then group 2's batch 2 (1,500 bytes) in the newest turn, a
+// byte in group 1's middle block flipped, or with `zeroed` its sector zeroed: the later turn proves
+// the damage (rule 6), which bounds group 1 at 2; the damaged block's manifest names only group 1,
+// so group 2 keeps its batch.
+std::optional<fl::filesystem> dropped(bool zeroed = false) {
+	fl::filesystem disk;
+	Records w;
+	{
+		auto host = open(disk);
+		for (std::uint64_t g = 1; g <= 2; ++g) { host->create_group(g); stage(*host, w, g, j::TurnRecordKind::Checkpoint, "checkpoint-" + std::to_string(g)); }
+		commit(*host);
+		stage(*host, w, 1, j::TurnRecordKind::Batch, run('N', 3000)); commit(*host);
+		stage(*host, w, 2, j::TurnRecordKind::Batch, run('M', 1500)); commit(*host);
+	}
+	const auto [segment, offset] = find(disk, run('N', 200));
+	(zeroed ? zero : damage)(disk, segment, middle(offset));
+	return std::optional<fl::filesystem>(disk.snapshot());
+}
+
+// Rule-5 damage, and a power cut at every mutation of the first open after it: the open's new
+// epoch makes the damaged one an earlier epoch. Past its kept turn recovery still reports a sector
+// that fails, but not a lost write (a zeroed sector) only a later turn showed, so the table must
+// hold the verdict before the open record. Every cut reopens to the uncut open's bounds and
+// losses, twice. A gap whose last block is the newest has no manifest yet and loses both groups;
+// with a later turn the gap's manifests bound both at 3; the dropped turns bound group 1 at 2.
+void first_open() {
+	using S = j::GroupStatus;
+	struct Expected { S status[2]; std::uint64_t bound[2]; };  // groups 1 and 2
+	const std::vector<std::tuple<std::string, std::optional<fl::filesystem> (*)(), Expected>> layouts{
+		{"batch 3", [] { return gap(false); }, {{S::lost, S::lost}, {0, 0}}},
+		{"both fragments", [] { return gap(true); }, {{S::lost, S::lost}, {0, 0}}},
+		{"dropped turns", [] { return dropped(); }, {{S::bounded, S::stored}, {2, 0}}},
+		{"gap, later turn", [] { return gap(true, true); }, {{S::bounded, S::bounded}, {3, 3}}},
+		{"dropped turns, zeroed", [] { return dropped(true); }, {{S::bounded, S::stored}, {2, 0}}},
+		{"gap, later turn, zeroed", [] { return gap(true, true, true); }, {{S::bounded, S::bounded}, {3, 3}}},
+	};
+	for (const auto& [damaged, layout, expected] : layouts) {
+		auto base = layout();
+		if (!base) { check(false, "a filler lays the gap over two blocks"); return; }
+		Verdict reference{}; std::uint64_t total = 0;
+		{
+			fl::filesystem probe = base->snapshot();
+			const auto start = probe.mutations();
+			{
+				auto host = open(probe); reference = verdict(*host);
+				check(host->driver(0).recovered().damaged, "the uncut open reports the damage: " + damaged);
+			}
+			total = probe.mutations() - start;
+		}
+		for (int g = 0; g < 2; ++g) {
+			check(reference.status[g] == expected.status[g] && reference.bound[g] == expected.bound[g], damaged + ": the uncut open's group " + std::to_string(g + 1) + " is status " +
+				std::to_string(static_cast<int>(expected.status[g])) + " bound " + std::to_string(expected.bound[g]) + ": " + describe(reference));
+		}
+		check(total > 0, "the open writes");
+		std::cout << damaged << ": " << total << " cuts, uncut " << describe(reference) << '\n';
+		for (std::uint64_t cut = 0; cut < total; ++cut) {
+			fl::filesystem disk = base->snapshot();
+			disk.power_off_after(cut);
+			try { open(disk); } catch (const std::exception&) {}
+			disk.crash(cut * 7919 + 1);
+			const auto at = damaged + ", cut at " + std::to_string(cut) + " of " + std::to_string(total) + ": ";
+			for (int reopen = 0; reopen < 2; ++reopen) {
+				auto host = open(disk);
+				const auto after = verdict(*host);
+				check(after == reference, at + describe(after) + ", uncut " + describe(reference));
+			}
+		}
+	}
 }
 }  // namespace
 
 int main(int argc, char** argv) {
 	const std::string only = argc > 1 ? argv[1] : "";
-	const std::vector<std::pair<std::string, void (*)()>> cases{{"bounds", bounds}, {"crash", crash}, {"second", second}, {"retention", retention}, {"spans", spans}};
+	const std::vector<std::pair<std::string, void (*)()>> cases{{"bounds", bounds}, {"crash", crash}, {"second", second}, {"retention", retention}, {"spans", spans}, {"first_open", first_open}};
 	for (const auto& [name, run] : cases) {
 		if (!only.empty() && only != name) { continue; }
 		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }

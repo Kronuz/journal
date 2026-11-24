@@ -27,7 +27,7 @@
 //   layout                          RJHL0001: L and the log generation; replaced whole
 //   groups-<slot:3x>-<node:9x>      RJGT0001: the group table's entries under one node of a slot's
 //                                   trie, at most leaf_bytes unless one entry; replaced whole
-//   l<generation:16x>-<loop:4x>-turns-<segment:16x>   a loop's RFTW0001 segment
+//   l<generation:16x>-<loop:4x>-turns-<segment:16x>   a loop's RFTW0002 segment
 //   g<group:16x>-artifact-<incarnation:16x><serial:16x>   a group's artifact
 //
 // docs/design/host-layout.md has the layout and the re-partition protocol.
@@ -873,7 +873,9 @@ private:
 		loops_ = stored;
 		if (stored != options_.loops) { repartition(); }
 		opened_.resize(loops_); released_.resize(loops_); dirty_.resize(loops_);
+		// Each driver's recovery stores its verdict before the driver writes its open record.
 		auto groups = known(loops_);
+		for (auto& loop : groups) { loop.settle = [this](const TurnRecovery& recovered) { settle_damage(recovered); }; }
 		for (std::uint32_t loop = 0; loop < loops_; ++loop) {
 			auto view = loop_io(generation_, loop);
 			loop_views_.push_back(view);
@@ -881,13 +883,13 @@ private:
 			drivers_.back()->retire_with([this](std::uint64_t group) { return retired_floor(group); });
 			drivers_.back()->before_turn([this, loop] { commit_transitions(loop); });
 		}
+		// A bounded group's table entry stores its bound before anything serves, so the bound
+		// outlives the damage; the log then keeps its records after the bound, and it is not lost.
 		std::set<std::uint64_t> lost; std::map<std::uint64_t, std::uint64_t> bounded;
 		for (const auto& turns : drivers_) {
 			lost.insert(turns->recovered().lost.begin(), turns->recovered().lost.end());
 			for (const auto& [id, found] : turns->recovered().bounded) { bounded[id] = found.bound; }
 		}
-		// A bounded group's table entry stores its bound before anything serves, so the bound
-		// outlives the damage; the log then keeps its records after the bound, and it is not lost.
 		for (auto id : mark_bounds(bounded)) { driver_of(id).keep(id); lost.erase(id); }
 		mark_lost(lost);
 		// The log's groups of a damaged shard are lost with it: their incarnation and serials, which
@@ -921,6 +923,16 @@ private:
 		}
 		if (removed) { io_->sync_directory(); }
 	}
+	// A log's verdict, durable before its driver writes the open record (TurnLogGroups::settle):
+	// the new epoch makes the damaged one an earlier epoch, past whose kept turn a lost write no
+	// longer shows (rule 5). The table stores each bounded group's bound and marks the lost ids;
+	// the open's pass once every driver runs finds them stored.
+	void settle_damage(const TurnRecovery& recovered) {
+		std::set<std::uint64_t> lost = recovered.lost; std::map<std::uint64_t, std::uint64_t> bounded;
+		for (const auto& [id, found] : recovered.bounded) { bounded[id] = found.bound; }
+		for (auto id : mark_bounds(bounded)) { lost.erase(id); }
+		mark_lost(lost);
+	}
 	// Stores each bounded group's bound in its open entry, durably, and clears the bound of an
 	// open group whose log kept a checkpoint after it (which supersedes what the damage held).
 	// Returns the bounded ids stored; any other (no open entry, or a damaged shard) stays lost.
@@ -934,7 +946,7 @@ private:
 			if (found->second.bound != at) { found->second.bound = at; changed.insert(id); }
 			stored.insert(id);
 		}
-		for (std::uint32_t slot = 0; slot < host_detail::slots && !drivers_.empty(); ++slot) {
+		for (std::uint32_t slot = 0; slot < host_detail::slots && drivers_.size() == loops_; ++slot) {  // every driver runs
 			for (auto& [id, entry] : shards_[slot]) {
 				if (!entry.bound || bounded.contains(id) || entry.state != GroupState::open) { continue; }
 				const auto& records = driver_of(id).records(id);
