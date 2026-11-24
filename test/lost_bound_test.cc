@@ -399,6 +399,7 @@ void first_open() {
 		}
 		check(reference.status[0] == expected, damaged + ": the uncut open " + (expected == j::GroupStatus::lost ? "loses" : "bounds") + " group 1: " + describe(reference));
 		check(total > 0, "the open writes");
+		std::cout << damaged << ": " << total << " cuts, uncut " << describe(reference) << '\n';
 		for (std::uint64_t cut = 0; cut < total; ++cut) {
 			fl::filesystem disk = base->snapshot();
 			disk.power_off_after(cut);
