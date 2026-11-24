@@ -273,10 +273,11 @@ void retention() {
 
 // One gap over two blocks, past the newest epoch's last kept turn (rule 5). Block W holds group
 // 1's batch 2 (turn K), then the first fragment of group 2's 700-byte batch (turn T) past W's
-// first sector; W+1 holds that batch's last fragment, then group 1's batch 3 in W+1's first
+// first sector; W+1 holds that batch's last fragment, then group 1's batch 3 in W+1's second
 // sector. A byte flipped in batch 3, and with `both` in the first fragment too; with `later`, a
-// later turn (group 2's batch 3, 1,500 bytes) writes the gap's manifests. Nothing when no filler
-// lays the batches so.
+// later turn (group 2's batch 3, 1,500 bytes) writes the gap's manifests. A flipped byte costs its
+// sector, and W+1's first sector holds W's manifest, so neither damage touches a block's first
+// sector. Nothing when no filler lays the batches so.
 std::optional<fl::filesystem> gap(bool both, bool later = false) {
 	namespace d = j::turn_log_detail;
 	const std::uint64_t block = block_data, sector = d::sector_data;
@@ -296,7 +297,7 @@ std::optional<fl::filesystem> gap(bool both, bool later = false) {
 		if (segment.empty()) { continue; }
 		const auto at = q / block, first = q - d::record_header - d::fragment_header;  // Q's first fragment
 		const bool fits = first / block == at && first % block >= sector && first % block + d::fragment_header + d::record_header + 700 > block &&
-			k / block == at && k < first && z / block == at + 1 && (z + 40) % block < sector && z > (at + 1) * block;
+			k / block == at && k < first && z / block == at + 1 && z % block >= sector && z % block + 40 <= block;
 		if (!fits) { continue; }
 		// The positions are the log's: W and W+1 carry its headers, Q's first fragment fills W from
 		// `first`, its last opens W+1's data, and Z's record is whole right after it.
@@ -323,8 +324,8 @@ std::optional<fl::filesystem> gap(bool both, bool later = false) {
 	return std::nullopt;
 }
 
-// gap()'s layout with both fragments damaged: one gap from W into W+1, whose manifest alone names
-// batch 3: group 1 is lost, or bounded at 3 or above, never at 2.
+// gap()'s layout with both fragments damaged: one gap from W into W+1, which alone holds batch 3:
+// group 1 is lost, or bounded at 3 or above, never at 2.
 void spans() {
 	auto disk = gap(true);
 	if (!disk) { check(false, "a filler lays the gap over two blocks"); return; }
@@ -355,8 +356,8 @@ std::string describe(const Verdict& v) {
 }
 
 // Group 1's batch 2 (3,000 bytes), then group 2's batch 2 (1,500 bytes) in the newest turn, a
-// byte in group 1's middle block flipped: the later turn proves the damage (rule 6), and rule 5
-// drops both turns, which bound groups 1 and 2 at 2.
+// byte in group 1's middle block flipped: the later turn proves the damage (rule 6), which bounds
+// group 1 at 2; the damaged block's manifest names only group 1, so group 2 keeps its batch.
 std::optional<fl::filesystem> dropped() {
 	fl::filesystem disk;
 	Records w;
@@ -376,13 +377,16 @@ std::optional<fl::filesystem> dropped() {
 // epoch makes the damaged one an earlier epoch, whose turns past its kept turn recovery ignores,
 // so the table must hold the verdict before the open record. Every cut reopens to the uncut
 // open's bounds and losses, twice. A gap whose last block is the newest has no manifest yet and
-// loses both groups; with a later turn, or a damage rule 2 proves, the dropped turns bound them.
+// loses both groups; with a later turn the gap's manifests bound both at 3; the dropped turns
+// bound group 1 at 2.
 void first_open() {
-	const std::vector<std::tuple<std::string, std::optional<fl::filesystem> (*)(), j::GroupStatus>> layouts{
-		{"batch 3", [] { return gap(false); }, j::GroupStatus::lost},
-		{"both fragments", [] { return gap(true); }, j::GroupStatus::lost},
-		{"dropped turns", dropped, j::GroupStatus::bounded},
-		{"gap, later turn", [] { return gap(true, true); }, j::GroupStatus::bounded},
+	using S = j::GroupStatus;
+	struct Expected { S status[2]; std::uint64_t bound[2]; };  // groups 1 and 2
+	const std::vector<std::tuple<std::string, std::optional<fl::filesystem> (*)(), Expected>> layouts{
+		{"batch 3", [] { return gap(false); }, {{S::lost, S::lost}, {0, 0}}},
+		{"both fragments", [] { return gap(true); }, {{S::lost, S::lost}, {0, 0}}},
+		{"dropped turns", dropped, {{S::bounded, S::stored}, {2, 0}}},
+		{"gap, later turn", [] { return gap(true, true); }, {{S::bounded, S::bounded}, {3, 3}}},
 	};
 	for (const auto& [damaged, layout, expected] : layouts) {
 		auto base = layout();
@@ -397,7 +401,10 @@ void first_open() {
 			}
 			total = probe.mutations() - start;
 		}
-		check(reference.status[0] == expected, damaged + ": the uncut open " + (expected == j::GroupStatus::lost ? "loses" : "bounds") + " group 1: " + describe(reference));
+		for (int g = 0; g < 2; ++g) {
+			check(reference.status[g] == expected.status[g] && reference.bound[g] == expected.bound[g], damaged + ": the uncut open's group " + std::to_string(g + 1) + " is status " +
+				std::to_string(static_cast<int>(expected.status[g])) + " bound " + std::to_string(expected.bound[g]) + ": " + describe(reference));
+		}
 		check(total > 0, "the open writes");
 		std::cout << damaged << ": " << total << " cuts, uncut " << describe(reference) << '\n';
 		for (std::uint64_t cut = 0; cut < total; ++cut) {
