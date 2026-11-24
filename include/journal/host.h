@@ -27,7 +27,7 @@
 //   layout                          RJHL0001: L and the log generation; replaced whole
 //   groups-<slot:3x>-<node:9x>      RJGT0001: the group table's entries under one node of a slot's
 //                                   trie, at most leaf_bytes unless one entry; replaced whole
-//   l<generation:16x>-<loop:4x>-turns-<segment:16x>   a loop's RFTW0001 segment
+//   l<generation:16x>-<loop:4x>-turns-<segment:16x>   a loop's RFTW0002 segment
 //   g<group:16x>-artifact-<incarnation:16x><serial:16x>   a group's artifact
 //
 // docs/design/host-layout.md has the layout and the re-partition protocol.
