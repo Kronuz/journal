@@ -24,7 +24,9 @@ cross a block. A zero length ends the segment's data.
 
 A write covers whole sectors: from the one holding the log's position, which it rewrites with the
 data already there, through the one holding its end, zero-filled past it. The log keeps the data of
-its last partial sector for the next write.
+its last partial sector for the next write. While a turn is in flight, a read of an acknowledged
+record takes that sector's bytes from this copy, not the file: the file's may be part way through
+the write (`Host::park` mid-turn, a Store's `live()`), and its check fails until the write ends.
 
 ## The verdicts
 
@@ -111,7 +113,15 @@ whole-sector write against an unaligned one, not more sectors on the device.
 - The stored low bits only name the segment a stale sector is checked under, and the CRC does not
   cover them: damage to them in a current sector costs nothing and is not reported.
 - A CRC-32C collision lets a damaged sector verify: 2^-32 per damaged sector.
-- A tear inside a sector, as on pmem without BTT, is outside the model: it reads as damage.
+- A tear inside a sector, as on pmem without BTT, is outside the model: it reads as damage. A tear
+  inside a turn's first sector, which it shares with the turn before, fails that sector's check,
+  and the sector lies in the newest block, whose manifest is not written yet: every group is lost,
+  the turn before's included (review F3). Keeping the turn before's bytes out of the sector means
+  ending each write at a sector boundary, 28-31% more bytes per turn (the cut-header design's O2).
+- Damage in the first sector of a block no write reached, in the newest segment's unwritten blocks
+  or a spare's, is damage in a gap no manifest names: every group is lost (review F2), one sector
+  in 64 of that space at 32 KiB blocks. `RFTW0001` read a flipped header there as the end and an
+  unreadable one as an error from recovery. Reading such damage as the end instead changes rule 1.
 - A fragment never verifies on its own, so bytes inside a torn write's payload that once formed a
   valid fragment cannot forge a record: every sector the parse reads verifies under this segment,
   or the parse stops. Damage reads as damage, and a gap whose blocks have no manifest yet, the
@@ -127,6 +137,7 @@ whole-sector write against an unaligned one, not more sectors on the device.
 | `stale_alias` | A recycled file of segment S = 2^32 + 5 holds, where W's second sector belongs, the sector segment 5 wrote there with the same data and S's low 32 bits: it reads as stale and W as torn. A CRC that binds only 32 bits reads it as current |
 | `newest_turn_damage` | The cut-header probe's newest tail, at 24 seeds and 2048- and 4096-byte blocks: a byte flipped at three places in every sector W changed is reported or harmless, never silent, and every subset of W's sectors left old reads as a tear. Under `RFTW0001` damage to W reads as a tear |
 | `earlier_turn_damage` | A byte in each sector before the newest write of the newest segment (seeds 4 and 6 at 4096-byte blocks, 22 at 2048) is reported, and each group kept holds every acknowledged record |
+| `midwrite_reads` | A turn's write half copied into the sector it shares with the turn before (2048- and 32768-byte blocks, 4 seeds of 100 turns): every group's `peek` returns its acknowledged records, and again after the barrier. Reading that sector from the file throws `Corruption` |
 | `large_header_damage`, `large_header_tear` | A block header past its first sector: damage to its second sector is reported, and that sector left old by the torn newest turn is a tear |
 
 `test/turn_log_power_test.cc` (T9) runs crash points at 512-, 4096-, 2048- and 1024-byte blocks,
