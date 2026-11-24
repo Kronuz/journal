@@ -43,6 +43,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 			set_tests_properties(journal_${t} PROPERTIES TIMEOUT 30)
 		endif()
 	endforeach()
+	target_sources(journal_host_test PRIVATE test/host_idle_test.cc)  # host_test's idle-group cases
 	# Host runs one entry per case, read from host_test.cc's case list, so each has its own time
 	# under the sanitizers and the cases run in parallel.
 	set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/host_test.cc)
