@@ -24,7 +24,8 @@
 // preallocated file per group whose turn is made durable by IO::sync_files, the measured
 // alternative. Each core is a thread with its own directory; each turn carries one record
 // from each group active in it. Reports turns per second per core, the turn's p50 and
-// p99 latency (write and barrier), and bytes written per byte appended.
+// p99 latency (write and barrier), the write's and the barrier's p50 and p99 apart, and bytes
+// written per byte appended.
 //   journal_turn_bench DIR [cores] [groups] [record_bytes] [active_percent] [seconds]
 #include "journal/turn_log.h"
 #include "completion/posix.h"
@@ -34,6 +35,7 @@
 #include <filesystem>
 #include <iostream>
 #include <random>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -41,7 +43,8 @@ namespace j = kronuz::journal;
 using clock_type = std::chrono::steady_clock;
 
 namespace {
-struct Result { std::uint64_t turns = 0, records = 0, appended = 0, written = 0; std::vector<double> latency; };
+struct Result { std::uint64_t turns = 0, records = 0, appended = 0, written = 0; std::vector<double> latency, write, barrier; };
+double micros(clock_type::time_point from, clock_type::time_point to) { return std::chrono::duration<double, std::micro>(to - from).count(); }
 
 std::filesystem::path fresh(const std::filesystem::path& path) {
 	std::filesystem::remove_all(path); std::filesystem::create_directories(path);
@@ -69,9 +72,15 @@ Result shared(const std::filesystem::path& dir, std::uint64_t groups, std::size_
 			auto sequence = log.sequence(g) + 1;
 			batch.push_back({g, sequence, sequence % 64 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint, payload, sequence - 1});
 		}
+		// append(), timed in its steps: encoding and the write, then the barrier.
 		const auto t0 = clock_type::now();
-		log.append(batch);
-		r.latency.push_back(std::chrono::duration<double, std::micro>(clock_type::now() - t0).count());
+		const auto write = log.stage(batch);
+		if (write.file->write_at(write.offset, write.bytes) != write.bytes.size()) { throw std::runtime_error("short turn log write"); }
+		const auto t1 = clock_type::now();
+		log.flush(write);
+		const auto t2 = clock_type::now();
+		log.completed();
+		r.latency.push_back(micros(t0, clock_type::now())); r.write.push_back(micros(t0, t1)); r.barrier.push_back(micros(t1, t2));
 		++r.turns; r.records += batch.size(); r.appended += batch.size() * bytes;
 		log.prepare();  // off the measured turn
 	}
@@ -103,8 +112,10 @@ Result per_group(const std::filesystem::path& dir, std::uint64_t groups, std::si
 			files[g]->write_at(offsets[g], record); offsets[g] += record.size(); dirty.push_back(files[g].get());
 			r.written += record.size();
 		}
+		const auto t1 = clock_type::now();
 		io.sync_files(dirty);
-		r.latency.push_back(std::chrono::duration<double, std::micro>(clock_type::now() - t0).count());
+		const auto t2 = clock_type::now();
+		r.latency.push_back(micros(t0, t2)); r.write.push_back(micros(t0, t1)); r.barrier.push_back(micros(t1, t2));
 		++r.turns; r.records += groups_now.size(); r.appended += groups_now.size() * bytes;
 	}
 	return r;
@@ -133,11 +144,13 @@ int main(int argc, char** argv) {
 			});
 		}
 		for (auto& t : threads) { t.join(); }
-		Result all; for (auto& r : results) { all.turns += r.turns; all.records += r.records; all.appended += r.appended; all.written += r.written; all.latency.insert(all.latency.end(), r.latency.begin(), r.latency.end()); }
+		Result all; for (auto& r : results) { all.turns += r.turns; all.records += r.records; all.appended += r.appended; all.written += r.written; all.latency.insert(all.latency.end(), r.latency.begin(), r.latency.end());
+			all.write.insert(all.write.end(), r.write.begin(), r.write.end()); all.barrier.insert(all.barrier.end(), r.barrier.begin(), r.barrier.end()); }
 		std::cout << (turn_log ? "shared   " : "per-group") << " cores " << cores << " groups " << groups << " bytes " << bytes << " active " << percent << "%: "
 			<< static_cast<double>(all.turns) / seconds / cores << " turns/s/core, " << static_cast<double>(all.records) / seconds << " records/s, p50 "
 			<< percentile(all.latency, 0.5) << " us, p99 " << percentile(all.latency, 0.99) << " us, written/appended "
-			<< (all.appended ? static_cast<double>(all.written) / static_cast<double>(all.appended) : 0) << '\n';
+			<< (all.appended ? static_cast<double>(all.written) / static_cast<double>(all.appended) : 0) << ", write p50 " << percentile(all.write, 0.5) << " us p99 "
+			<< percentile(all.write, 0.99) << " us, barrier p50 " << percentile(all.barrier, 0.5) << " us p99 " << percentile(all.barrier, 0.99) << " us\n";
 	}
 	std::filesystem::remove_all(root);
 	return 0;
