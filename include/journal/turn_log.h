@@ -31,6 +31,7 @@
 #include "framing.h"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdio>
 #include <deque>
 #include <limits>
@@ -167,6 +168,7 @@ struct Item {
 	std::string payload;
 	std::uint64_t segment = 0, offset = 0;  // the record's first fragment; a gap's block start
 	std::uint64_t last = 0;  // a gap's last block whose bytes may begin a lost record
+	std::uint64_t later = 0;  // a gap's highest turn read past a failure in its block, of `epoch`
 };
 // Per described block: its groups' highest sequences, and where the header naming them is.
 struct BlockManifest { std::map<std::uint64_t, std::uint64_t> groups; std::uint64_t segment = 0, epoch = 0; std::uint32_t block = 0; };
@@ -227,6 +229,24 @@ inline bool damaged_fragment(std::string_view block, std::uint64_t offset, std::
 	}
 	return false;
 }
+// The epoch and highest turn that records starting in `block` past `from` name, by fragments of
+// this segment that verify there; zero when none does. The scan stops at a failure, so a later
+// write there would go unread: recovery compares this turn with the failing one's.
+inline std::pair<std::uint64_t, std::uint64_t> later_turn(std::string_view block, std::size_t from, std::uint64_t segment) {
+	// Found by the segment number's first nonzero byte, so a block of zeros costs one memchr.
+	char number[8]; framing::store(number, segment, 8);
+	const auto zeros = static_cast<std::size_t>(std::countr_zero(segment) / 8); const std::string_view anchor(number + zeros, 8 - zeros);
+	std::pair<std::uint64_t, std::uint64_t> later{0, 0};
+	for (auto found = block.find(anchor, from + 8 + zeros); found != std::string_view::npos && found - zeros + 16 <= block.size(); found = block.find(anchor, found + 1)) {
+		const auto at = found - zeros - 8;  // where a fragment naming the segment there starts
+		const auto epoch = framing::peek64(block.substr(at + 16));
+		const auto fragment = framing::parse_fragment(block.substr(at), block.size() - at, segment, epoch);
+		const bool starts = fragment.type == framing::Full || fragment.type == framing::First;
+		if (fragment.check != framing::Check::ok || !starts || fragment.payload.size() < 9) { continue; }
+		if (const auto turn = framing::peek64(fragment.payload.substr(1)); turn > later.second) { later = {epoch, turn}; }
+	}
+	return later;
+}
 inline void scan_segment(File& file, const Identity& identity, const TurnLogOptions& options, std::uint64_t segment, std::vector<Item>& items, Manifests& manifests) {
 	std::uint64_t here = 0;
 	// A gap merges every unreadable run up to the next record. `holds`: this block's bytes may
@@ -234,6 +254,14 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 	auto gap = [&](bool holds) {
 		if (items.empty() || !items.back().gap) { Item item; item.gap = true; item.segment = segment; item.offset = item.last = here; items.push_back(std::move(item)); }
 		else if (holds) { items.back().last = here; }
+	};
+	// What the block holds past an unproven failure: its records go unread. Past a failure inside a
+	// gap, a later write needs a second fault, so only a gap's first block is read (unwritten blocks
+	// cost nothing).
+	auto past = [&](std::string_view block, std::size_t from) {
+		const auto [epoch, turn] = later_turn(block, from, segment);
+		auto& item = items.back();
+		if (turn > item.later) { item.later = turn; item.epoch = epoch; }
 	};
 	std::string block(options.block_bytes, '\0'), partial; bool assembling = false; std::uint64_t partial_epoch = 0, partial_offset = 0;
 	// Where the last header or fragment that verified starts, while it does not end its write.
@@ -246,8 +274,10 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 		const auto header = framing::parse_header(view, stream(identity, options.block_bytes, segment, 0), index);
 		if (header.check != framing::Check::ok) {
 			const bool damage = damaged_header(view, offset, segment);  // else unwritten, stale or torn
+			const bool first = items.empty() || !items.back().gap;
 			gap(damage); assembling = false;
 			if (damage) { items.back().damage = true; }
+			else if (first) { past(view, 1); }
 			continue;
 		}
 		const auto epoch = header.epoch; const auto count = header.count; in_write = 0;
@@ -264,6 +294,7 @@ inline void scan_segment(File& file, const Identity& identity, const TurnLogOpti
 				gap(true); assembling = false;
 				const bool written = in_write && (offset + *in_write) / framing::sector_bytes == (offset + position) / framing::sector_bytes;
 				if (damaged_fragment(view, offset, position, segment, epoch, written)) { items.back().damage = true; }
+				else { past(view, position + 1); }
 				break;
 			}
 			const auto type = fragment.type; const auto payload = fragment.payload; const auto length = payload.size();
@@ -851,6 +882,22 @@ inline TurnRecovery TurnLog::recover(const TurnLogGroups& known) {
 		// there cost every group with a record in them. In an earlier epoch, the next open names
 		// the turns it kept.
 		if (newest_epoch) {
+			// A write starts only after every earlier write's barrier returned, so a record of a turn
+			// later than a failure's makes the failure damage (rule 6). A failure's turn is at least
+			// the first not kept, and each record's before it (the next, past a turn's end).
+			std::vector<std::uint64_t> at_least;  // per gap, in order
+			std::uint64_t least = last_turn + 1;
+			for (std::size_t i = previous_end; i < stop; ++i) {
+				const auto& item = items[i];
+				if (item.gap) { at_least.push_back(least); }
+				else if (item.epoch == open.epoch) { least = std::max<std::uint64_t>(least, item.turn + (item.kind == end_of_turn)); }
+			}
+			std::uint64_t later = 0;
+			for (auto i = stop; i-- > previous_end;) {
+				auto& item = items[i];
+				if (item.epoch == open.epoch) { later = std::max(later, item.gap ? item.later : item.turn); }
+				if (item.gap) { if (later > at_least.back()) { item.damage = true; } at_least.pop_back(); }
+			}
 			bool hidden = false;
 			for (std::size_t i = previous_end; i < stop; ++i) { if (items[i].damage) { gap_damage(i); hidden = true; } }
 			for (std::size_t i = previous_end; hidden && i < stop; ++i) {
