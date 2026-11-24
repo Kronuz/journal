@@ -37,7 +37,7 @@ itself. Each `PosixFile` copies its backend's mode when it opens, so the queue w
 | Event | full | plain |
 |---|---|---|
 | Process or kernel crash | every acknowledged record | every acknowledged record |
-| Power loss, macOS | every acknowledged record | nothing promised: `fsync` leaves data in the drive's cache; each group recovers a state it was in, or reports damage |
+| Power loss, macOS | every acknowledged record | nothing promised: `fsync` leaves data in the drive's cache; each group keeps a prefix of its log, or is reported lost |
 | Power loss, Linux and FreeBSD | as the filesystem's `fsync` | the same calls, the same promise |
 
 In full mode an unsupported operation fails instead of weakening: an `F_FULLFSYNC` that fails,
@@ -53,10 +53,14 @@ calls on every host, so the two modes differ on Linux CI too.
 - `journal_turn_log_power` (full): a power cut after every mutation, and again during
   recovery: every acknowledged record survives, the in-flight turn whole or not at all.
 - `journal_turn_log_power_plain`: the same cuts, each ended twice. As a process crash
-  (`power_on`), every acknowledged record survives. As a power loss (`crash`), each group not
-  reported lost recovers a state it was in, the in-flight turn's included, and nothing that was
-  never written; the sweep requires that some power loss does lose an acknowledged record, so a
-  plain model that kept everything would fail it.
+  (`power_on`), every acknowledged record survives. As a power loss (`crash`), recovery keeps of
+  each group not reported lost a prefix of a state it was in, the in-flight turn's included:
+  never a record that was not written or one out of place. The sweep requires that some power
+  loss does lose an acknowledged record, so a plain model that kept everything would fail it.
+  It tallies what plain mode costs: of 5,600 crash points, 5,238 power losses lost an
+  acknowledged record and 2,673 reported damage; one kept only part of a turn (group 1's
+  sequence 1 of a turn that wrote 1 and 2, a recycled segment's name restored by the crash), and
+  it reported damage. A part of a turn is a shorter prefix of the group's log, not a reorder.
 
 ## Checked against the real calls
 

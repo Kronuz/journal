@@ -214,7 +214,14 @@ void follows(j::FlushMode mode, const std::vector<Call>& calls, const std::strin
 	}
 	if (j::host_sync_platform != j::SyncPlatform::macos) { return; }
 	if (mode == j::FlushMode::full) {
-		check(has(calls, Call::full_fsync) && !has(calls, Call::barrier_fsync) && calls.back() == Call::full_fsync, "full mode flushes the drive at every sync: " + at);
+		// Each fsync only stages: the next call that is not an fsync is the drive flush.
+		bool staged = true;
+		for (std::size_t i = 0; i < calls.size(); ++i) {
+			if (calls[i] != Call::fsync) { continue; }
+			auto next = i; while (next < calls.size() && calls[next] == Call::fsync) { ++next; }
+			staged &= next < calls.size() && calls[next] == Call::full_fsync;
+		}
+		check(has(calls, Call::full_fsync) && !has(calls, Call::barrier_fsync) && staged, "full mode flushes the drive after every fsync: " + at);
 	} else {
 		check(!has(calls, Call::full_fsync) && has(calls, Call::fsync), "plain mode never flushes the drive: " + at);
 	}

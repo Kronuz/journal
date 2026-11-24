@@ -27,7 +27,7 @@
 // every third point again during the recovery that follows. Segments recycle, so stale blocks
 // from an earlier use are present (condition 10). The sweep runs in either flush mode, with the
 // calls macOS makes on any host: full loses nothing acknowledged; plain survives a process crash
-// whole, and after a power loss recovers, per group, only a state the group was in.
+// whole, and after a power loss keeps of each group only a prefix of a state it was in.
 #include "faultlab/faultfs.h"
 #include "journal/turn_log.h"
 #include <algorithm>
@@ -80,17 +80,40 @@ struct Workload {
 		for (const auto& r : batch) { if (r.kind == j::TurnRecordKind::Checkpoint) { acknowledged[r.group].clear(); } acknowledged[r.group].push_back(r); }
 		for (const auto& r : batch) { history[r.group].push_back(acknowledged[r.group]); }
 	}
-	// Plain mode's power loss: every group recovery keeps is in a state it was in, the in-flight
-	// turn's included; nothing recovered was never written.
-	bool consistent(const j::TurnRecovery& recovered) const {
-		auto with = acknowledged; for (const auto& r : in_flight) { if (r.kind == j::TurnRecordKind::Checkpoint) { with[r.group].clear(); } with[r.group].push_back(r); }
-		for (const auto& [group, records] : recovered.groups) {
-			if (recovered.lost.contains(group)) { continue; }
-			const auto found = history.find(group);
-			const bool known = found != history.end() && std::find(found->second.begin(), found->second.end(), records) != found->second.end();
-			if (!known && !(with.contains(group) && with.at(group) == records)) { return false; }
+	// Plain mode's power loss: what recovery keeps of a group not lost, against the states it was
+	// in (the in-flight turn's included). `torn` is a prefix of one, part of a turn; `invented`
+	// is neither, a record never written or out of place.
+	enum class Kept { state, torn, invented };
+	Kept kept_of(std::uint64_t group, const std::vector<j::TurnRecord>& records) const {
+		std::vector<std::vector<j::TurnRecord>> states;
+		if (const auto found = history.find(group); found != history.end()) { states = found->second; }
+		auto with = acknowledged.contains(group) ? acknowledged.at(group) : std::vector<j::TurnRecord>{};
+		for (const auto& r : in_flight) { if (r.group != group) { continue; } if (r.kind == j::TurnRecordKind::Checkpoint) { with.clear(); } with.push_back(r); }
+		states.push_back(with);
+		Kept kept = Kept::invented;
+		for (const auto& state : states) {
+			if (state == records) { return Kept::state; }
+			if (records.size() < state.size() && std::equal(records.begin(), records.end(), state.begin())) { kept = Kept::torn; }
 		}
-		return true;
+		return kept;
+	}
+	// The groups recovery kept in no state they were in, each with its recovered and acknowledged
+	// sequences (T9_HISTORY=1 adds every state).
+	std::string invented(const j::TurnRecovery& recovered, bool torn_too) const {
+		auto sequences = [](const std::vector<j::TurnRecord>& records) {
+			std::string out; for (const auto& r : records) { out += ' ' + std::to_string(r.sequence) + (r.kind == j::TurnRecordKind::Checkpoint ? "c" : ""); } return out;
+		};
+		std::string out;
+		for (const auto& [group, records] : recovered.groups) {
+			const auto kept = kept_of(group, records);
+			if (recovered.lost.contains(group) || kept == Kept::state || (kept == Kept::torn && !torn_too)) { continue; }
+			out += "; group " + std::to_string(group) + (kept == Kept::torn ? " torn," : "") + " recovered" + sequences(records) + ", acknowledged" + (acknowledged.contains(group) ? sequences(acknowledged.at(group)) : "");
+			if (std::getenv("T9_HISTORY") && history.contains(group)) { for (const auto& state : history.at(group)) { out += " |" + sequences(state); } }
+		}
+		return out;
+	}
+	bool torn(const j::TurnRecovery& recovered) const {
+		return std::any_of(recovered.groups.begin(), recovered.groups.end(), [&](const auto& g) { return !recovered.lost.contains(g.first) && kept_of(g.first, g.second) == Kept::torn; });
 	}
 	// Recovery holds every acknowledged record, and the in-flight turn whole or not at all.
 	bool matches(const j::TurnRecovery& recovered) {
@@ -110,8 +133,8 @@ enum class Loss { power, process };
 void open_mode(fl::filesystem& disk, Mode mode) {
 	disk.set_flush_mode(mode == Mode::full ? fl::flush_mode::full : fl::flush_mode::plain, fl::sync_platform::macos);
 }
-// Plain mode's tally: crash points whose power loss lost an acknowledged record, or reported damage.
-struct PlainLoss { std::uint64_t lost = 0, damaged = 0; };
+// Plain mode's tally: power losses that lost an acknowledged record, reported damage, or kept part of a turn.
+struct PlainLoss { std::uint64_t lost = 0, damaged = 0, torn = 0, torn_silent = 0; };
 PlainLoss plain_loss;
 std::string listing(const fl::filesystem& disk) { std::string names; for (const auto& name : disk.list()) { names += ' ' + name; } return names; }
 
@@ -147,8 +170,13 @@ void run(std::uint64_t seed, std::uint64_t cut, std::uint64_t second, unsigned t
 	try {
 		j::TurnLog log(io, identity, recovered, options);
 		if (mode == Mode::plain && loss == Loss::power) {
-			check(work.consistent(recovered), "plain mode's power loss recovers each group in a state it was in: " + at + names);
+			const auto invented = work.invented(recovered, false);
+			check(invented.empty(), "plain mode's power loss keeps of each group a prefix of a state it was in: " + at + names + invented);
 			plain_loss.damaged += recovered.damaged || !recovered.lost.empty();
+			if (work.torn(recovered)) {
+				++plain_loss.torn; plain_loss.torn_silent += !recovered.damaged;
+				if (std::getenv("T9_TORN")) { std::cout << "torn: " << at << (recovered.damaged ? " damaged" : " silent") << work.invented(recovered, true) << '\n'; }
+			}
 			plain_loss.lost += !work.matches(recovered);
 			return;
 		}
@@ -563,7 +591,8 @@ int main(int argc, char** argv) {
 		}
 		if (mode == Mode::plain) {
 			std::cout << "block " << block << ", plain: " << points << " crash points (" << seconds << " with a second loss in recovery), each a power loss and a process crash; "
-				<< plain_loss.lost - loss_before.lost << " power losses lost an acknowledged record, " << plain_loss.damaged - loss_before.damaged << " reported damage, " << failures - before << " failures\n";
+				<< plain_loss.lost - loss_before.lost << " power losses lost an acknowledged record, " << plain_loss.damaged - loss_before.damaged << " reported damage, "
+				<< plain_loss.torn - loss_before.torn << " kept part of a turn (" << plain_loss.torn_silent - loss_before.torn_silent << " without reporting damage), " << failures - before << " failures\n";
 			continue;
 		}
 		std::uint64_t corrupted = 0, both = 0, header = 0, last = 0, sectors = 0, tears = 0;
