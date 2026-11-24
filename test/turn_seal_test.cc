@@ -319,26 +319,27 @@ void full_size() {
 void bound() {
 	std::mt19937_64 random(42);
 	unsigned turns = 0;
-	for (std::uint32_t block : {256u, 512u, 1024u, 4096u, 32768u}) {
+	for (std::uint32_t block : {512u, 1024u, 4096u, 32768u}) {
 		for (int round = 0; round < 100; ++round) {
 			j::framing::Manifest filling{true, 1, 0, {}};
-			const auto room = (block / 2 - j::framing::header_bytes(0)) / 16;
+			const auto room = (d::data_bytes(block) / 2 - d::header_bytes(0)) / 16;
 			for (std::uint64_t g = 0; g < room; ++g) { filling.groups[g + 1] = 1; }
-			j::framing::Emitter emitter(d::stream(identity, block, 2, 1), 0, filling);
+			auto emitter = d::Emitter::measure(d::stream(identity, block, 2, 1), 0, filling);
 			std::uint64_t cost = 0;
 			const bool tiny = random() % 2;
 			const auto records = tiny ? random() % 600 + 1 : random() % 30 + 1;
 			for (std::uint64_t i = 0; i < records; ++i) {
 				const auto group = random() % 3000 + 1;
 				const std::size_t size = tiny ? random() % 8 : random() % (3 * block);
-				emitter.record(d::logical(1, 1, group, 1, std::string(size, 'x')), group, 1);
+				emitter.record(d::view(d::header(1, 1, group, 1)), size, [](std::string&, std::size_t) {}, group, 1);
 				cost += d::record_cost(size);
 			}
-			std::string count; j::put32(count, static_cast<std::uint32_t>(records));
-			emitter.record(d::logical(d::end_of_turn, 1, 0, 0, count));
-			check(emitter.position() <= d::turn_bound(cost, block), "the bound holds: block " + std::to_string(block) + " records " + std::to_string(records));
-			const auto inverse = d::turn_room(emitter.position(), block);
-			check(!inverse || d::turn_bound(inverse, block) <= emitter.position(), "the room inverts the bound");
+			emitter.record(d::view(d::header(d::end_of_turn, 1, 0, 0)), 4, [](std::string&, std::size_t) {}, 0, 0);
+			// The file bytes the turn's sectors take.
+			const auto bytes = (emitter.position() + d::sector_data - 1) / d::sector_data * d::sector_bytes;
+			check(bytes <= d::turn_bound(cost, block), "the bound holds: block " + std::to_string(block) + " records " + std::to_string(records));
+			const auto inverse = d::turn_room(bytes, block);
+			check(!inverse || d::turn_bound(inverse, block) <= bytes, "the room inverts the bound");
 			++turns;
 		}
 	}

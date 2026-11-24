@@ -20,11 +20,12 @@
  * THE SOFTWARE.
  */
 
-// The block framing of journal's durable logs: the turn log (RFTW0001) and strata's
-// manifest log. A stream is blocks of block_bytes, each opening with a header (magic,
-// identity, segment, block number, epoch, an optional manifest of the block before it,
-// CRC-32C); records split into fragments that never cross a block, each under its own
-// CRC-32C and bound to the stream's segment and epoch. docs/mechanisms/framing.md.
+// The block framing of strata's manifest log; the turn log (RFTW0002) frames its sectors in
+// turn_log.h and shares the fragment types, manifests and byte helpers here. A stream is blocks
+// of block_bytes, each opening with a header (magic, identity, segment, block number, epoch, an
+// optional manifest of the block before it, CRC-32C); records split into fragments that never
+// cross a block, each under its own CRC-32C and bound to the stream's segment and epoch.
+// docs/mechanisms/framing.md.
 
 #pragma once
 

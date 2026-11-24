@@ -22,8 +22,8 @@
 
 // The turn path owns its buffers (docs/mechanisms/turn-seal.md, "The turn's buffers"). One
 // CTest entry per case:
-//   bytes    framing a record's header and body in place writes what main's logical() path wrote
-//   turns    a log's turns, rolling into new segments, write main's bytes at main's offsets
+//   bytes    framing a record's header and body in place writes the plain framing's sealed sectors
+//   turns    a log's turns, rolling into new segments, write the plain framing's sectors at its offsets
 //   warm     a warm turn of 32 records from 8 groups allocates nothing in stage() or completed()
 //   seal     a sealed turn through the driver allocates far less than one body: no copy at seal
 //   recycle  the driver hands each sealed body back once its turn completes; warm turns allocate nothing
@@ -98,63 +98,67 @@ template <class F> Count counted(F&& fn) {
 	return {allocations.load(), allocated.load()};
 }
 
-// main's framing at journal:178030b, verbatim but for names: what the bytes on disk must stay.
+// RFTW0002 written the plain way: whole logical records into a data stream from the sector
+// holding the start, then sealed into sectors. What the turn path's in-place framing must write.
 namespace reference {
 struct Manifest { bool known = false; std::uint64_t segment = 0; std::uint32_t block = 0; std::map<std::uint64_t, std::uint64_t> groups; };
 class Emitter {
 public:
-	Emitter(const f::Stream& stream, std::uint64_t position, Manifest filling = {})
-		: stream_(stream), position_(position), filling_(std::move(filling)) {}
+	// `prefix`: the data the sector holding `position` has before it.
+	Emitter(const d::Stream& stream, std::uint64_t position, Manifest filling = {}, std::string prefix = {})
+		: stream_(stream), block_(stream.block_bytes / 512 * 504), position_(position), first_(position / 504), filling_(std::move(filling)), data_(std::move(prefix)) {}
 	std::uint64_t record(std::string_view logical, std::uint64_t group = 0, std::uint64_t sequence = 0) {
 		std::string_view rest(logical); bool first = true; std::uint64_t start = 0;
-		const std::uint64_t block = stream_.block_bytes;
 		while (!rest.empty()) {
 			enter_block();
-			auto room = block - position_ % block;
-			if (room < f::fragment_header + 1) { pad(room); continue; }
-			auto count = std::min<std::size_t>(rest.size(), room - f::fragment_header);
+			auto room = block_ - position_ % block_;
+			if (room < 5) { data_.append(room, '\0'); position_ += room; continue; }
+			auto count = std::min<std::size_t>(rest.size(), room - 4);
 			bool last = count == rest.size();
 			if (first) { start = position_; }
 			if (group) { auto& highest = filling_.groups[group]; highest = std::max(highest, sequence); }
-			fragment(first ? (last ? f::Full : f::First) : (last ? f::Last : f::Middle), rest.substr(0, count));
+			f::put16(data_, static_cast<std::uint16_t>(count)); data_.push_back(static_cast<char>(first ? (last ? f::Full : f::First) : (last ? f::Last : f::Middle))); data_.push_back('\0');
+			data_.append(rest.substr(0, count)); position_ += 4 + count;
 			rest.remove_prefix(count); first = false;
 		}
 		return start;
 	}
-	const std::string& bytes() const noexcept { return bytes_; }
+	// The write: the data zero-filled to its last sector's end, each sector with its trailer.
+	std::string bytes() const {
+		std::string data = data_; data.resize((data.size() + 503) / 504 * 504, '\0');
+		std::string out;
+		for (std::size_t at = 0; at < data.size(); at += 504) {
+			const auto sector = data.substr(at, 504);
+			std::string bound; j::put64(bound, stream_.segment); j::put32(bound, static_cast<std::uint32_t>(first_ + at / 504));
+			j::Checksum checksum; checksum.update(sector); checksum.update(bound);
+			out.append(sector); j::put32(out, static_cast<std::uint32_t>(stream_.segment)); j::put32(out, checksum.value());
+		}
+		return out;
+	}
+	// The data its last sector holds before the position: the next write's prefix.
+	std::string partial() const { return data_.substr(data_.size() - position_ % 504); }
 	std::uint64_t position() const noexcept { return position_; }
 	const Manifest& filling() const noexcept { return filling_; }
 private:
 	void enter_block() {
-		const std::uint64_t block = stream_.block_bytes;
-		if (position_ % block) { return; }
-		auto start = bytes_.size();
-		bytes_.append(stream_.magic); bytes_.append(stream_.identity.data(), stream_.identity.size());
-		j::put64(bytes_, stream_.segment); j::put32(bytes_, static_cast<std::uint32_t>(position_ / block)); j::put64(bytes_, stream_.epoch);
-		auto count = stream_.manifests && filling_.known && f::header_bytes(static_cast<std::uint16_t>(std::min<std::size_t>(filling_.groups.size(), 4096))) <= block / 2 ?
-			static_cast<std::uint16_t>(filling_.groups.size()) : f::no_manifest;
-		j::put64(bytes_, count == f::no_manifest ? 0 : filling_.segment); j::put32(bytes_, count == f::no_manifest ? 0 : filling_.block); f::put16(bytes_, count);
-		if (count != f::no_manifest) { for (const auto& [group, sequence] : filling_.groups) { j::put64(bytes_, group); j::put64(bytes_, sequence); } }
-		j::put32(bytes_, j::crc32c(std::string_view(bytes_).substr(start)));
-		position_ += f::header_bytes(count);
-		filling_ = Manifest{true, stream_.segment, static_cast<std::uint32_t>(position_ / block), {}};
+		if (position_ % block_) { return; }
+		auto start = data_.size();
+		data_.append(d::magic); data_.append(stream_.identity.data(), stream_.identity.size());
+		j::put64(data_, stream_.segment); j::put32(data_, static_cast<std::uint32_t>(position_ / block_)); j::put64(data_, stream_.epoch);
+		const auto count = filling_.known && 58 + 16 * std::min<std::size_t>(filling_.groups.size(), 4096) <= block_ / 2 ? static_cast<std::uint16_t>(filling_.groups.size()) : std::uint16_t{0xffff};
+		j::put64(data_, count == 0xffff ? 0 : filling_.segment); j::put32(data_, count == 0xffff ? 0 : filling_.block); f::put16(data_, count);
+		if (count != 0xffff) { for (const auto& [group, sequence] : filling_.groups) { j::put64(data_, group); j::put64(data_, sequence); } }
+		position_ += data_.size() - start;
+		filling_ = Manifest{true, stream_.segment, static_cast<std::uint32_t>(position_ / block_), {}};
 	}
-	void pad(std::uint64_t count) { bytes_.append(count, '\0'); position_ += count; }
-	void fragment(f::Fragment type, std::string_view payload) {
-		std::string header; f::put16(header, static_cast<std::uint16_t>(payload.size())); header.push_back(static_cast<char>(type)); header.push_back('\0');
-		j::put64(header, stream_.segment); j::put64(header, stream_.epoch);
-		j::Checksum checksum; checksum.update(header); checksum.update(payload);
-		j::put32(bytes_, checksum.value()); bytes_.append(header); bytes_.append(payload);
-		position_ += f::fragment_header + payload.size();
-	}
-	f::Stream stream_; std::uint64_t position_; std::string bytes_; Manifest filling_;
+	d::Stream stream_; std::uint64_t block_, position_, first_; Manifest filling_; std::string data_;
 };
 inline std::string logical(std::uint8_t kind, std::uint64_t turn, std::uint64_t group, std::uint64_t sequence, std::string_view payload) {
 	std::string bytes; bytes.reserve(d::record_header + payload.size());
 	bytes.push_back(static_cast<char>(kind)); j::put64(bytes, turn); j::put64(bytes, group); j::put64(bytes, sequence); bytes.append(payload);
 	return bytes;
 }
-// The turn main's TurnLog::stage framed: its records, then the end-of-turn record.
+// The turn TurnLog::stage frames: its records, then the end-of-turn record.
 inline void turn(Emitter& emitter, std::uint64_t number, std::span<const j::TurnRecord> records) {
 	for (const auto& r : records) { emitter.record(logical(static_cast<std::uint8_t>(r.kind), number, r.group, r.sequence, r.payload), r.group, r.sequence); }
 	std::string count; j::put32(count, static_cast<std::uint32_t>(records.size()));
@@ -184,75 +188,76 @@ const j::Identity identity{'B', 'U', 'F', 'F', 'E', 'R'};
 
 // A1. Every record kind, size class and start position, from manifests that are empty, small,
 // past half a block and past 4096 groups: the head-and-body path, the fill path in uneven
-// pieces and the one-piece path write main's bytes, offsets and manifests; a measuring emitter
-// lays them out at the same positions.
+// pieces and the one-piece path write the plain framing's sealed sectors, offsets and manifests;
+// a measuring emitter lays them out at the same positions.
 void bytes() {
 	std::mt19937_64 random(7);
 	std::uint64_t records = 0;
 	const std::uint8_t kinds[] = {1, 2, 3, d::end_of_turn, d::open_record};
-	for (std::uint32_t block : {256u, 512u, 4096u, 32768u}) {
-		const std::uint64_t room = block - f::header_bytes(f::no_manifest) - f::fragment_header;
-		const std::uint64_t sizes[] = {0, 1, 2, 23, 24, 25, 26, 100, room - 25, room - 24, room, room + 1, block, 2 * block + 7, 3 * block - 1};
-		for (bool manifests : {true, false}) {
-			for (std::size_t prior : {std::size_t{0}, std::size_t{3}, std::size_t{block / 32}, std::size_t{4100}}) {
-				for (std::uint64_t start : {std::uint64_t{0}, std::uint64_t{f::header_bytes(f::no_manifest)}, std::uint64_t{block - 25}, std::uint64_t{block - 24}, std::uint64_t{block - 1}, std::uint64_t{block + 100}}) {
-					const f::Stream stream{d::magic, identity, block, 5, 3, manifests};
-					reference::Manifest filling{true, 5, static_cast<std::uint32_t>(start / block), {}};
-					for (std::size_t g = 0; g < prior; ++g) { filling.groups[random() % 9000 + 1] = random() % 50; }
-					reference::Emitter old(stream, start, filling);
-					f::Emitter pieces(stream, start, converted(filling)), fills(stream, start, converted(filling)), whole(stream, start, converted(filling));
-					auto measure = f::Emitter::measure(stream, start, converted(filling));
-					for (int n = 0; n < 24; ++n) {
-						const auto kind = kinds[random() % 5];
-						const auto size = sizes[random() % std::size(sizes)];
-						const std::uint64_t group = random() % 4 ? random() % 40 : 0, sequence = random() % 1000;
-						const auto body = payload(group, sequence, size);
-						const auto head = d::header(kind, 9, group, sequence);
-						const auto expected = old.record(reference::logical(kind, 9, group, sequence, body), group, sequence);
-						const auto a = pieces.record(d::view(head), body, group, sequence);
-						std::string_view rest(body);
-						const auto b = fills.record(d::view(head), body.size(), [&](std::string& out, std::size_t count) {
-							while (count) { const auto piece = std::min<std::size_t>(count, random() % 7 + 1); out.append(rest.substr(0, piece)); rest.remove_prefix(piece); count -= piece; }
-						}, group, sequence);
-						const auto c = whole.record(d::logical(kind, 9, group, sequence, body), group, sequence);
-						const auto m = measure.record(d::view(head), body.size(), [&](std::string&, std::size_t) { check(false, "a measuring emitter calls no fill"); }, group, sequence);
-						++records;
-						const auto at = "block " + std::to_string(block) + " manifests " + std::to_string(manifests) + " prior " + std::to_string(prior) + " start " + std::to_string(start) + " record " + std::to_string(n);
-						check(a == expected && b == expected && c == expected && m == expected, "each path starts the record where main did: " + at);
-						check(pieces.position() == old.position() && fills.position() == old.position() && whole.position() == old.position() && measure.position() == old.position(), "each path ends it where main did: " + at);
-						check(same(pieces.filling(), old.filling()) && same(measure.filling(), old.filling()), "each path notes main's manifest: " + at);
-					}
-					check(pieces.bytes() == old.bytes() && fills.bytes() == old.bytes() && whole.bytes() == old.bytes(), "the bytes are main's: block " + std::to_string(block) + " start " + std::to_string(start));
-					check(measure.bytes().empty(), "a measuring emitter writes nothing");
+	for (std::uint32_t block : {512u, 4096u, 32768u}) {
+		const std::uint64_t data = d::data_bytes(block), room = data - d::header_bytes(d::no_manifest) - d::fragment_header;
+		const std::uint64_t sizes[] = {0, 1, 2, 23, 24, 25, 26, 100, 503, 504, 505, room - 25, room - 24, room, room + 1, data, 2 * data + 7, 3 * data - 1};
+		for (std::size_t prior : {std::size_t{0}, std::size_t{3}, std::size_t{block / 32}, std::size_t{4100}}) {
+			for (std::uint64_t start : {std::uint64_t{0}, std::uint64_t{d::header_bytes(d::no_manifest)}, std::uint64_t{503}, data - 25, data - 5, data - 1, data + 100}) {
+				const auto stream = d::stream(identity, block, 5, 3);
+				reference::Manifest filling{true, 5, static_cast<std::uint32_t>(start / data), {}};
+				for (std::size_t g = 0; g < prior; ++g) { filling.groups[random() % 9000 + 1] = random() % 50; }
+				const std::string prefix(start % d::sector_data, 'p');
+				reference::Emitter old(stream, start, filling, prefix);
+				d::Emitter pieces(stream, start, converted(filling), {}, prefix), fills(stream, start, converted(filling), {}, prefix), whole(stream, start, converted(filling), {}, prefix);
+				auto measure = d::Emitter::measure(stream, start, converted(filling));
+				for (int n = 0; n < 24; ++n) {
+					const auto kind = kinds[random() % 5];
+					const auto size = sizes[random() % std::size(sizes)];
+					const std::uint64_t group = random() % 4 ? random() % 40 : 0, sequence = random() % 1000;
+					const auto body = payload(group, sequence, size);
+					const auto head = d::header(kind, 9, group, sequence);
+					const auto expected = old.record(reference::logical(kind, 9, group, sequence, body), group, sequence);
+					const auto a = pieces.record(d::view(head), body, group, sequence);
+					std::string_view rest(body);
+					const auto b = fills.record(d::view(head), body.size(), [&](std::string& out, std::size_t count) {
+						while (count) { const auto piece = std::min<std::size_t>(count, random() % 7 + 1); out.append(rest.substr(0, piece)); rest.remove_prefix(piece); count -= piece; }
+					}, group, sequence);
+					const auto c = whole.record(d::logical(kind, 9, group, sequence, body), {}, group, sequence);
+					const auto m = measure.record(d::view(head), body.size(), [&](std::string&, std::size_t) { check(false, "a measuring emitter calls no fill"); }, group, sequence);
+					++records;
+					const auto at = "block " + std::to_string(block) + " prior " + std::to_string(prior) + " start " + std::to_string(start) + " record " + std::to_string(n);
+					check(a == expected && b == expected && c == expected && m == expected, "each path starts the record where the plain framing does: " + at);
+					check(pieces.position() == old.position() && fills.position() == old.position() && whole.position() == old.position() && measure.position() == old.position(), "each path ends it where the plain framing does: " + at);
+					check(same(pieces.filling(), old.filling()) && same(measure.filling(), old.filling()), "each path notes the plain framing's manifest: " + at);
 				}
+				pieces.seal(); fills.seal(); whole.seal(); measure.seal();
+				const auto sealed = old.bytes();
+				check(pieces.bytes() == sealed && fills.bytes() == sealed && whole.bytes() == sealed, "the sealed sectors are the plain framing's: block " + std::to_string(block) + " start " + std::to_string(start));
+				check(measure.bytes().empty(), "a measuring emitter writes nothing");
 			}
 		}
 	}
-	std::cout << "bytes: " << records << " records against main's framing\n";
+	std::cout << "bytes: " << records << " records against the plain framing\n";
 }
 
-// Mirrors a log with main's framing: where each turn starts and the bytes it writes.
+// Mirrors a log with the plain framing: where each turn starts and the sectors it writes.
 struct Shadow {
-	f::Stream stream; std::uint64_t segment_bytes = 0, end = 0; reference::Manifest filling;
+	d::Stream stream; std::uint64_t segment_bytes = 0, end = 0; reference::Manifest filling; std::string partial;
 	Shadow(const j::TurnLog& log, const j::TurnLogOptions& options)
 		: stream(d::stream(identity, options.block_bytes, log.segment(), log.epoch())), segment_bytes(options.segment_bytes) {
 		reference::Emitter open(stream, 0, {});
 		open.record(reference::logical(d::open_record, log.last_turn(), 0, 0, {}));
-		end = open.position(); filling = open.filling();
+		end = open.position(); filling = open.filling(); partial = open.partial();
 	}
-	// main's bytes for a turn staged at `segment` and `offset`; `rolled` when main would start
-	// it in the next segment, which the log must then have done.
+	// The plain framing's sectors for a turn staged at `segment` and file `offset`; `rolled` when it
+	// starts in the next segment, which the log must then have done.
 	std::string turn(std::uint64_t number, std::span<const j::TurnRecord> records, std::uint64_t segment, std::uint64_t offset, bool& rolled, const std::string& at) {
-		reference::Emitter here(stream, end, filling); reference::turn(here, number, records);
-		rolled = here.position() > segment_bytes;
+		reference::Emitter here(stream, end, filling, partial); reference::turn(here, number, records);
+		rolled = here.position() > d::data_bytes(segment_bytes);
 		if (!rolled) {
-			check(segment == stream.segment && offset == end, "the turn follows the last one: " + at);
-			end = here.position(); filling = here.filling(); return here.bytes();
+			check(segment == stream.segment && offset == d::file_offset(end - end % d::sector_data), "the turn follows the last one: " + at);
+			end = here.position(); filling = here.filling(); partial = here.partial(); return here.bytes();
 		}
 		check(segment > stream.segment && offset == 0, "a turn past the segment's rest starts the next segment: " + at);
 		stream.segment = segment;
 		reference::Emitter fresh(stream, 0, filling); reference::turn(fresh, number, records);
-		end = fresh.position(); filling = fresh.filling(); return fresh.bytes();
+		end = fresh.position(); filling = fresh.filling(); partial = fresh.partial(); return fresh.bytes();
 	}
 };
 // Stages, checks against the shadow, writes, syncs and completes one turn.
@@ -260,7 +265,7 @@ std::uint64_t commit(j::TurnLog& log, Shadow& shadow, std::span<const j::TurnRec
 	const auto write = log.stage(records);
 	bool moved = false;
 	const auto expected = shadow.turn(write.turn, records, log.segment(), write.offset, moved, at);
-	check(write.bytes == expected, "the turn's bytes are main's: " + at);
+	check(write.bytes == expected, "the turn's sectors are the plain framing's: " + at);
 	check(write.file->write_at(write.offset, write.bytes) == write.bytes.size(), "the turn is written");
 	log.flush(write); log.completed();
 	if (rolled) { *rolled = moved; }
@@ -268,7 +273,7 @@ std::uint64_t commit(j::TurnLog& log, Shadow& shadow, std::span<const j::TurnRec
 }
 
 // A1. Turns of one to four records, empty to four blocks, from five groups, on 16 KiB segments:
-// many turns start the next segment. Each turn's bytes and offset are main's, and the log
+// many turns start the next segment. Each turn's sectors and offset are the plain framing's, and the log
 // recovers every record.
 void turns() {
 	const j::TurnLogOptions options{32 * 512, 512, 1, 1000, 600};
@@ -303,7 +308,7 @@ void turns() {
 
 // A2. Rounds of a batch turn (8 groups, 4 records each, 100 B to 40 KiB) and a checkpoint turn;
 // after four warm rounds, stage() and completed() of each turn allocate nothing, the turn's
-// bytes are main's, and its payload bytes are the bodies' bytes.
+// sectors are the plain framing's, and its payload bytes are the bodies' bytes.
 void warm() {
 	const j::TurnLogOptions options{std::uint64_t{8} << 20, 32 << 10, 1, 100, 1 << 20};
 	fl::filesystem disk; fl::io io(disk);
@@ -325,7 +330,7 @@ void warm() {
 			std::optional<j::TurnLog::TurnWrite> write;
 			const auto staging = counted([&] { write = log.stage(*turn); });
 			const auto expected_bytes = [&] { bool rolled = false; return shadow.turn(write->turn, *turn, log.segment(), write->offset, rolled, at); }();
-			check(write->bytes == expected_bytes, "the turn's bytes are main's: " + at);
+			check(write->bytes == expected_bytes, "the turn's sectors are the plain framing's: " + at);
 			check(write->file->write_at(write->offset, write->bytes) == write->bytes.size(), "the turn is written");
 			log.flush(*write);
 			const auto completing = counted([&] { log.completed(); });

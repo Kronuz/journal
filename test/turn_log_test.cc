@@ -20,24 +20,29 @@
  * THE SOFTWARE.
  */
 
-// RFTW0001 (turn_log.h): turns round-trip across blocks, segments, and epochs; the torn
+// RFTW0002 (turn_log.h): turns round-trip across blocks, segments, and epochs; the torn
 // tail is dropped; damage before a later turn loses only the groups it may have held;
-// checkpoints supersede; stale bytes of a recycled file never read as current.
+// checkpoints supersede; stale bytes of a recycled file never read as current; each sector
+// verdict recovers by value. `turn_log_test [case]`, every case by default.
 #include "journal/turn_log.h"
+#include "faultlab/faultfs.h"
 #include "completion/posix.h"
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iostream>
 #include <optional>
 #include <random>
 
 namespace j = kronuz::journal;
+namespace d = j::turn_log_detail;
+namespace fl = kronuz::faultlab;
 
 namespace {
 int checks = 0, failures = 0;
-void check(bool value, const char* what) {
+void check(bool value, const std::string& what) {
 	++checks;
-	if (!value) { ++failures; std::cerr << "FAIL: " << what << '\n'; }
+	if (!value) { ++failures; if (failures < 100) { std::cerr << "FAIL: " << what << '\n'; } }
 }
 template <class F> bool throws(F&& f) {
 	try { f(); return false; } catch (const std::exception&) { return true; }
@@ -62,8 +67,22 @@ struct Directory {
 };
 const j::Identity identity{'T', 'U', 'R', 'N'};
 const j::TurnLogOptions small{8 * 512, 512, 1};  // 512-byte blocks, 4 KiB segments
+constexpr std::uint64_t sector = 512;
+// RFTW0002 positions count sector data bytes. The file also builds against a log without sector
+// checks, where positions are file offsets, so its newest-turn cases run there too.
+constexpr bool sectors = d::magic[7] == '2';
+std::uint64_t file_at(std::uint64_t position) { return sectors ? position / 504 * 512 + position % 504 : position; }
+std::uint64_t block_data(std::uint32_t block_bytes) { return sectors ? block_bytes / 512 * 504 : block_bytes; }
 
 using Model = std::map<std::uint64_t, std::vector<j::TurnRecord>>;
+// Every group recovery does not call lost holds exactly its acknowledged records.
+bool kept(const j::TurnRecovery& r, const Model& model) {
+	for (const auto& [group, records] : model) {
+		const auto found = r.groups.find(group);
+		if (!r.lost.contains(group) && (found == r.groups.end() || found->second != records)) { return false; }
+	}
+	return true;
+}
 j::TurnRecord record(std::uint64_t group, std::uint64_t sequence, std::size_t size, j::TurnRecordKind kind = j::TurnRecordKind::Batch) {
 	std::string payload(size, '\0');
 	for (std::size_t i = 0; i < size; ++i) { payload[i] = static_cast<char>('a' + (group * 7 + sequence * 3 + i) % 26); }
@@ -122,11 +141,11 @@ void torn_tail() {
 		std::ifstream file(directory.segment(segment), std::ios::binary); std::string bytes(size, '\0'); file.read(bytes.data(), static_cast<std::streamsize>(size));
 		written = bytes.find_last_not_of('\0') + 1;
 	}
-	const auto sector = (written - 1) / j::framing::sector_bytes * j::framing::sector_bytes;
-	directory.zero(segment, sector, written - sector);
+	const auto lost = (written - 1) / sector * sector;
+	directory.zero(segment, lost, written - lost);
 	j::TurnLog log(io, identity, recovered, small);
 	check(recovered.last_turn == before && !recovered.groups.contains(9) && !recovered.damaged && recovered.groups == model, "a torn last turn is dropped whole");
-	check(start < sector, "the torn turn spans more than the lost sector");
+	check(file_at(start) < lost, "the torn turn spans more than the lost sector");
 }
 
 void torn_turn_in_earlier_epoch() {
@@ -160,13 +179,13 @@ void damage() {
 	{
 		j::TurnLog log(io, identity, recovered, small);
 		log.append(std::vector{record(4, 1, 20)});                   // intact, but nothing later
-		log.append(std::vector{record(6, 1, 700)});                  // ends in the damaged block
+		log.append(std::vector{record(6, 1, 760)});                  // ends in the damaged block
 		at = log.position();
 		log.append(std::vector{record(1, 1, 300), record(2, 1, 300)});  // damaged below
 		log.append(std::vector{record(3, 1, 300)});
 		log.append(std::vector{record(1, 2, 300)});
 	}
-	directory.flip(1, at + 10);  // inside turn 2's first fragment header
+	directory.flip(1, file_at(at + 10));  // inside turn 2's first fragment header
 	j::TurnLog log(io, identity, recovered, small);
 	check(recovered.damaged && recovered.lost.contains(1), "the groups with records in the damaged block are lost");
 	check(recovered.lost.contains(2) || recovered.groups[2] == std::vector{record(2, 1, 300)}, "a record of the damaged turn that reads back whole is kept");
@@ -187,14 +206,14 @@ void double_damage() {
 		for (std::uint64_t g = 1; g <= 6; ++g) { first.push_back(record(g, 1, 2, j::TurnRecordKind::Checkpoint)); }
 		log.append(first);
 		log.append(std::vector{record(1, 2, 3000)});  // ends in `block`, which later turns share
-		block = log.position() / options.block_bytes;
-		for (std::uint64_t s = 2; s < 6; ++s) { log.append(std::vector{record(6, s, 6)}); }
+		block = log.position() / block_data(options.block_bytes);
+		for (std::uint64_t s = 2; s < 10; ++s) { log.append(std::vector{record(6, s, 6)}); }
 		end = log.position();
 		for (auto& r : first) { model[r.group].push_back(r); }
 		model[1].push_back(record(1, 2, 3000));
-		for (std::uint64_t s = 2; s < 6; ++s) { model[6].push_back(record(6, s, 6)); }
+		for (std::uint64_t s = 2; s < 10; ++s) { model[6].push_back(record(6, s, 6)); }
 	}
-	check(end / options.block_bytes == block + 1, "the last turns end in the block after the damaged one");
+	check(end / block_data(options.block_bytes) == block + 1, "the last turns end in the block after the damaged one");
 	directory.flip(1, block * options.block_bytes + 512);  // the 3000-byte record's last fragment
 	directory.flip(1, (block + 1) * options.block_bytes + 10);  // the next header's identity
 	j::TurnLog log(io, identity, recovered, options);
@@ -214,7 +233,7 @@ void damaged_header_last_turn() {
 		log.append(std::vector{record(1, 2, 50), record(2, 2, 900)});  // group 1's whole in block 0, group 2's to block 2
 		end = log.position();
 	}
-	check(end > 2 * small.block_bytes, "the last turn crosses block 1");
+	check(end > 2 * block_data(small.block_bytes), "the last turn crosses block 1");
 	directory.flip(1, small.block_bytes + 10);  // block 1's header
 	j::TurnLog log(io, identity, recovered, small);
 	check(recovered.damaged, "a damaged header inside the last turn is reported");
@@ -231,65 +250,28 @@ void double_damage_copy() {
 		log.append(std::vector{record(9, 1, 100)});  // copied forward once its segment is the oldest
 		auto checkpoint = [&](std::size_t size) { ++s; log.append(std::vector{record(1, s, size, j::TurnRecordKind::Checkpoint)}); };
 		while (log.segment() == 1) { checkpoint(300); }
-		while (log.position() % small.block_bytes < 80 || log.position() % small.block_bytes > 300) { checkpoint(10); }
+		while (log.position() % block_data(small.block_bytes) < 80 || log.position() % block_data(small.block_bytes) > 300) { checkpoint(10); }
 		segment = log.segment(); at = log.position();
 		log.append(std::vector{record(9, 2, 100)});  // lost to the damage below
 		while (*log.data_segments().begin() != segment) { checkpoint(300); }
 		check(log.stats().forwarded_records == 1, "only the group's first record moved forward");
 	}
-	check(at / small.block_bytes + 1 < small.segment_bytes / small.block_bytes, "the next block is in the segment");
-	directory.flip(segment, at + 30);  // the second record's fragment
-	directory.flip(segment, (at / small.block_bytes + 1) * small.block_bytes + 10);  // the next header's identity
+	check(at / block_data(small.block_bytes) + 1 < small.segment_bytes / small.block_bytes, "the next block is in the segment");
+	directory.flip(segment, file_at(at + 30));  // the second record's fragment
+	directory.flip(segment, (at / block_data(small.block_bytes) + 1) * small.block_bytes + 10);  // the next header's identity
 	j::TurnLog log(io, identity, recovered, small);
 	check(recovered.damaged, "the double damage is reported");
 	check(recovered.lost.contains(9) || recovered.groups[9] == std::vector{record(9, 1, 100), record(9, 2, 100)}, "a forwarded copy does not show a group kept its records");
 }
 
-// A turn's fragments in a segment file: where each starts and ends, whether it ends its write,
-// whether its header crosses its sector, whether a header of its write starts before it in its
-// sector, and where the next fragment of its block starts.
-struct Piece { std::uint64_t start, end; bool ends, cut, written; std::optional<std::uint64_t> next; };
-std::vector<Piece> pieces(const std::string& bytes, std::uint64_t segment, std::uint32_t block_bytes) {
-	namespace f = j::framing; namespace d = j::turn_log_detail;
-	std::vector<Piece> out; std::uint8_t kind = 0;
-	for (std::uint64_t b = 0; (b + 1) * block_bytes <= bytes.size(); ++b) {
-		const auto block = std::string_view(bytes).substr(b * block_bytes, block_bytes);
-		const auto header = f::parse_header(block, d::stream(identity, block_bytes, segment, 0), b);
-		if (header.check != f::Check::ok) { continue; }
-		const auto start = b * block_bytes; std::optional<std::size_t> in_write = 0; std::vector<Piece> here;
-		for (std::size_t p = header.size; block_bytes - p >= f::fragment_header + 1;) {
-			const auto fragment = f::parse_fragment(block.substr(p), block_bytes - p, segment, header.epoch);
-			if (fragment.check != f::Check::ok) { break; }
-			if (fragment.type == f::Full || fragment.type == f::First) { kind = static_cast<std::uint8_t>(fragment.payload[0]); }
-			const bool ends = (fragment.type == f::Full || fragment.type == f::Last) && (kind == d::end_of_turn || kind == d::open_record);
-			const std::uint64_t sector = (start + p) / f::sector_bytes, end = p + f::fragment_header + fragment.payload.size();
-			here.push_back({start + p, start + end, ends, (start + p + f::fragment_header - 1) / f::sector_bytes != sector, in_write && (start + *in_write) / f::sector_bytes == sector, std::nullopt});
-			in_write = ends ? std::nullopt : std::optional{p}; p = end;
-		}
-		for (std::size_t i = 0; i + 1 < here.size(); ++i) { here[i].next = here[i + 1].start; }
-		out.insert(out.end(), here.begin(), here.end());
-	}
-	return out;
-}
-// Which condition of rule 2 (docs/mechanisms/turn-log-damage.md) a byte in sector `s` of `piece`,
-// a later sector than its first, leaves unproven; "proven" when none does.
-std::string shape(const Piece& piece, std::uint64_t s) {
-	const auto sector = j::framing::sector_bytes;
-	if ((piece.end - 1) / sector - piece.start / sector > 1) { return "U3"; }
-	if (!piece.next || *piece.next / sector != s) { return "U4"; }
-	if ((*piece.next + j::framing::fragment_header - 1) / sector != s) { return "U2"; }
-	if (piece.cut && !piece.written) { return "U1"; }
-	return "proven";
-}
-// Damage to an acknowledged turn before the newest, in the newest segment: a byte in each later
-// sector of each fragment that crosses a sector. A later write that reached the disk began after
-// the damaged turn's barrier, whether it starts in the damaged block or a later one, so recovery
-// reports the damage, and a group it keeps holds every acknowledged record. The workload and
-// seeds are the cut-header probe's, whose layout left these silent (journal-earlier-turn-loss).
-void earlier_turn_damage(std::uint32_t block_bytes, std::uint64_t seed, std::map<std::string, unsigned>& shapes) {
-	Directory directory("earlier-turn"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
+// Damage to an acknowledged turn before the newest, in the newest segment, on the cut-header
+// probe's workload: a byte in each sector written before the newest write's. Recovery reports it,
+// and a group it keeps holds every acknowledged record.
+void earlier_turn_damage(std::uint32_t block_bytes, std::uint64_t seed) {
+	fl::filesystem disk; fl::io io(disk);
 	const j::TurnLogOptions options{8 * std::uint64_t{block_bytes}, block_bytes, 1, 3, 600};
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(seed);
+	std::uint64_t newest = 0, limit = 0;
 	{
 		j::TurnLog log(io, identity, recovered, options);
 		for (unsigned t = 0; t < 60; ++t) {
@@ -300,63 +282,32 @@ void earlier_turn_damage(std::uint32_t block_bytes, std::uint64_t seed, std::map
 				const std::size_t size = random() % 700 + 1;
 				batch.push_back(record(group, ++sequence, size, random() % 5 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint));
 			}
+			const auto segment = log.segment(), position = log.position();
 			log.append(batch); log.prepare();
 			for (const auto& r : batch) { if (r.kind == j::TurnRecordKind::Checkpoint) { model[r.group].clear(); } model[r.group].push_back(r); }
+			newest = log.segment(); limit = segment == newest ? file_at(position) / sector * sector : 0;  // the sectors before the newest write's
 		}
 	}
 	j::TurnLogGroups known; for (const auto& [group, _] : model) { known.open.push_back(group); }
-	std::uint64_t newest = 0; std::string bytes; std::vector<Piece> list;
-	for (const auto& entry : std::filesystem::directory_iterator(directory.path)) {
-		const auto number = j::turn_log_detail::segment_number(entry.path().filename().string());
-		if (!number || *number < newest) { continue; }
-		std::ifstream file(entry.path(), std::ios::binary); std::string content(std::filesystem::file_size(entry.path()), '\0');
-		file.read(content.data(), static_cast<std::streamsize>(content.size()));
-		if (auto found = pieces(content, *number, block_bytes); !found.empty()) { newest = *number; bytes = std::move(content); list = std::move(found); }
-	}
-	// The newest write starts after the second-to-last write end.
-	std::uint64_t newest_write = 0; int ends = 0;
-	for (auto it = list.rbegin(); it != list.rend(); ++it) { if (it->ends && ++ends == 2) { newest_write = it->end; break; } }
-	const auto sector = j::framing::sector_bytes;
-	for (const auto& piece : list) {
-		if (piece.start >= newest_write) { break; }
-		// Whether a later write starts in a later block: else every later write shares this block.
-		bool later_block = false, after_end = false;
-		for (const auto& other : list) {
-			if (other.start <= piece.start) { continue; }
-			if (after_end && other.start / block_bytes > piece.start / block_bytes) { later_block = true; break; }
-			after_end = after_end || other.ends;
-		}
-		for (auto s = piece.start / sector + 1; s <= (piece.end - 1) / sector; ++s) {
-			const auto from = s * sector, to = std::min<std::uint64_t>(piece.end, (s + 1) * sector);
-			for (const auto offset : {from + (to - from) / 2, to - 1}) {
-				++shapes[(later_block ? "later block, " : "same block, ") + shape(piece, s)];
-				directory.flip(newest, offset);
-				const auto r = j::TurnLog::read(io, identity, options, known);
-				directory.flip(newest, offset);
-				bool kept = true;
-				for (const auto& [group, records] : model) {
-					const auto found = r.groups.find(group);
-					if (!r.lost.contains(group) && (found == r.groups.end() || found->second != records)) { kept = false; }
-				}
-				if (!r.damaged || !kept) {
-					std::cerr << "  block_bytes " << block_bytes << " seed " << seed << " segment " << newest << " offset " << offset << " (" << shape(piece, s) << (later_block ? ", later block" : ", same block") << ")\n";
-				}
-				check(r.damaged, "damage to an earlier turn is reported");
-				check(kept, "a group recovery keeps holds every acknowledged record");
+	const auto name = j::turn_log_detail::segment_name(newest);
+	for (std::uint64_t from = 0; from < limit; from += sector) {
+		for (const auto offset : {from + sector / 2, from + sector - 1}) {
+			auto damaged = disk.snapshot(); fl::io damaged_io(damaged);
+			{
+				auto file = damaged_io.open_existing(name); char byte = 0; file->read_at(offset, std::span<char>(&byte, 1));
+				byte = static_cast<char>(byte ^ 0x5a); file->write_at(offset, std::string_view(&byte, 1)); file->sync();
 			}
+			const auto r = j::TurnLog::read(damaged_io, identity, options, known);
+			if (!r.damaged || !kept(r, model)) { std::cerr << "  block_bytes " << block_bytes << " seed " << seed << " segment " << newest << " offset " << offset << '\n'; }
+			check(r.damaged, "damage to an earlier turn is reported");
+			check(kept(r, model), "a group recovery keeps holds every acknowledged record");
 		}
 	}
-	check(!bytes.empty() && !list.empty(), "the newest segment holds turns");
+	check(limit > 0, "the newest segment holds turns before the newest");
 }
-void earlier_turn_damage() {
-	std::map<std::string, unsigned> shapes;
-	earlier_turn_damage(4096, 4, shapes); earlier_turn_damage(4096, 6, shapes); earlier_turn_damage(2048, 22, shapes);
-	check(shapes["same block, U1"] && shapes["same block, U2"] && shapes["same block, U3"], "the unproven shapes with later writes only in their block occur");
-	check(shapes["later block, U3"] + shapes["later block, U4"] + shapes["later block, proven"] > 0, "damage before a later block's write occurs");
-}
-// A block header larger than its first sector (a manifest of 28 or more groups) leaves no fragment
-// header whole there, so damage to it reads as a tear by its sector alone. The turns later in its
-// block prove the turn that wrote it durable: recovery reports the damage.
+void earlier_turn_damage() { earlier_turn_damage(4096, 4); earlier_turn_damage(4096, 6); earlier_turn_damage(2048, 22); }
+// A block header larger than its first sector (a manifest of 28 or more groups): damage to it is
+// reported, and the turns later in its block are kept or their groups lost.
 void large_header_damage() {
 	Directory directory("large-header"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
 	const j::TurnLogOptions options{32 * 2048, 2048, 1};
@@ -364,27 +315,25 @@ void large_header_damage() {
 	{
 		j::TurnLog log(io, identity, recovered, options);
 		std::vector<j::TurnRecord> first;
-		for (std::uint64_t g = 1; g <= 40; ++g) { first.push_back(record(g, 1, 1, j::TurnRecordKind::Checkpoint)); }
+		for (std::uint64_t g = 1; g <= 40; ++g) { first.push_back(record(g, 1, 20, j::TurnRecordKind::Checkpoint)); }
 		log.append(first);  // block 0's groups: block 1's header names them
 		log.append(std::vector{record(41, 1, 20)}); log.append(std::vector{record(41, 2, 20)});
-		check(log.position() / options.block_bytes == 1, "the later turns share block 1");
+		check(log.position() / block_data(options.block_bytes) == 1, "the later turns share block 1");
 		for (const auto& r : first) { model[r.group].push_back(r); }
 		model[41] = {record(41, 1, 20), record(41, 2, 20)};
 	}
 	std::string header(64, '\0');
 	{ std::ifstream file(directory.segment(1), std::ios::binary); file.seekg(options.block_bytes); file.read(header.data(), 64); }
-	const auto size = j::framing::header_bytes(j::framing::get16(std::string_view(header).substr(56)));
-	check(size > j::framing::sector_bytes + 100, "block 1's header crosses its first sector");
-	directory.flip(1, options.block_bytes + j::framing::sector_bytes + 50);  // a manifest entry in its second sector
+	const auto size = 58 + 16 * std::size_t{j::framing::get16(std::string_view(header).substr(56))};
+	check(size > sector + 100, "block 1's header crosses its first sector");
+	directory.flip(1, options.block_bytes + sector + 50);  // a manifest entry in its second sector
 	j::TurnLogGroups known; for (const auto& [group, _] : model) { known.open.push_back(group); }
 	const auto r = j::TurnLog::read(io, identity, options, known);
 	check(r.damaged, "damage to a header before later turns of its block is reported");
-	bool kept = true;
-	for (const auto& [group, records] : model) { const auto found = r.groups.find(group); if (!r.lost.contains(group) && (found == r.groups.end() || found->second != records)) { kept = false; } }
-	check(kept, "a group recovery keeps holds every acknowledged record");
+	check(kept(r, model), "a group recovery keeps holds every acknowledged record");
 }
-// The same header written by a torn newest turn, its second sector left old: the turn's bytes in
-// the next sector are its own, so they prove nothing, and the turn is dropped as a tear.
+// The same header written by a torn newest turn, its second sector left old: the turn is dropped
+// as a tear.
 void large_header_tear() {
 	Directory directory("large-header-tear"); j::PosixIO io(directory.path); auto owner = io.acquire_owner(true);
 	const j::TurnLogOptions options{32 * 2048, 2048, 1};
@@ -393,10 +342,10 @@ void large_header_tear() {
 		j::TurnLog log(io, identity, recovered, options);
 		log.append(std::vector{record(50, 1, 10)}); model[50] = {record(50, 1, 10)};
 		std::vector<j::TurnRecord> torn;
-		for (std::uint64_t g = 1; g <= 40; ++g) { torn.push_back(record(g, 1, 1, j::TurnRecordKind::Checkpoint)); }
+		for (std::uint64_t g = 1; g <= 40; ++g) { torn.push_back(record(g, 1, 20, j::TurnRecordKind::Checkpoint)); }
 		torn.push_back(record(41, 1, 600));  // from block 1's second sector into its third
 		auto write = log.stage(torn);
-		const auto old_from = options.block_bytes + j::framing::sector_bytes, old_to = old_from + j::framing::sector_bytes;
+		const auto old_from = options.block_bytes + sector, old_to = old_from + sector;
 		check(write.offset < old_from && write.offset + write.bytes.size() > old_to + 100, "the torn turn spans block 1's second sector and more");
 		const auto bytes = std::string_view(write.bytes);
 		check(write.file->write_at(write.offset, bytes.substr(0, old_from - write.offset)) == old_from - write.offset, "the sectors before the old one are written");
@@ -405,6 +354,170 @@ void large_header_tear() {
 	}
 	const auto r = j::TurnLog::read(io, identity, options);
 	check(!r.damaged && r.lost.empty() && r.groups == model, "a torn turn whose own later bytes survive reads as a tear");
+}
+
+// A log's segment files, by name, on a memory disk.
+using Files = std::map<std::string, std::string>;
+Files files(j::IO& io) {
+	Files result; auto cursor = io.scan_directory();
+	while (auto name = cursor->next()) {
+		if (!d::segment_number(*name)) { continue; }
+		auto file = io.open_existing(*name); std::string bytes(file->size(), '\0'); file->read_at(0, bytes); result[*name] = std::move(bytes);
+	}
+	return result;
+}
+void put(j::IO& io, const std::string& name, std::uint64_t offset, std::string_view bytes) { auto file = io.open_existing(name); file->write_at(offset, bytes); file->sync(); }
+void acknowledge(Model& model, const std::vector<j::TurnRecord>& batch) {
+	for (const auto& r : batch) { if (r.kind == j::TurnRecordKind::Checkpoint) { model[r.group].clear(); } model[r.group].push_back(r); }
+}
+// The cut-header probe's turn: one to three of six groups, records up to 700 bytes, one in five a checkpoint.
+std::vector<j::TurnRecord> probe_turn(const j::TurnLog& log, std::mt19937_64& random) {
+	std::vector<j::TurnRecord> batch; std::map<std::uint64_t, std::uint64_t> next;
+	for (auto n = random() % 3 + 1; n; --n) {
+		const auto group = random() % 6 + 1;
+		auto& sequence = next.try_emplace(group, log.sequence(group)).first->second;
+		const std::size_t size = random() % 700 + 1;
+		batch.push_back(record(group, ++sequence, size, random() % 5 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint));
+	}
+	return batch;
+}
+// The newest turn W of a log opened three times (the cut-header probe's newest tail): a byte flipped
+// at three places in each sector W changed is reported, or recovery keeps every acknowledged record,
+// W's included; never silent. Every set of W's changed sectors left as they were reads as a tear.
+// Without sector checks, damage in a fragment that crosses a sector drops W silently.
+void newest_turn_damage(std::uint32_t block_bytes, std::uint64_t seed, std::map<std::string, unsigned>& tally) {
+	const j::TurnLogOptions options{8 * std::uint64_t{block_bytes}, block_bytes, 1, 3, 600};
+	const auto at = "seed " + std::to_string(seed) + " block_bytes " + std::to_string(block_bytes);
+	fl::filesystem disk; fl::io io(disk); Model acknowledged, with; std::mt19937_64 random(seed);
+	Files before, after; std::optional<fl::filesystem> pre;
+	for (int open = 0; open < 3; ++open) {
+		j::TurnRecovery recovered; j::TurnLog log(io, identity, recovered, options);
+		check(!recovered.damaged && recovered.groups == acknowledged, "a reopened log holds what was acknowledged: " + at);
+		for (unsigned n = open < 2 ? 20 : static_cast<unsigned>(seed % 4) * 7; n; --n) { auto b = probe_turn(log, random); log.append(b); acknowledge(acknowledged, b); log.prepare(); }
+		if (open < 2) { continue; }
+		before = files(io); pre.emplace(disk.snapshot());
+		auto w = probe_turn(log, random); log.append(w);
+		after = files(io); with = acknowledged; acknowledge(with, w);
+	}
+	std::vector<std::pair<std::string, std::uint64_t>> changed;
+	for (const auto& [name, bytes] : after) {
+		const auto found = before.find(name);
+		for (std::uint64_t s = 0; s * sector < bytes.size(); ++s) {
+			if (found == before.end() || found->second.compare(s * sector, sector, bytes, s * sector, sector)) { changed.push_back({name, s}); }
+		}
+	}
+	if (changed.empty() || !before.contains(changed.back().first)) { ++tally["runs where W opens a segment"]; return; }  // no old sectors to leave
+	j::TurnLogGroups known; for (const auto& [group, _] : with) { known.open.push_back(group); }
+	for (const auto& [name, s] : changed) {
+		for (int n = 0; n < 3; ++n) {
+			auto damaged = disk.snapshot(); fl::io damaged_io(damaged);
+			const auto offset = s * sector + random() % sector;
+			const char byte = static_cast<char>(after.at(name)[offset] ^ 0x5a); put(damaged_io, name, offset, std::string_view(&byte, 1));
+			const auto r = j::TurnLog::read(damaged_io, identity, options, known);
+			const bool reported = r.damaged && kept(r, with), harmless = !r.damaged && r.groups == with && r.lost.empty();
+			++tally[reported ? "damage reported" : harmless ? "damage harmless" : r.damaged ? "damage reported, a group wrong" : "damage SILENT"];
+			check(reported || harmless, "damage to the newest turn is reported, never silent: " + at + " " + name + " offset " + std::to_string(offset));
+		}
+	}
+	const auto k = changed.size();
+	std::vector<std::uint64_t> masks;
+	if (k <= 5) { for (std::uint64_t m = 0; m + 1 < (std::uint64_t{1} << k); ++m) { masks.push_back(m); } }
+	else { for (int i = 0; i < 32; ++i) { masks.push_back(random() & ((k >= 64 ? ~0ull : (1ull << k) - 1) & ~(1ull << (random() % k)))); } }
+	for (const auto mask : masks) {  // the sectors in the mask reach the disk; the others stay as before W
+		auto torn = pre->snapshot(); fl::io torn_io(torn);
+		for (std::size_t i = 0; i < k; ++i) {
+			const auto& [name, s] = changed[i];
+			if (mask >> i & 1) { put(torn_io, name, s * sector, std::string_view(after.at(name)).substr(s * sector, sector)); }
+		}
+		const auto r = j::TurnLog::read(torn_io, identity, options);
+		const bool tear = !r.damaged && r.lost.empty() && (r.groups == acknowledged || r.groups == with);
+		++tally[tear ? "tears read as tears" : "tears read as damage or loss"];
+		check(tear, "a tear of the newest turn reads as a tear: " + at + " mask " + std::to_string(mask) + " of " + std::to_string(k));
+	}
+}
+void newest_turn_damage() {
+	std::map<std::string, unsigned> tally;
+	for (std::uint32_t block : {2048u, 4096u}) { for (std::uint64_t seed = 1; seed <= 24; ++seed) { newest_turn_damage(block, seed, tally); } }
+	for (const auto& [what, count] : tally) { std::cout << "newest turn: " << what << ": " << count << '\n'; }
+	check(tally["damage reported"] > 100 && tally["tears read as tears"] > 100, "the newest turn's damage and tears occur");
+}
+
+// D4's sector verdicts, each recovered by value. The newest turn W spans sectors past the one it
+// shares with the turn before: each of W's sectors left as before W (zeros), as all zeros, as a
+// recycled file's stale sector, or damaged.
+void sector_verdicts() {
+	const j::TurnLogOptions options{8 * 2048, 2048, 1, 3, 600};
+	fl::filesystem disk; fl::io io(disk); Model acknowledged, with; Files before, after; std::optional<fl::filesystem> pre;
+	std::uint64_t segment = 0, kept_turn = 0, w_turn = 0, first = 0, last = 0;
+	{
+		j::TurnRecovery recovered; j::TurnLog log(io, identity, recovered, options);
+		while (log.segment() == 1 || log.position() < 900) { auto b = std::vector{record(1, log.sequence(1) + 1, 300)}; log.append(b); acknowledge(acknowledged, b); }
+		segment = log.segment(); kept_turn = log.last_turn(); before = files(io); pre.emplace(disk.snapshot());
+		const auto w = std::vector{record(2, 1, 1400), record(3, 1, 20)};
+		const auto start = file_at(log.position());
+		w_turn = log.append(w); after = files(io); with = acknowledged; acknowledge(with, w);
+		first = start / sector; last = (file_at(log.position()) - 1) / sector;
+	}
+	const auto name = d::segment_name(segment);
+	check(last >= first + 3, "W spans four sectors or more");
+	// W's sectors on the disk as it was before W, then `change`: what a crash may leave, before the
+	// barrier lets the log reclaim anything.
+	// The host holds every group open: damage loses those recovery holds nothing of.
+	j::TurnLogGroups known; for (const auto& [group, _] : with) { known.open.push_back(group); }
+	auto read = [&](const std::function<void(j::IO&)>& change) {
+		auto copy = pre->snapshot(); fl::io copy_io(copy);
+		for (auto s = first; s <= last; ++s) { put(copy_io, name, s * sector, std::string_view(after.at(name)).substr(s * sector, sector)); }
+		change(copy_io);
+		return j::TurnLog::read(copy_io, identity, options, known);
+	};
+	auto tear = [&](const j::TurnRecovery& r) { return !r.damaged && r.lost.empty() && r.groups == acknowledged && r.last_turn == kept_turn; };
+	auto old = [&](std::uint64_t s) { return std::string_view(before.at(name)).substr(s * sector, sector); };
+	const auto current = read([](j::IO&) {});
+	check(!current.damaged && current.lost.empty() && current.groups == with && current.last_turn == w_turn, "current: every sector this segment wrote reads, W included");
+	check(tear(read([&](j::IO& io) { put(io, name, first * sector, old(first)); })), "torn: W's first sector, rewritten from the turn before's data, left old");
+	check(tear(read([&](j::IO& io) { put(io, name, (first + 2) * sector, old(first + 2)); })), "torn: a later sector of W left unwritten");
+	check(tear(read([&](j::IO& io) { put(io, name, last * sector, std::string(sector, '\0')); })), "all-zero: W's last sector reads as never written, not as damage");
+	// A recycled file holds the sectors of its earlier use: segment 1's sector at the same index.
+	const auto stale = std::string_view(after.at(d::segment_name(1))).substr((first + 1) * sector, sector);
+	check(stale.find_first_not_of('\0') != std::string_view::npos, "segment 1 wrote the sector at that index");
+	check(tear(read([&](j::IO& io) { put(io, name, (first + 1) * sector, stale); })), "stale: a recycled file's sector of an earlier segment ends the data");
+	for (const auto s : {first, first + 1, last}) {
+		for (const auto offset : {std::uint64_t{0}, std::uint64_t{300}, std::uint64_t{sector - 1}}) {
+			const auto at = s * sector + offset;
+			const char byte = static_cast<char>(after.at(name)[at] ^ 0x5a);
+			const auto r = read([&](j::IO& io) { put(io, name, at, std::string_view(&byte, 1)); });
+			check(r.damaged && r.lost.contains(2) && kept(r, with), "damaged: a flipped byte in W's sector " + std::to_string(s - first) + " at " + std::to_string(offset) + " is reported, W's groups lost");
+		}
+	}
+}
+// A3 of the format (D2): a recycled file of segment S that is not zeroed holds, at the index of
+// one of W's later sectors, the sector segment S - 2^32 wrote there, its data the same as W's. Its
+// stored low 32 bits are S's; only the full 64 bits in its CRC make it stale, so W reads as torn.
+void stale_alias() {
+	if (!sectors) { return; }  // positions bind no sector without sector checks
+	const j::TurnLogOptions options{8 * 2048, 2048, 1, 3, 600};
+	const std::uint64_t low = 5, high = low + (std::uint64_t{1} << 32);
+	struct Log { fl::filesystem disk; Files files; std::uint64_t first = 0, last = 0, turn = 0; };
+	auto write = [&](std::uint64_t segment) {
+		Log out; fl::io io(out.disk);
+		io.create_exclusive(d::segment_name(segment - 1)); io.sync_directory();  // the log opens `segment` next
+		j::TurnRecovery recovered; j::TurnLog log(io, identity, recovered, options);
+		check(log.segment() == segment, "the log writes the segment asked");
+		log.append(std::vector{record(1, 1, 300)});
+		const auto start = file_at(log.position());
+		out.turn = log.append(std::vector{record(2, 1, 1400)});
+		out.first = start / sector; out.last = (file_at(log.position()) - 1) / sector; out.files = files(io);
+		return out;
+	};
+	auto older = write(low), newer = write(high);
+	const std::uint64_t next = newer.first + 1, s = next % 4 ? next : next + 1;  // a later sector of W that holds no block header
+	const auto name = d::segment_name(high);
+	const auto alias = std::string_view(older.files.at(d::segment_name(low))).substr(s * sector, sector);
+	const auto own = std::string_view(newer.files.at(name)).substr(s * sector, sector);
+	check(s < newer.last && alias.substr(0, 504) == own.substr(0, 504) && alias.substr(504, 4) == own.substr(504, 4), "the stale sector holds W's data and S's low 32 bits");
+	fl::io io(newer.disk); put(io, name, s * sector, alias);
+	const auto r = j::TurnLog::read(io, identity, options);
+	check(!r.damaged && r.lost.empty() && r.last_turn == newer.turn - 1 && !r.groups.contains(2) && r.groups.at(1) == std::vector{record(1, 1, 300)}, "a sector of segment S - 2^32 reads as stale, never as current: W is torn");
 }
 
 void checkpoints_and_guards() {
@@ -500,11 +613,98 @@ void staged_turns() {
 	j::TurnLog log(io, identity, recovered, small);
 	check(recovered.groups[1] == std::vector{record(1, 1, 100)}, "the completed turn recovers; the failed one does not");
 }
+// Reads while a turn's write is in flight (Host::park mid-turn, a Store's live()): the write is part
+// way through the sector it shares with the turn before, half its new bytes copied, and every
+// group still reads back its acknowledged records.
+void midwrite_reads() {
+	const std::uint64_t unit = sectors ? 504 : 512;
+	unsigned cases = 0;
+	for (std::uint32_t block : {2048u, 32768u}) {
+		for (std::uint64_t seed = 1; seed <= 4; ++seed) {
+			fl::filesystem disk; fl::io io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed); Model model;
+			j::TurnLog log(io, identity, recovered, {8 * std::uint64_t{block}, block, 1, 3, 600});
+			for (unsigned n = 0; n < 100; ++n) {
+				const auto batch = probe_turn(log, random);
+				const auto segment = log.segment(), position = log.position();
+				const auto write = log.stage(batch);
+				std::size_t copied = 0;
+				if (log.segment() == segment && position % unit) {
+					const auto room = unit - position % unit;  // the turn's new data bytes in the shared sector
+					copied = static_cast<std::size_t>((sectors ? position % unit : 0) + std::min<std::uint64_t>(room, write.bytes.size()) / 2);
+					check(write.file->write_at(write.offset, write.bytes.substr(0, copied)) == copied, "the half copy lands");
+					++cases;
+					for (const auto& [group, records] : model) {
+						try { check(log.peek(group) == records, "a read mid-write returns the acknowledged records"); }
+						catch (const std::exception& error) { check(false, std::string("a read mid-write throws: ") + error.what()); }
+					}
+				}
+				check(write.file->write_at(write.offset + copied, write.bytes.substr(copied)) == write.bytes.size() - copied, "the rest lands");
+				write.file->sync_data(); log.completed(); acknowledge(model, batch);
+				for (const auto& [group, records] : model) { check(log.peek(group) == records, "after the barrier every group reads back"); }
+				log.prepare();
+			}
+		}
+	}
+	check(cases > 500, "most turns rewrite a shared sector: " + std::to_string(cases));
+}
 }  // namespace
 
-int main() {
-	try { round_trip(); torn_tail(); torn_turn_in_earlier_epoch(); damage(); double_damage(); damaged_header_last_turn(); double_damage_copy(); earlier_turn_damage(); large_header_damage(); large_header_tear(); checkpoints_and_guards(); stale_bytes(); staged_turns(); for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }
-	catch (const std::exception& error) { check(false, error.what()); }
+// The bytes each turn takes in the log, on the cut-header design's workloads: the data position's
+// advance in file bytes (per sector, 512 for each 504 under RFTW0002), the bytes the log wrote, the
+// 512-byte sectors and 4 KiB pages that write touches (what a device and the page cache write back),
+// and the payload. Not a check: `cost` prints them, at any format, for the A4 comparison.
+void cost() {
+	struct Load { const char* name; std::uint32_t block; std::size_t bytes; };
+	for (const auto& load : {Load{"T9 workload", 2048, 0}, Load{"T9 workload", 4096, 0}, Load{"T9 workload", 32768, 0}, Load{"turn_bench 16 groups 50% 256 B", 32768, 256}, Load{"turn_bench 16 groups 50% 4096 B", 32768, 4096}}) {
+		const j::TurnLogOptions options{std::uint64_t{16} << 20, load.block, 1, 3, 600};
+		double advance = 0, written = 0, sectors_touched = 0, pages_touched = 0, payload = 0, turns = 0;
+		auto touched = [](std::uint64_t offset, std::size_t size, std::uint64_t unit) { return static_cast<double>(((offset + size + unit - 1) / unit - offset / unit) * unit); };
+		for (std::uint64_t seed = 1; seed <= 8; ++seed) {
+			fl::filesystem disk; fl::io io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed);
+			j::TurnLog log(io, identity, recovered, options);
+			for (unsigned turn = 0; turn < 400; ++turn) {
+				std::vector<j::TurnRecord> batch;
+				if (!load.bytes) { batch = probe_turn(log, random); }
+				else {
+					for (std::uint64_t g = 1; g <= 16; ++g) {
+						if (random() % 100 >= 50) { continue; }
+						const auto sequence = log.sequence(g) + 1;
+						batch.push_back({g, sequence, sequence % 64 ? j::TurnRecordKind::Batch : j::TurnRecordKind::Checkpoint, std::string(load.bytes, 'x'), sequence - 1});
+					}
+					if (batch.empty()) { continue; }
+				}
+				const auto segment = log.segment(), position = log.position(), before = log.stats().bytes_written;
+				const auto write = log.stage(batch);
+				check(write.file->write_at(write.offset, write.bytes) == write.bytes.size(), "the host writes the staged bytes");
+				write.file->sync_data(); log.completed();
+				check(log.segment() == segment, "the turns stay in one segment");
+				advance += static_cast<double>(log.position() - position); written += static_cast<double>(log.stats().bytes_written - before);
+				sectors_touched += touched(write.offset, write.bytes.size(), 512); pages_touched += touched(write.offset, write.bytes.size(), 4096);
+				for (const auto& r : batch) { payload += static_cast<double>(r.payload.size()); }
+				++turns;
+			}
+		}
+		const double file = sectors ? advance * 512 / 504 : advance;
+		std::cout << "cost " << load.name << ", block " << load.block << ": per turn " << payload / turns << " payload bytes, " << file / turns << " log bytes, " << written / turns << " written, " << sectors_touched / turns << " in sectors touched, " << pages_touched / turns << " in pages touched\n";
+	}
+}
+
+int main(int argc, char** argv) {
+	const std::string only = argc > 1 ? argv[1] : "";
+	const std::vector<std::pair<std::string, void (*)()>> cases{{"round_trip", round_trip}, {"torn_tail", torn_tail}, {"torn_turn_in_earlier_epoch", torn_turn_in_earlier_epoch},
+		{"damage", damage}, {"double_damage", double_damage}, {"damaged_header_last_turn", damaged_header_last_turn}, {"double_damage_copy", double_damage_copy},
+		{"earlier_turn_damage", earlier_turn_damage}, {"large_header_damage", large_header_damage}, {"large_header_tear", large_header_tear},
+		{"newest_turn_damage", newest_turn_damage}, {"sector_verdicts", sector_verdicts}, {"stale_alias", stale_alias},
+		{"checkpoints_and_guards", checkpoints_and_guards}, {"stale_bytes", stale_bytes}, {"staged_turns", staged_turns}, {"midwrite_reads", midwrite_reads},
+		{"reclamation", [] { for (std::uint64_t seed = 4; seed < 7; ++seed) { reclamation(seed); } }}};
+	bool ran = false;
+	if (only == "cost") { cost(); ran = true; }
+	for (const auto& [name, run] : cases) {
+		if (!only.empty() && name != only) { continue; }
+		ran = true;
+		try { run(); } catch (const std::exception& error) { check(false, name + ": " + error.what()); }
+	}
+	check(ran, "a case named " + only);
 	std::cout << checks << " turn log checks, " << failures << " failures\n";
 	return failures ? 1 : 0;
 }

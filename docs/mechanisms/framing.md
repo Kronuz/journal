@@ -4,9 +4,10 @@
 
 # Block framing and the growing-log tail rule
 
-One framing serves both durable logs: the turn log (`RFTW0001`, 32 KiB blocks, block manifests,
-preallocated segments) and strata's manifest log (`STRLOG01`, 512-byte blocks, no manifests, a file
-that grows by appends).
+This framing serves strata's manifest log (`STRLOG01`, 512-byte blocks, no manifests, a file that
+grows by appends). The turn log (`RFTW0002`) frames its blocks with sector checks of its own in
+`turn_log.h` ([turn-log-damage.md](turn-log-damage.md)) and shares this header's fragment types,
+manifest type and byte helpers.
 
 ## Bytes
 
@@ -21,20 +22,18 @@ that grows by appends).
   header. The CRC covers everything after itself. A fragment never crosses a block; a block's tail
   shorter than 25 bytes is zero padding that no reader reads.
 - `Emitter` writes records from a stream offset, entering blocks as it reaches them. With manifests
-  it notes each nonzero group's highest sequence for the next block's header (the turn log's use).
-  The turn log wraps its own 25-byte record header (kind, turn, group, sequence) inside the record;
-  the framing never looks inside a record.
+  it notes each nonzero group's highest sequence for the next block's header. The framing never
+  looks inside a record.
 - A record comes in pieces, each copied once, straight into its fragments: one string
-  (`record(logical)`), a head and a body (`record(head, body, ...)`, the turn log's header and
-  payload), or a head and `size` bytes a fill function appends in order (`record(head, size, fill,
-  ...)`, a forward copy read from its original). Each fragment's header is written first, its
-  payload pieces after it, then its CRC over both.
+  (`record(logical)`), a head and a body (`record(head, body, ...)`), or a head and `size` bytes a
+  fill function appends in order (`record(head, size, fill, ...)`, a copy read from its original).
+  Each fragment's header is written first, its payload pieces after it, then its CRC over both.
 - The emitter writes into a buffer its caller hands over and takes back (`Emitter(stream, position,
   filling, buffer)`, `std::move(emitter).bytes()`), so a caller that reuses one buffer frames
   into its capacity. A manifest's groups (`framing::Groups`) are a flat array that appends and
   sorts once when the header is written, reusing its capacity too.
 - `Emitter::measure` lays records out without writing them: positions and manifests, no bytes, no
-  fill called. The turn log asks it whether a turn fits an empty segment.
+  fill called.
 - `record_end(stream, position, size)` says where the emitter would end a record, in constant time,
   for a stream without manifests (a manifest's size depends on the groups written): the header and
   padding of the block it starts in, then whole blocks of `block - 62 - 24` payload bytes, then the
@@ -49,16 +48,13 @@ that grows by appends).
   so a length that leaves its block is bad, not cut. A header must leave its block room for a
   fragment (its size plus 24 below the block size), so the next block's start is always a header's;
   the emitter keeps a manifest within half a block, so honest headers always do.
-- The turn log's `scan_segment` reads whole preallocated blocks with them and keeps its own gap and
-  epoch logic. `RecordReader(file, stream, offset)` reads one record back by offset, in
-  order, into wherever its caller asks (the turn log's forwarding, straight into the turn), and
-  checks what `scan` checks on the way: each block header it enters (`header_shape` and
+- `RecordReader(file, stream, offset)` reads one record back by offset, in order, into wherever its
+  caller asks, and checks what `scan` checks on the way: each block header it enters (`header_shape` and
   `names_block` on its fixed part, epoch the stream's, then its CRC over the manifest read through a
   1 KiB stack buffer, so a read holds no heap) and each fragment against the
   stream's segment and epoch and, as its last byte is read, its CRC. A record of another segment or
   epoch, bytes changed since the scan, or a record shorter than read, are `Corruption`.
-  `read_record` reads a whole record into a string through it. The turn log keeps each live
-  record's epoch to rebuild its stream.
+  `read_record` reads a whole record into a string through it.
 - `read_file` reads a growing file whole, its partial last block included. `scan` reads it from the
   start and returns the whole records, each with its first fragment's offset and its end, and how
   the log ends.
@@ -98,19 +94,15 @@ whole, and drops a torn tail.
   for byte; 1,020 honest crash images, 672 torn, none misread; 219,672 single-bit flips, none silent,
   584 in padding; 7,504 two-fault images, none silent; two appends in flight, 33 of 76 images damage;
   a short write left in place, 21,846 of 21,962 sizes damage. Then one case per row of the rule.
-- `test/crc_fixture_test.cc` checks that the turn log still writes its `RFTW0001` fixture byte for byte.
-- `test/turn_buffers_test.cc` (`bytes`, `turns`) checks the in-place pieces against main's
-  one-string emitter: bytes, offsets and manifests for every record kind, size class and start
-  position, and a log's turns across segment rollovers (docs/mechanisms/turn-seal.md, "The turn's
-  buffers").
 - `fuzz/fuzz_framing.cc` (libFuzzer, `JOURNAL_FUZZ=ON`) and its replay test check the reader's
   claims on arbitrary bytes.
 
 ## Design vs code
 
 - The design names the component "the emitter, the scanner, the growing-file read and D6's tail
-  classifier". The turn log's whole-block scanner (`scan_segment`) stays in `turn_log.h`: its gaps,
-  epochs and block manifests are the turn log's recovery model; it shares the header and fragment
-  checks.
+  classifier". The turn log's sector framing, whole-block scanner (`scan_segment`) and record
+  reader live in `turn_log.h`: its sector verdicts, gaps, epochs and block manifests are the turn
+  log's recovery model. The cut-header design's D5 puts the sector layer here, for strata's
+  manifest log too; it stays in the turn log until strata's log takes it.
 - "Torn at a 512-byte multiple" uses the sector size (512) whatever the block size, since page sizes
   are multiples of 512.

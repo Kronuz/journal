@@ -11,7 +11,7 @@ Working notes for anyone changing this repository. [README.md](README.md) is for
 include/journal/
   journal.h       The per-group journal: append, checkpoint generations, recovery, migration.
   store.h         Store: the facade over both backends, with admission and inventory.
-  turn_log.h      RFTW0001, the shared turn log (D11).
+  turn_log.h      RFTW0002, the shared turn log (D11), every sector checked.
   turn_driver.h   One core's turns: groups stage records, one barrier per turn; run() and durable() as tasks.
   host.h          One directory per host: layout, group table, placement and re-partition, prefixed views.
   blocking.h      journal::run, the blocking entry, and journal::stalled.
@@ -23,8 +23,6 @@ include/journal/
   resources.h     Footprint value types and checked arithmetic.
   codec.h         On-disk encodings.
   primitives.h    Shared helpers.
-  memory_io.h     The old power-loss filesystem, kept for consensus and Detent; journal's
-                  tests run on faultlab's faultfs (a test-only FetchContent).
 test/             journal, inventory, admission, turn_log, turn_log_power (T9), driver,
                   shared_store, host, placement, completion, linux_completion.
 fuzz/             libFuzzer target for turn-log segments and checkpoint records, and its replay test.

@@ -226,9 +226,10 @@ turn already dirties.
 ## Limits
 
 - A tear inside a sector (pmem without BTT) stays outside the model; under O3 it reads as damage.
-- Under O3, a rotted sector past the newest write's end that a torn write's later sectors make the
-  scan read is reported as damage, and costs the torn turn's groups under rule 5. That needs real
-  damage on the device in an unwritten sector.
+- Under O3, the scan reads the first sector of every block of every segment, spares included, so a
+  rotted first sector in an unwritten block or a spare is damage in a gap no manifest names and
+  costs every open group (rules 1 and 3; durability review F2 of journal-turn-sector-checks). It
+  is reported, never silent, and needs real damage on the device in an unwritten sector.
 - An acknowledged sector that reads back as zeros or as its older version (a lost or remapped
   write) is outside the crash model: D4 alone reads it as the segment's end and drops every
   acknowledged turn after it silently (27,411 of 27,411 in the review's model). Q3's rule in D4
