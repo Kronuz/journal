@@ -138,6 +138,12 @@ void damage(fl::filesystem& disk, const std::string& segment, std::uint64_t posi
 	const char flipped = static_cast<char>(disk.view("host/" + segment)[offset] ^ 0x5a);
 	overwrite(disk, segment, offset, std::string_view(&flipped, 1));
 }
+// The sector holding `position` reads as never written: a write the device acknowledged and lost,
+// which no sector check catches, so only a later turn shows it (rule 6).
+void zero(fl::filesystem& disk, const std::string& segment, std::uint64_t position) {
+	const auto sector = j::turn_log_detail::sector_bytes;
+	overwrite(disk, segment, j::turn_log_detail::file_offset(position) / sector * sector, std::string(sector, '\0'));
+}
 
 // A1: bounds per group, with values. Readers: group 1 holds through 2, groups 2 and 4 through 1.
 void bounds() {
@@ -274,11 +280,11 @@ void retention() {
 // One gap over two blocks, past the newest epoch's last kept turn (rule 5). Block W holds group
 // 1's batch 2 (turn K), then the first fragment of group 2's 700-byte batch (turn T) past W's
 // first sector; W+1 holds that batch's last fragment, then group 1's batch 3 in W+1's second
-// sector. A byte flipped in batch 3, and with `both` in the first fragment too; with `later`, a
-// later turn (group 2's batch 3, 1,500 bytes) writes the gap's manifests. A flipped byte costs its
-// sector, and W+1's first sector holds W's manifest, so neither damage touches a block's first
-// sector. Nothing when no filler lays the batches so.
-std::optional<fl::filesystem> gap(bool both, bool later = false) {
+// sector. A byte flipped in batch 3, and with `both` in the first fragment too, or with `zeroed`
+// their sectors zeroed; with `later`, a later turn (group 2's batch 3, 1,500 bytes) writes the
+// gap's manifests. Damage costs its sector, and W+1's first sector holds W's manifest, so neither
+// touches a block's first sector. Nothing when no filler lays the batches so.
+std::optional<fl::filesystem> gap(bool both, bool later = false, bool zeroed = false) {
 	namespace d = j::turn_log_detail;
 	const std::uint64_t block = block_data, sector = d::sector_data;
 	for (std::size_t filler = 8; filler < 2000; ++filler) {
@@ -317,8 +323,9 @@ std::optional<fl::filesystem> gap(bool both, bool later = false) {
 		check(fragment(first, j::framing::First, head) && record(first, 2, 2), "group 2's batch 2 opens at " + std::to_string(first) + " and fills W");
 		check(fragment(last, j::framing::Last, d::record_header + 700 - head) && last + d::fragment_header + d::record_header + 700 - head == zf, "its last fragment opens W+1's data, right before batch 3");
 		check(fragment(zf, j::framing::Full, d::record_header + 40) && record(zf, 1, 3), "group 1's batch 3 is whole at " + std::to_string(zf));
-		if (both) { damage(attempt, segment, q + 10); }
-		damage(attempt, segment, z + 10);
+		const auto spoil = zeroed ? zero : damage;
+		if (both) { spoil(attempt, segment, q + 10); }
+		spoil(attempt, segment, z + 10);
 		return std::optional<fl::filesystem>(attempt.snapshot());
 	}
 	return std::nullopt;
@@ -356,9 +363,10 @@ std::string describe(const Verdict& v) {
 }
 
 // Group 1's batch 2 (3,000 bytes), then group 2's batch 2 (1,500 bytes) in the newest turn, a
-// byte in group 1's middle block flipped: the later turn proves the damage (rule 6), which bounds
-// group 1 at 2; the damaged block's manifest names only group 1, so group 2 keeps its batch.
-std::optional<fl::filesystem> dropped() {
+// byte in group 1's middle block flipped, or with `zeroed` its sector zeroed: the later turn proves
+// the damage (rule 6), which bounds group 1 at 2; the damaged block's manifest names only group 1,
+// so group 2 keeps its batch.
+std::optional<fl::filesystem> dropped(bool zeroed = false) {
 	fl::filesystem disk;
 	Records w;
 	{
@@ -369,24 +377,26 @@ std::optional<fl::filesystem> dropped() {
 		stage(*host, w, 2, j::TurnRecordKind::Batch, run('M', 1500)); commit(*host);
 	}
 	const auto [segment, offset] = find(disk, run('N', 200));
-	damage(disk, segment, middle(offset));
+	(zeroed ? zero : damage)(disk, segment, middle(offset));
 	return std::optional<fl::filesystem>(disk.snapshot());
 }
 
 // Rule-5 damage, and a power cut at every mutation of the first open after it: the open's new
-// epoch makes the damaged one an earlier epoch, whose turns past its kept turn recovery ignores,
-// so the table must hold the verdict before the open record. Every cut reopens to the uncut
-// open's bounds and losses, twice. A gap whose last block is the newest has no manifest yet and
-// loses both groups; with a later turn the gap's manifests bound both at 3; the dropped turns
-// bound group 1 at 2.
+// epoch makes the damaged one an earlier epoch. Past its kept turn recovery still reports a sector
+// that fails, but not a lost write (a zeroed sector) only a later turn showed, so the table must
+// hold the verdict before the open record. Every cut reopens to the uncut open's bounds and
+// losses, twice. A gap whose last block is the newest has no manifest yet and loses both groups;
+// with a later turn the gap's manifests bound both at 3; the dropped turns bound group 1 at 2.
 void first_open() {
 	using S = j::GroupStatus;
 	struct Expected { S status[2]; std::uint64_t bound[2]; };  // groups 1 and 2
 	const std::vector<std::tuple<std::string, std::optional<fl::filesystem> (*)(), Expected>> layouts{
 		{"batch 3", [] { return gap(false); }, {{S::lost, S::lost}, {0, 0}}},
 		{"both fragments", [] { return gap(true); }, {{S::lost, S::lost}, {0, 0}}},
-		{"dropped turns", dropped, {{S::bounded, S::stored}, {2, 0}}},
+		{"dropped turns", [] { return dropped(); }, {{S::bounded, S::stored}, {2, 0}}},
 		{"gap, later turn", [] { return gap(true, true); }, {{S::bounded, S::bounded}, {3, 3}}},
+		{"dropped turns, zeroed", [] { return dropped(true); }, {{S::bounded, S::stored}, {2, 0}}},
+		{"gap, later turn, zeroed", [] { return gap(true, true, true); }, {{S::bounded, S::bounded}, {3, 3}}},
 	};
 	for (const auto& [damaged, layout, expected] : layouts) {
 		auto base = layout();
