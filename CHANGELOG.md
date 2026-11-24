@@ -6,6 +6,27 @@ entries are dated.
 
 Upgrading a pin from before 2026-10-30: [the consumer upgrade note](https://github.com/Kronuz/cpp-libraries/blob/main/docs/UPGRADING-2026-10.md#journal) lists what changes for callers, how to find affected inputs, the commits not to pin, and the speedup.
 
+## 2026-11-24
+
+### Changed
+
+- The flush mode is the caller's: completion is pinned at `b4600a8`, whose `PosixIO` takes a
+  required `PosixIOOptions::flush_mode` (`FlushMode::plain` or `FlushMode::full`) with no
+  default, so `PosixIO(directory)` no longer compiles; pass `{FlushMode::full}` for what the
+  journal promised before on macOS. Every sync the journal makes follows that `PosixIO`'s mode,
+  the turn barrier included. On macOS `plain` makes `fsync` (survives a crash, not power loss)
+  and `full` makes `F_FULLFSYNC` everywhere, ordering points included; Linux and FreeBSD make
+  the same calls in both ([docs/mechanisms/sync-mode.md](docs/mechanisms/sync-mode.md)).
+- faultlab is pinned at `83fbde7`, whose faultfs models plain and full syncs; T9 runs in both
+  modes (`journal_turn_log_power`, `journal_turn_log_power_plain`).
+- `journal_bench` takes the mode (`journal_bench plain|full [--compare]`), and its comparator,
+  now the raw loop, flushes as the mode does; `journal_demo` takes it as its first argument.
+
+### Added
+
+- `test/sync_mode_test.cc`: a host's turn barrier and checkpoint follow its mode, the full-mode
+  refusal fails without weakening, and completion's recorded calls match faultlab's model.
+
 ## 2026-11-23
 
 ### Changed

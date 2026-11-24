@@ -271,10 +271,25 @@ checked at every crash point through both drivers (`test/shared_store_test.cc`).
 `PosixIO` resolves single-component filenames against an opened directory descriptor and
 rejects symlinks, special files, hard links, other devices, and permissions another user
 could exploit. The stable `owner.lock` gives cross-process exclusivity and is never
-replaced. Linux and FreeBSD use `fsync` on files and directories. macOS uses
-`F_FULLFSYNC` for files, and for namespace barriers a directory `fsync` followed by
-`F_FULLFSYNC` on the same-device lock file ([XNU's `fcntl(2)`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/fcntl.2)).
-Unsupported operations fail rather than weaken the contract.
+replaced. The journal makes no sync system call itself: every sync is a call on completion's
+`IO` or `File`, and `PosixIO` makes it as its flush mode names, a required
+`PosixIOOptions::flush_mode` with no default and no process-wide switch. Every file a
+`PosixIO` opens keeps its mode, so the turn barrier's `SyncData`, which a queue worker runs
+straight on the file, follows it too. Linux and FreeBSD use `fsync` (Linux: `fdatasync` for
+data barriers) in both modes. On macOS ([XNU's `fcntl(2)`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/fcntl.2)):
+
+- **`full`** uses `F_FULLFSYNC` for files and data barriers, for namespace barriers a directory
+  `fsync` followed by `F_FULLFSYNC` on the same-device lock file, and `F_FULLFSYNC` at ordering
+  points. Every acknowledged record survives power loss. An unsupported operation fails rather
+  than weakens the contract: a failed `F_FULLFSYNC` fails the call with its errno, and no
+  `fsync` replaces it.
+- **`plain`** uses `fsync` for files, data and directories, and `F_BARRIERFSYNC` at ordering
+  points. Every acknowledged record survives a process or kernel crash, but plain `fsync`
+  leaves data in the drive's cache, so power loss may lose acknowledged records; recovery
+  still reports what it cannot prove instead of inventing records.
+
+[docs/mechanisms/sync-mode.md](docs/mechanisms/sync-mode.md) has each journal sync's call per
+mode, and how the crash model and the recorded calls check it.
 
 The model assumes a local filesystem that honors atomic same-directory rename and
 successful syncs, on hardware that honors its flush contract. The fault tests exercise
@@ -292,6 +307,7 @@ interrupt every operation before and after each side effect, take both namespace
 before a barrier, restart and then cut power, corrupt every durable byte, and truncate every
 acknowledged prefix; the sync and completion drivers run the same schedules and must recover
 the same history. The turn log runs at every crash
-point with corrupted blocks (T9), and `fuzz/` fuzzes its segments and checkpoint records.
+point with corrupted blocks (T9), in both flush modes with macOS's calls (faultfs's
+`set_flush_mode`), and `fuzz/` fuzzes its segments and checkpoint records.
 The POSIX tests cover real create, append, checkpoint, reopen, locking, confinement, and
 rejection of symlinks, hard links, and special files.

@@ -16,8 +16,11 @@ and fits anyone who needs a write-ahead log with real durability barriers.
 
 ## ✨ Highlights
 
-- **Durable on return.** An append returns only after its barriers, macOS uses
-  `F_FULLFSYNC`, and an unsupported operation fails instead of weakening the contract.
+- **Durable on return, in the mode you choose.** An append returns only after its barriers.
+  The flush mode is the caller's, required where the `PosixIO` is built: on macOS `full` makes
+  every barrier an `F_FULLFSYNC` and survives power loss, and an unsupported operation fails
+  instead of weakening; `plain` makes `fsync`, which survives a crash but leaves data in the
+  drive's cache ([flush modes](#-flush-modes)).
 - **Fails closed.** Corruption anywhere in the acknowledged prefix stops recovery, and any
   uncertain I/O fences the journal until a fresh instance recovers.
 - **Checkpoints without long pauses.** Artifacts are prepared, sealed and verified before
@@ -45,13 +48,13 @@ int main() {
 	j::Identity identity{};                           // 128 bits, unique per store
 	identity[0] = 'S';
 	{
-		j::PosixIO io("store");
+		j::PosixIO io("store", {j::FlushMode::full});  // survives power loss on macOS
 		j::Journal journal(io, 1024 * 1024);          // batches of at most 1 MiB
 		journal.create(identity);
 		auto frontier = journal.append_batch("hello");  // durable on return
 		std::cout << "sequence " << frontier.sequence << '\n';  // sequence 1
 	}
-	j::PosixIO io("store");                            // after a restart
+	j::PosixIO io("store", {j::FlushMode::full});     // after a restart
 	j::Journal journal(io, 1024 * 1024);
 	journal.recover([](auto, std::string_view batch) { std::cout << batch << '\n'; });  // hello
 }
@@ -93,18 +96,38 @@ Not for:
 - **Network filesystems or storage that ignores flushes.** The durability model assumes a
   local filesystem that honors `fsync` and atomic rename.
 
+## 💾 Flush modes
+
+`PosixIOOptions::flush_mode` has no default, and every sync the journal makes follows the mode
+of the `PosixIO` under it: the turn barrier, checkpoints, directory barriers and the owner lock.
+
+| Event | `full` | `plain` |
+|---|---|---|
+| Process or kernel crash | every acknowledged record | every acknowledged record |
+| Power loss, macOS | every acknowledged record: each barrier is `F_FULLFSYNC` | nothing promised: plain `fsync` leaves data in the drive's cache |
+| Power loss, Linux and FreeBSD | as the filesystem's `fsync` | the same: both modes make the same calls |
+
+In `full` mode an unsupported operation fails instead of weakening: an `F_FULLFSYNC` that fails
+fails the append with its errno, and no `fsync` replaces it. In `plain` mode a power loss on
+macOS can lose acknowledged records; recovery still reports damage instead of inventing records.
+[docs/mechanisms/sync-mode.md](docs/mechanisms/sync-mode.md) has each sync's call per mode and
+the crash model's runs in both.
+
 ## ⚡ Performance
 
-`journal_bench --compare` appends 64 batches of 1, 32 or 256 operations of 256 bytes each and
-times each `append_batch()` until it returns durable; the table gives the median append in
-milliseconds, the range over two runs. The comparator, the *plain loop*, is what a caller writes
-without the library: one `write` and one `F_FULLFSYNC` per batch to one file, with no batch
-header, checksum, manifest or recovery. Before timing, the bench checks that the journal's
-recovered batches, the plain file and the input are the same bytes. Counted over the journal's
-192 appends on both Macs, a journal append makes three `F_FULLFSYNC` calls, one `fsync` and
-three `pwrite` calls; the plain loop makes one `F_FULLFSYNC`, so it waits about a third as long.
+`journal_bench full --compare` appends 64 batches of 1, 32 or 256 operations of 256 bytes each
+and times each `append_batch()` until it returns durable; the table gives the median append in
+milliseconds, the range over two runs, measured before flush modes, with the calls `full` makes.
+The comparator, the *raw loop*, is what a caller writes without the library: one `write` and one
+flush per batch, the call the mode makes for a data barrier (`F_FULLFSYNC` in `full`), to one
+file, with no batch header, checksum, manifest or recovery. Before timing, the bench checks that
+the journal's recovered batches, the raw file and the input are the same bytes. Counted over the
+journal's 192 appends on both Macs, a journal append makes three `F_FULLFSYNC` calls, one `fsync`
+and three `pwrite` calls; the raw loop makes one `F_FULLFSYNC`, so it waits about a third as long.
+`journal_bench plain` runs the same batches in `plain` mode
+([sync-mode.md](docs/mechanisms/sync-mode.md#cost) has both modes against main).
 
-| Operations per batch | journal, Apple M4 Pro (ms) | plain loop, M4 Pro (ms) | journal, Intel Core i9-9980HK (ms) | plain loop, i9 (ms) |
+| Operations per batch | journal, Apple M4 Pro (ms) | raw loop, M4 Pro (ms) | journal, Intel Core i9-9980HK (ms) | raw loop, i9 (ms) |
 |---:|---:|---:|---:|---:|
 | 1 | 13.0 to 15.0 | 4.0 to 4.1 | 63.0 to 63.4 | 21.0 |
 | 32 | 13.1 to 13.2 | 4.1 to 4.6 | 63.1 to 63.3 | 21.0 |
@@ -122,7 +145,7 @@ the repository root:
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target journal_bench
-./build/journal_bench --compare
+./build/journal_bench full --compare
 ```
 
 ## 📚 Documentation
@@ -147,7 +170,7 @@ ctest --test-dir build --output-on-failure
 
 The benchmarks (`journal_bench`, `journal_checkpoint_bench`, `journal_reclaim_bench`,
 `journal_turn_bench`) build with the tests, run from the repository root and write under
-`.scratch/`; `journal_bench --compare` adds the plain write-and-flush loop. Add `-DJOURNAL_FUZZ=ON` (Clang) for the libFuzzer target.
+`.scratch/`; `journal_bench full --compare` adds the raw write-and-flush loop. Add `-DJOURNAL_FUZZ=ON` (Clang) for the libFuzzer target.
 
 ## 🤝 Contributing
 
