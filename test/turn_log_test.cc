@@ -25,7 +25,7 @@
 // checkpoints supersede; stale bytes of a recycled file never read as current; each sector
 // verdict recovers by value. `turn_log_test [case]`, every case by default.
 #include "journal/turn_log.h"
-#include "journal/memory_io.h"
+#include "faultlab/faultfs.h"
 #include "completion/posix.h"
 #include <filesystem>
 #include <functional>
@@ -36,6 +36,7 @@
 
 namespace j = kronuz::journal;
 namespace d = j::turn_log_detail;
+namespace fl = kronuz::faultlab;
 
 namespace {
 int checks = 0, failures = 0;
@@ -267,8 +268,7 @@ void double_damage_copy() {
 // probe's workload: a byte in each sector written before the newest write's. Recovery reports it,
 // and a group it keeps holds every acknowledged record.
 void earlier_turn_damage(std::uint32_t block_bytes, std::uint64_t seed) {
-	namespace t = j::testing;
-	t::Disk disk; t::MemoryIO io(disk);
+	fl::filesystem disk; fl::io io(disk);
 	const j::TurnLogOptions options{8 * std::uint64_t{block_bytes}, block_bytes, 1, 3, 600};
 	j::TurnRecovery recovered; Model model; std::mt19937_64 random(seed);
 	std::uint64_t newest = 0, limit = 0;
@@ -292,7 +292,7 @@ void earlier_turn_damage(std::uint32_t block_bytes, std::uint64_t seed) {
 	const auto name = j::turn_log_detail::segment_name(newest);
 	for (std::uint64_t from = 0; from < limit; from += sector) {
 		for (const auto offset : {from + sector / 2, from + sector - 1}) {
-			t::Disk damaged = disk; t::MemoryIO damaged_io(damaged);
+			auto damaged = disk.snapshot(); fl::io damaged_io(damaged);
 			{
 				auto file = damaged_io.open_existing(name); char byte = 0; file->read_at(offset, std::span<char>(&byte, 1));
 				byte = static_cast<char>(byte ^ 0x5a); file->write_at(offset, std::string_view(&byte, 1)); file->sync();
@@ -386,17 +386,16 @@ std::vector<j::TurnRecord> probe_turn(const j::TurnLog& log, std::mt19937_64& ra
 // W's included; never silent. Every set of W's changed sectors left as they were reads as a tear.
 // Without sector checks, damage in a fragment that crosses a sector drops W silently.
 void newest_turn_damage(std::uint32_t block_bytes, std::uint64_t seed, std::map<std::string, unsigned>& tally) {
-	namespace t = j::testing;
 	const j::TurnLogOptions options{8 * std::uint64_t{block_bytes}, block_bytes, 1, 3, 600};
 	const auto at = "seed " + std::to_string(seed) + " block_bytes " + std::to_string(block_bytes);
-	t::Disk disk; t::MemoryIO io(disk); Model acknowledged, with; std::mt19937_64 random(seed);
-	Files before, after; t::Disk pre;
+	fl::filesystem disk; fl::io io(disk); Model acknowledged, with; std::mt19937_64 random(seed);
+	Files before, after; std::optional<fl::filesystem> pre;
 	for (int open = 0; open < 3; ++open) {
 		j::TurnRecovery recovered; j::TurnLog log(io, identity, recovered, options);
 		check(!recovered.damaged && recovered.groups == acknowledged, "a reopened log holds what was acknowledged: " + at);
 		for (unsigned n = open < 2 ? 20 : static_cast<unsigned>(seed % 4) * 7; n; --n) { auto b = probe_turn(log, random); log.append(b); acknowledge(acknowledged, b); log.prepare(); }
 		if (open < 2) { continue; }
-		before = files(io); pre = disk;
+		before = files(io); pre.emplace(disk.snapshot());
 		auto w = probe_turn(log, random); log.append(w);
 		after = files(io); with = acknowledged; acknowledge(with, w);
 	}
@@ -411,7 +410,7 @@ void newest_turn_damage(std::uint32_t block_bytes, std::uint64_t seed, std::map<
 	j::TurnLogGroups known; for (const auto& [group, _] : with) { known.open.push_back(group); }
 	for (const auto& [name, s] : changed) {
 		for (int n = 0; n < 3; ++n) {
-			t::Disk damaged = disk; t::MemoryIO damaged_io(damaged);
+			auto damaged = disk.snapshot(); fl::io damaged_io(damaged);
 			const auto offset = s * sector + random() % sector;
 			const char byte = static_cast<char>(after.at(name)[offset] ^ 0x5a); put(damaged_io, name, offset, std::string_view(&byte, 1));
 			const auto r = j::TurnLog::read(damaged_io, identity, options, known);
@@ -425,7 +424,7 @@ void newest_turn_damage(std::uint32_t block_bytes, std::uint64_t seed, std::map<
 	if (k <= 5) { for (std::uint64_t m = 0; m + 1 < (std::uint64_t{1} << k); ++m) { masks.push_back(m); } }
 	else { for (int i = 0; i < 32; ++i) { masks.push_back(random() & ((k >= 64 ? ~0ull : (1ull << k) - 1) & ~(1ull << (random() % k)))); } }
 	for (const auto mask : masks) {  // the sectors in the mask reach the disk; the others stay as before W
-		t::Disk torn = pre; t::MemoryIO torn_io(torn);
+		auto torn = pre.snapshot(); fl::io torn_io(torn);
 		for (std::size_t i = 0; i < k; ++i) {
 			const auto& [name, s] = changed[i];
 			if (mask >> i & 1) { put(torn_io, name, s * sector, std::string_view(after.at(name)).substr(s * sector, sector)); }
@@ -447,14 +446,13 @@ void newest_turn_damage() {
 // shares with the turn before: each of W's sectors left as before W (zeros), as all zeros, as a
 // recycled file's stale sector, or damaged.
 void sector_verdicts() {
-	namespace t = j::testing;
 	const j::TurnLogOptions options{8 * 2048, 2048, 1, 3, 600};
-	t::Disk disk; t::MemoryIO io(disk); Model acknowledged, with; Files before, after; t::Disk pre;
+	fl::filesystem disk; fl::io io(disk); Model acknowledged, with; Files before, after; std::optional<fl::filesystem> pre;
 	std::uint64_t segment = 0, kept_turn = 0, w_turn = 0, first = 0, last = 0;
 	{
 		j::TurnRecovery recovered; j::TurnLog log(io, identity, recovered, options);
 		while (log.segment() == 1 || log.position() < 900) { auto b = std::vector{record(1, log.sequence(1) + 1, 300)}; log.append(b); acknowledge(acknowledged, b); }
-		segment = log.segment(); kept_turn = log.last_turn(); before = files(io); pre = disk;
+		segment = log.segment(); kept_turn = log.last_turn(); before = files(io); pre.emplace(disk.snapshot());
 		const auto w = std::vector{record(2, 1, 1400), record(3, 1, 20)};
 		const auto start = file_at(log.position());
 		w_turn = log.append(w); after = files(io); with = acknowledged; acknowledge(with, w);
@@ -467,7 +465,7 @@ void sector_verdicts() {
 	// The host holds every group open: damage loses those recovery holds nothing of.
 	j::TurnLogGroups known; for (const auto& [group, _] : with) { known.open.push_back(group); }
 	auto read = [&](const std::function<void(j::IO&)>& change) {
-		t::Disk copy = pre; t::MemoryIO copy_io(copy);
+		auto copy = pre.snapshot(); fl::io copy_io(copy);
 		for (auto s = first; s <= last; ++s) { put(copy_io, name, s * sector, std::string_view(after.at(name)).substr(s * sector, sector)); }
 		change(copy_io);
 		return j::TurnLog::read(copy_io, identity, options, known);
@@ -497,12 +495,11 @@ void sector_verdicts() {
 // stored low 32 bits are S's; only the full 64 bits in its CRC make it stale, so W reads as torn.
 void stale_alias() {
 	if (!sectors) { return; }  // positions bind no sector without sector checks
-	namespace t = j::testing;
 	const j::TurnLogOptions options{8 * 2048, 2048, 1, 3, 600};
 	const std::uint64_t low = 5, high = low + (std::uint64_t{1} << 32);
-	struct Log { t::Disk disk; Files files; std::uint64_t first = 0, last = 0, turn = 0; };
+	struct Log { fl::filesystem disk; Files files; std::uint64_t first = 0, last = 0, turn = 0; };
 	auto write = [&](std::uint64_t segment) {
-		Log out; t::MemoryIO io(out.disk);
+		Log out; fl::io io(out.disk);
 		io.create_exclusive(d::segment_name(segment - 1)); io.sync_directory();  // the log opens `segment` next
 		j::TurnRecovery recovered; j::TurnLog log(io, identity, recovered, options);
 		check(log.segment() == segment, "the log writes the segment asked");
@@ -518,7 +515,7 @@ void stale_alias() {
 	const auto alias = std::string_view(older.files.at(d::segment_name(low))).substr(s * sector, sector);
 	const auto own = std::string_view(newer.files.at(name)).substr(s * sector, sector);
 	check(s < newer.last && alias.substr(0, 504) == own.substr(0, 504) && alias.substr(504, 4) == own.substr(504, 4), "the stale sector holds W's data and S's low 32 bits");
-	t::MemoryIO io(newer.disk); put(io, name, s * sector, alias);
+	fl::io io(newer.disk); put(io, name, s * sector, alias);
 	const auto r = j::TurnLog::read(io, identity, options);
 	check(!r.damaged && r.lost.empty() && r.last_turn == newer.turn - 1 && !r.groups.contains(2) && r.groups.at(1) == std::vector{record(1, 1, 300)}, "a sector of segment S - 2^32 reads as stale, never as current: W is torn");
 }
@@ -620,12 +617,11 @@ void staged_turns() {
 // way through the sector it shares with the turn before, half its new bytes copied, and every
 // group still reads back its acknowledged records.
 void midwrite_reads() {
-	namespace t = j::testing;
 	const std::uint64_t unit = sectors ? 504 : 512;
 	unsigned cases = 0;
 	for (std::uint32_t block : {2048u, 32768u}) {
 		for (std::uint64_t seed = 1; seed <= 4; ++seed) {
-			t::Disk disk; t::MemoryIO io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed); Model model;
+			fl::filesystem disk; fl::io io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed); Model model;
 			j::TurnLog log(io, identity, recovered, {8 * std::uint64_t{block}, block, 1, 3, 600});
 			for (unsigned n = 0; n < 100; ++n) {
 				const auto batch = probe_turn(log, random);
@@ -658,14 +654,13 @@ void midwrite_reads() {
 // 512-byte sectors and 4 KiB pages that write touches (what a device and the page cache write back),
 // and the payload. Not a check: `cost` prints them, at any format, for the A4 comparison.
 void cost() {
-	namespace t = j::testing;
 	struct Load { const char* name; std::uint32_t block; std::size_t bytes; };
 	for (const auto& load : {Load{"T9 workload", 2048, 0}, Load{"T9 workload", 4096, 0}, Load{"T9 workload", 32768, 0}, Load{"turn_bench 16 groups 50% 256 B", 32768, 256}, Load{"turn_bench 16 groups 50% 4096 B", 32768, 4096}}) {
 		const j::TurnLogOptions options{std::uint64_t{16} << 20, load.block, 1, 3, 600};
 		double advance = 0, written = 0, sectors_touched = 0, pages_touched = 0, payload = 0, turns = 0;
 		auto touched = [](std::uint64_t offset, std::size_t size, std::uint64_t unit) { return static_cast<double>(((offset + size + unit - 1) / unit - offset / unit) * unit); };
 		for (std::uint64_t seed = 1; seed <= 8; ++seed) {
-			t::Disk disk; t::MemoryIO io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed);
+			fl::filesystem disk; fl::io io(disk); j::TurnRecovery recovered; std::mt19937_64 random(seed);
 			j::TurnLog log(io, identity, recovered, options);
 			for (unsigned turn = 0; turn < 400; ++turn) {
 				std::vector<j::TurnRecord> batch;
