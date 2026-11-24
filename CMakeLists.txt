@@ -29,7 +29,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/.scratch")  # the tests' state
 	# faultlab's faultfs, the crash model the power-loss tests and fuzzers run on; test-only. It
 	# reuses the completion target declared above.
-	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG a3b71d1b9bdcfa3664dbce8725f14c07bb14845f)
+	FetchContent_Declare(faultlab GIT_REPOSITORY https://github.com/Kronuz/faultlab.git GIT_TAG 5d4df9b04d7064fc978c84d29e7db8e6789bb10c)
 	FetchContent_MakeAvailable(faultlab)
 	set(faultfs_tests journal framing turn_log_power shared_store driver host host_delete placement turn_seal sync_seam lost_bound)
 	foreach(t journal inventory admission framing turn_log turn_log_power shared_store crc_fixture driver host host_delete placement turn_seal sync_seam lost_bound)
