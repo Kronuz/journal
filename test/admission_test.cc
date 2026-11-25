@@ -23,6 +23,7 @@
 #include "journal/admission.h"
 #include <iostream>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace kronuz::journal;
@@ -224,6 +225,44 @@ void replacement_growth() {
 		"unstarted cancellation refunds all grown capacity");
 	bounded(ledger);
 }
+// An owned store at its limit whose Control appends drained part of its control pool, then
+// crashed: the recovered ledger still funds a whole replacement cycle and a checkpoint completes
+// (docs/mechanisms/admission.md, Recovery).
+void recovery() {
+	struct Case { const char* name; std::uint64_t used, control, replacement, drained; };
+	for (auto k : {Case{"R >= C", 1u << 20, 64u << 10, 512u << 10, 48u << 10}, Case{"R < C - c", 1u << 20, 256u << 10, 64u << 10, 250u << 10}}) {
+		const std::string name = k.name;
+		const AdmissionLimits owned{{k.used + k.control + k.replacement, 8192}, {k.control, 3}, {k.replacement, 4}, 64, 3};
+		Admission before(census({k.used, 10}), owned);
+		for (auto left = k.drained; left;) {
+			auto step = std::min<std::uint64_t>(left, 4096); auto permit = before.reserve(AdmissionClass::Control, {step, 0});
+			if (!permit) { check(false, name + ": control drains at the limit"); return; }
+			permit->mark_started(); permit->settle({step, 0}); left -= step;
+		}
+		auto pre = before.stats();
+		check(pre.control_available == StorageResources{k.control - k.drained, 3} && pre.replacement_available == StorageResources{k.replacement, 4},
+			name + ": before the crash the drain is control's alone");
+		check(before.reserve(AdmissionClass::Replacement, {k.replacement, 1}).has_value(), name + ": before the crash a whole replacement cycle is funded");
+		Admission after(census(pre.used), owned);
+		auto post = after.stats(); auto funding = k.control + k.replacement - k.drained, control = std::min(k.control, funding);
+		check(post.used == pre.used && post.control_available == StorageResources{control, 3} &&
+			post.replacement_available == StorageResources{funding - control, 4}, name + ": recovery funds control first, as it opens today");
+		check(after.reserve(AdmissionClass::Control, {114, 0}).has_value(), name + ": the pre-Start pack is admitted");
+		check(after.stats().control_available == StorageResources{control, 3}, name + ": the pack's cancellation refunds it");
+		auto cycle = after.reserve(AdmissionClass::Replacement, {k.replacement, 1});
+		check(cycle.has_value(), name + ": after the crash a whole replacement cycle is funded");
+		if (!cycle) { continue; }
+		auto held = after.stats();
+		check(held.control_available == StorageResources{k.control - k.drained, 3} && held.replacement_available == StorageResources{0, 3} &&
+			held.outstanding == StorageResources{k.replacement, 1}, name + ": the cycle takes the drained bytes back from control");
+		cycle->mark_started(); cycle->settle({k.replacement / 2, 1});
+		after.credit_durable_reclaim({k.replacement / 2 + k.drained, 1});
+		auto done = after.stats();
+		check(done.used == StorageResources{k.used, 10} && done.control_available == StorageResources{k.control, 3} &&
+			done.replacement_available == StorageResources{k.replacement, 4} && done.normal_ready && !done.tainted,
+			name + ": the checkpoint and its reclaim leave both pools whole");
+	}
+}
 void schedules() {
 	Admission ledger(census({100, 10}), limits); std::mt19937 random(0x504f4f4c); std::vector<StoragePermit> held;
 	for (unsigned step = 0; step < 2000; ++step) {
@@ -241,7 +280,11 @@ void schedules() {
 	held.clear(); bounded(ledger);
 }
 }
-int main() {
-	try { replacement_growth(); pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); schedules(); } catch (const std::exception& error) { check(false, error.what()); }
+int main(int argc, char** argv) {
+	// One case by name (`recovery`), or every case.
+	try {
+		if (argc > 1 && std::string_view(argv[1]) == "recovery") { recovery(); }
+		else { replacement_growth(); pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); recovery(); schedules(); }
+	} catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " admission checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }
