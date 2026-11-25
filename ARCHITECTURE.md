@@ -121,7 +121,8 @@ the final charges once the operation's barriers complete. Space returns only thr
 `credit_durable_reclaim()`, after a durable deletion. A started permit that is never
 settled taints the ledger. The journal's `bootstrap_plan()`, `append_plan()`, and
 `checkpoint_plan()` compute the footprints to reserve; `resources.h` holds the value
-types and checked arithmetic.
+types and checked arithmetic. [docs/mechanisms/admission.md](docs/mechanisms/admission.md) has the pools'
+refill, the recovery claim and what each permit spends.
 
 The checked arithmetic and the committed and reserved counters come from
 `allocators::resources`; the storage permits, the Control and Replacement pools and the
