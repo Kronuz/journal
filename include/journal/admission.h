@@ -42,6 +42,9 @@ struct AdmissionStats {
 	bool tainted = false, normal_ready = false, over_limit = false;
 };
 namespace detail {
+inline StorageResources resources_min(StorageResources a, StorageResources b) noexcept {
+	return {std::min(a.logical_bytes, b.logical_bytes), std::min(a.entries, b.entries)};
+}
 struct AdmissionState {
 	AdmissionLimits limits;
 	StorageResources control_available, replacement_available;
@@ -53,6 +56,8 @@ struct AdmissionState {
 	StorageResources control_held, replacement_held;
 	bool replacement_active = false;
 	std::size_t active_control = 0;
+	// Replacement's claim on control's available bytes after a census (docs/mechanisms/admission.md).
+	StorageResources claim;
 	StorageResources free() const {
 		auto charged = resources_add(resources_add(used(), outstanding()), resources_add(control_available, replacement_available));
 		if (!resources_fit(charged, limits.hard)) { return {}; }
@@ -60,9 +65,13 @@ struct AdmissionState {
 	}
 	void refill() {
 		for (auto pair : {std::pair{&control_available, resources_subtract(limits.control_pool, control_held)}, std::pair{&replacement_available, resources_subtract(limits.replacement_pool, replacement_held)}}) {
-			auto available = free(); auto needed = resources_subtract(pair.second, *pair.first);
-			*pair.first = resources_add(*pair.first, {std::min(available.logical_bytes, needed.logical_bytes), std::min(available.entries, needed.entries)});
+			*pair.first = resources_add(*pair.first, resources_min(free(), resources_subtract(pair.second, *pair.first)));
 		}
+		claim = resources_min(claim, resources_subtract(limits.replacement_pool, resources_add(replacement_held, replacement_available)));
+	}
+	// The part of `need` a Replacement takes from control: what its pool lacks, within the claim.
+	StorageResources claimed(StorageResources need) const {
+		return resources_min(resources_min(claim, control_available), resources_subtract(need, resources_min(need, replacement_available)));
 	}
 	AdmissionStats stats() const noexcept {
 		AdmissionStats result{used(), control_available, replacement_available, outstanding(), tickets, tainted};
@@ -85,9 +94,9 @@ public:
 	StoragePermit(const StoragePermit&) = delete;
 	StoragePermit& operator=(const StoragePermit&) = delete;
 	StoragePermit(StoragePermit&& other) noexcept
-		: state_(std::move(other.state_)), reservation_(std::move(other.reservation_)), class_(other.class_), started_(other.started_) {}
+		: state_(std::move(other.state_)), reservation_(std::move(other.reservation_)), class_(other.class_), claimed_(other.claimed_), started_(other.started_) {}
 	StoragePermit& operator=(StoragePermit&& other) noexcept {
-		if (this != &other) { release(); state_ = std::move(other.state_); reservation_ = std::move(other.reservation_); class_ = other.class_; started_ = other.started_; }
+		if (this != &other) { release(); state_ = std::move(other.state_); reservation_ = std::move(other.reservation_); class_ = other.class_; claimed_ = other.claimed_; started_ = other.started_; }
 		return *this;
 	}
 	~StoragePermit() { release(); }
@@ -107,7 +116,7 @@ public:
 		}
 		auto state = state_;
 		try {
-			auto refund = refund_values(detail::resources_subtract(peak(), added));
+			auto refund = refund_values(detail::resources_subtract(peak(), added), false);
 			state_->book->settle(reservation_, detail::resource_vector(added), detail::resource_vector(removed));
 			apply_refund(refund);
 			finish(); state_.reset(); state->refill();
@@ -118,20 +127,26 @@ public:
 	void abandon() noexcept { if (state_) { started_ = true; release(); } }
 private:
 	friend class Admission;
-	StoragePermit(std::shared_ptr<detail::AdmissionState> state, allocators::Reservation<2> reservation, AdmissionClass kind)
-		: state_(std::move(state)), reservation_(std::move(reservation)), class_(kind) {}
+	StoragePermit(std::shared_ptr<detail::AdmissionState> state, allocators::Reservation<2> reservation, AdmissionClass kind, StorageResources claimed)
+		: state_(std::move(state)), reservation_(std::move(reservation)), class_(kind), claimed_(claimed) {}
 	struct Refund {
-		StorageResources control_held, control_available, replacement_held, replacement_available;
+		StorageResources control_held, control_available, replacement_held, replacement_available, claim;
 	};
-	Refund refund_values(StorageResources unused) const {
-		Refund value{state_->control_held, state_->control_available, state_->replacement_held, state_->replacement_available};
+	// A cancellation returns what the permit claimed to control, as far as control lacks it; a
+	// settlement leaves it replacement's.
+	Refund refund_values(StorageResources unused, bool cancelled) const {
+		Refund value{state_->control_held, state_->control_available, state_->replacement_held, state_->replacement_available, state_->claim};
 		if (class_ == AdmissionClass::Control) {
 			value.control_held = detail::resources_subtract(value.control_held, peak());
 			value.control_available = detail::resources_add(value.control_available, unused);
 		}
 		if (class_ == AdmissionClass::Replacement) {
+			auto lacking = detail::resources_subtract(state_->limits.control_pool, detail::resources_add(value.control_held, value.control_available));
+			auto returned = cancelled ? detail::resources_min(claimed_, lacking) : StorageResources{};
 			value.replacement_held = detail::resources_subtract(value.replacement_held, peak());
-			value.replacement_available = detail::resources_add(value.replacement_available, unused);
+			value.replacement_available = detail::resources_add(value.replacement_available, detail::resources_subtract(unused, returned));
+			value.control_available = detail::resources_add(value.control_available, returned);
+			value.claim = detail::resources_add(value.claim, returned);
 		}
 		return value;
 	}
@@ -140,6 +155,7 @@ private:
 		state_->control_available = value.control_available;
 		state_->replacement_held = value.replacement_held;
 		state_->replacement_available = value.replacement_available;
+		state_->claim = value.claim;
 	}
 	void finish() noexcept {
 		--state_->tickets;
@@ -150,7 +166,7 @@ private:
 		if (!state_) { return; }
 		if (started_) { state_->tainted = true; }
 		else {
-			try { auto refund = refund_values(peak()); state_->book->cancel(reservation_); apply_refund(refund); state_->refill(); }
+			try { auto refund = refund_values(peak(), true); state_->book->cancel(reservation_); apply_refund(refund); state_->refill(); }
 			catch (...) { state_->tainted = true; }
 		}
 		reservation_.abandon();
@@ -159,6 +175,7 @@ private:
 	std::shared_ptr<detail::AdmissionState> state_;
 	allocators::Reservation<2> reservation_;
 	AdmissionClass class_;
+	StorageResources claimed_;
 	bool started_ = false;
 };
 
@@ -174,7 +191,11 @@ public:
 			throw std::invalid_argument("unready census or invalid storage admission limits");
 		}
 		state_ = std::make_shared<detail::AdmissionState>(); state_->limits = limits;
-		state_->book.emplace(detail::resource_vector(limits.hard), detail::resource_vector({inventory.logical_bytes, inventory.entries})); state_->refill();
+		state_->book.emplace(detail::resource_vector(limits.hard), detail::resource_vector({inventory.logical_bytes, inventory.entries}));
+		// The census cannot tell which pool a deficit came from: control is funded first, and
+		// replacement claims what replacement-first funding would have given it beyond that.
+		auto funding = state_->free(); state_->refill();
+		state_->claim = detail::resources_subtract(detail::resources_min(limits.replacement_pool, funding), state_->replacement_available);
 	}
 	Admission(const Admission&) = delete;
 	Admission& operator=(const Admission&) = delete;
@@ -190,12 +211,20 @@ public:
 		auto remaining_replacement = state_->replacement_active ? 0u : 1u;
 		if ((kind == AdmissionClass::Normal && state_->tickets >= state_->limits.maximum_tickets - remaining_control - remaining_replacement) ||
 			(kind == AdmissionClass::Control && state_->tickets >= state_->limits.maximum_tickets - (state_->replacement_active ? 0 : 1))) { return std::nullopt; }
-		auto available = kind == AdmissionClass::Normal ? state_->free() :
-			(kind == AdmissionClass::Control ? state_->control_available : state_->replacement_available);
-		if ((kind == AdmissionClass::Normal && !state_->stats().normal_ready) ||
-			(kind == AdmissionClass::Replacement && state_->replacement_active) || !detail::resources_fit(peak, available)) { return std::nullopt; }
 		auto control_available = state_->control_available;
 		auto replacement_available = state_->replacement_available;
+		auto claim = state_->claim;
+		StorageResources taken;
+		if (kind == AdmissionClass::Replacement) {
+			taken = state_->claimed(peak);
+			control_available = detail::resources_subtract(control_available, taken);
+			replacement_available = detail::resources_add(replacement_available, taken);
+			claim = detail::resources_subtract(claim, taken);
+		}
+		auto available = kind == AdmissionClass::Normal ? state_->free() :
+			(kind == AdmissionClass::Control ? control_available : replacement_available);
+		if ((kind == AdmissionClass::Normal && !state_->stats().normal_ready) ||
+			(kind == AdmissionClass::Replacement && state_->replacement_active) || !detail::resources_fit(peak, available)) { return std::nullopt; }
 		auto control_held = state_->control_held;
 		auto replacement_held = state_->replacement_held;
 		if (kind == AdmissionClass::Control) {
@@ -212,9 +241,10 @@ public:
 		state_->replacement_available = replacement_available;
 		state_->control_held = control_held;
 		state_->replacement_held = replacement_held;
+		state_->claim = claim;
 		if (kind == AdmissionClass::Control) { ++state_->active_control; }
 		if (kind == AdmissionClass::Replacement) { state_->replacement_active = true; }
-		++state_->tickets; return StoragePermit(state_, std::move(*reservation), kind);
+		++state_->tickets; return StoragePermit(state_, std::move(*reservation), kind, taken);
 	}
 	// Grow the same protected ticket, including after known preparation IO.
 	bool grow_replacement(StoragePermit& permit, StorageResources minimum) {
@@ -225,12 +255,16 @@ public:
 		StorageResources target{std::max(minimum.logical_bytes, permit.peak().logical_bytes),
 			std::max(minimum.entries, permit.peak().entries)};
 		auto delta = detail::resources_subtract(target, permit.peak());
-		if (!detail::resources_fit(delta, state_->replacement_available)) { return false; }
+		auto taken = state_->claimed(delta);
+		auto spendable = detail::resources_add(state_->replacement_available, taken);
+		if (!detail::resources_fit(delta, spendable)) { return false; }
 		auto held = detail::resources_add(state_->replacement_held, delta);
-		auto available = detail::resources_subtract(state_->replacement_available, delta);
-		if (!state_->book->try_grow(permit.reservation_, detail::resource_vector(target), detail::resource_vector(state_->replacement_available))) { return false; }
+		if (!state_->book->try_grow(permit.reservation_, detail::resource_vector(target), detail::resource_vector(spendable))) { return false; }
+		state_->control_available = detail::resources_subtract(state_->control_available, taken);
+		state_->claim = detail::resources_subtract(state_->claim, taken);
+		permit.claimed_ = detail::resources_add(permit.claimed_, taken);
 		state_->replacement_held = held;
-		state_->replacement_available = available;
+		state_->replacement_available = detail::resources_subtract(spendable, delta);
 		return true;
 	}
 	void credit_durable_reclaim(StorageResources removed) {

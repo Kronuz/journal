@@ -56,7 +56,12 @@ void pools() {
 	check(ledger.stats().control_available == limits.control_pool, "pre-IO cancellation returns its originating protected reservation"); bounded(ledger);
 	Admission pressure(census({950, 95}), limits);
 	check(!pressure.stats().normal_ready && pressure.stats().control_available == StorageResources{50, 5} && pressure.stats().replacement_available == StorageResources{}, "partial startup funds control first and reports pressure");
-	check(!pressure.reserve(AdmissionClass::Normal, {1, 1}) && !pressure.reserve(AdmissionClass::Replacement, {1, 1}), "pressure refuses new normal and unfunded replacement work");
+	check(!pressure.reserve(AdmissionClass::Normal, {1, 1}), "pressure refuses new normal work");
+	{
+		auto claimed = pressure.reserve(AdmissionClass::Replacement, {1, 1});
+		check(claimed && pressure.stats().control_available == StorageResources{49, 4}, "after a census replacement work spends its claim on control");
+	}
+	check(pressure.stats().control_available == StorageResources{50, 5} && pressure.stats().replacement_available == StorageResources{}, "its cancellation returns the claim to control");
 	{ auto partial = pressure.reserve(AdmissionClass::Control, {50, 5}); check(partial.has_value(), "funded partial control permit remains usable"); bounded(pressure); }
 	for (auto over : {StorageResources{1001, 0}, StorageResources{0, 101}, StorageResources{std::numeric_limits<std::uint64_t>::max(), 1}}) {
 		Admission startup(census(over), limits);
@@ -263,6 +268,55 @@ void recovery() {
 			name + ": the checkpoint and its reclaim leave both pools whole");
 	}
 }
+// The recovery claim's transitions by value (docs/mechanisms/admission.md, Recovery).
+void claim() {
+	Admission recovered(census({700, 70}), limits);
+	check(recovered.stats().control_available == StorageResources{100, 10} && recovered.stats().replacement_available == StorageResources{200, 20},
+		"a census funds control first");
+	{
+		auto cycle = recovered.reserve(AdmissionClass::Replacement, {250, 25});
+		check(cycle && recovered.stats().control_available == StorageResources{50, 5} && recovered.stats().replacement_available == StorageResources{}, "a reservation spends its pool, then the claim");
+		bounded(recovered);
+	}
+	check(recovered.stats().control_available == StorageResources{100, 10} && recovered.stats().replacement_available == StorageResources{200, 20} && !recovered.stats().tainted,
+		"a cancelled reservation returns its claim to control");
+	auto cycle = recovered.reserve(AdmissionClass::Replacement, {200, 20});
+	check(cycle && recovered.stats().control_available == StorageResources{100, 10}, "a reservation its pool funds takes nothing from control");
+	check(recovered.grow_replacement(*cycle, {300, 30}) && recovered.stats().control_available == StorageResources{}, "growth spends the claim");
+	check(!recovered.grow_replacement(*cycle, {301, 31}) && cycle->peak() == StorageResources{300, 30}, "growth never passes the replacement pool");
+	cycle->mark_started(); cycle->settle({150, 15});
+	check(recovered.stats().control_available == StorageResources{} && recovered.stats().replacement_available == StorageResources{150, 15}, "a settlement leaves the claimed bytes replacement's");
+	recovered.credit_durable_reclaim({250, 25});
+	check(recovered.stats().normal_ready && recovered.stats().control_available == StorageResources{100, 10} && recovered.stats().replacement_available == StorageResources{300, 30},
+		"reclaim refills control first and makes both pools whole"); bounded(recovered);
+	{
+		auto drain = recovered.reserve(AdmissionClass::Control, {60, 6}); drain->mark_started(); drain->settle({60, 6});
+		auto whole = recovered.reserve(AdmissionClass::Replacement, {300, 30}); whole->mark_started(); whole->settle({300, 30});
+	}
+	check(recovered.stats().control_available == StorageResources{40, 4} && recovered.stats().replacement_available == StorageResources{} &&
+		!recovered.reserve(AdmissionClass::Replacement, {1, 1}), "once replacement was whole the claim is gone: a live deficit takes nothing from control");
+	// Control drained by (30, 3) and a checkpoint's (20, 2) staged at the crash: reclaiming the staged
+	// files leaves the claim at the drain, and the cycle takes exactly that back.
+	Admission staged(census({650, 65}), limits);
+	check(staged.stats().control_available == StorageResources{100, 10} && staged.stats().replacement_available == StorageResources{250, 25}, "staged files charge the census");
+	staged.credit_durable_reclaim({20, 2});
+	check(staged.stats().replacement_available == StorageResources{270, 27}, "reclaimed staged files refill replacement");
+	check(!staged.reserve(AdmissionClass::Replacement, {301, 31}), "the refill caps the claim: a reservation never passes the replacement pool");
+	auto republish = staged.reserve(AdmissionClass::Replacement, {300, 30});
+	check(republish && staged.stats().control_available == StorageResources{70, 7}, "the claim is the drain alone after the staged reclaim");
+	republish.reset();
+	{
+		auto taking = staged.reserve(AdmissionClass::Replacement, {300, 30});
+		staged.credit_durable_reclaim({30, 3});
+		check(staged.stats().control_available == StorageResources{100, 10}, "a reclaim during the cycle refills control");
+	}
+	check(staged.stats().control_available == StorageResources{100, 10} && staged.stats().replacement_available == StorageResources{300, 30} && !staged.stats().tainted,
+		"a cancellation returns only what control lacks"); bounded(staged);
+	Admission live(census({600, 60}), limits);
+	{ auto whole = live.reserve(AdmissionClass::Replacement, {300, 30}); whole->mark_started(); whole->settle({300, 30}); }
+	check(live.stats().replacement_available == StorageResources{} && live.stats().control_available == StorageResources{100, 10} &&
+		!live.reserve(AdmissionClass::Replacement, {1, 1}), "a census with both pools whole has no claim");
+}
 void schedules() {
 	Admission ledger(census({100, 10}), limits); std::mt19937 random(0x504f4f4c); std::vector<StoragePermit> held;
 	for (unsigned step = 0; step < 2000; ++step) {
@@ -284,7 +338,7 @@ int main(int argc, char** argv) {
 	// One case by name (`recovery`), or every case.
 	try {
 		if (argc > 1 && std::string_view(argv[1]) == "recovery") { recovery(); }
-		else { replacement_growth(); pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); recovery(); schedules(); }
+		else { replacement_growth(); pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); recovery(); claim(); schedules(); }
 	} catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " admission checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }
