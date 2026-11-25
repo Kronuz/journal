@@ -49,9 +49,19 @@ pools, and nothing refilled at the limit: it never compacted again.
 The rule spends control's bytes only when a replacement cycle asks, so a group that needs a Control
 pack before it can start still gets the control share it got before. Funding replacement first at
 construction would have refused that pack to every store with `T` below `replacement_pool` plus
-the pack. A claim taken from control can leave Control permits short while the cycle runs; the
-cycle's reclaim refills control first.
+the pack.
+
+The trade: while a claimed cycle runs, control is short by what the cycle took, until the cycle's
+reclaim refills control first. Before this rule that Replacement was refused and control stayed
+whole; now the Replacement is admitted and a later Control permit can be refused. Consensus's
+install cutover is one: `request_install` reserves its Control cutover permit after the
+snapshot's Replacement, so it can return Pressure where the snapshot's Replacement used to be
+refused. No store loses an operation it has today: the claim is spent only by a Replacement the
+old split refused.
 
 Tests: `test/admission_test.cc` `recovery` (the review probe's two drained stores: Replacement(R)
-admitted after the census, the checkpoint and reclaim leave both pools whole) and `claim` (each
-event above by value).
+admitted after the census, the checkpoint and reclaim leave both pools whole), `claim` (each
+event above by value, and the claim's formula on a census short of control) and
+`short_schedules` (random schedules over short censuses: each pool's bound, the hard limit and
+the cancel round trip after every step). `test/admission_mutants.py` holds the claim's mutants
+these cases kill.
