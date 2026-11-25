@@ -22,6 +22,7 @@
 
 #include "journal/admission.h"
 #include <iostream>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -316,6 +317,93 @@ void claim() {
 	{ auto whole = live.reserve(AdmissionClass::Replacement, {300, 30}); whole->mark_started(); whole->settle({300, 30}); }
 	check(live.stats().replacement_available == StorageResources{} && live.stats().control_available == StorageResources{100, 10} &&
 		!live.reserve(AdmissionClass::Replacement, {1, 1}), "a census with both pools whole has no claim");
+	// T = (50, 5) < C: the claim is min(R, T) - ra = (50, 5), not replacement's whole deficit. A
+	// reclaim of (100, 10) fills control, then (50, 5) of replacement; the claim stays (50, 5).
+	Admission thin(census({950, 95}), limits);
+	thin.credit_durable_reclaim({100, 10});
+	check(thin.stats().control_available == StorageResources{100, 10} && thin.stats().replacement_available == StorageResources{50, 5},
+		"a reclaim after a thin census fills control, then replacement");
+	check(!thin.reserve(AdmissionClass::Replacement, {150, 15}), "the claim is min(R, T) minus replacement's share, not its whole deficit");
+	auto funded = thin.reserve(AdmissionClass::Replacement, {100, 10});
+	check(funded && thin.stats().control_available == StorageResources{50, 5} && thin.stats().replacement_available == StorageResources{},
+		"a reservation within the claim takes exactly the claim from control");
+}
+// Random schedules over censuses short of the pools: after every step each pool and the hard limit
+// keep their bounds against the live permits, and a reserve/grow/cancel episode round-trips stats.
+void short_schedules() {
+	using detail::resources_add, detail::resources_fit, detail::resources_min, detail::resources_subtract;
+	std::mt19937_64 random(0x434c41494d);
+	auto pick = [&](StorageResources upto) { return StorageResources{random() % (upto.logical_bytes + 1), random() % (upto.entries + 1)}; };
+	struct Held { StoragePermit permit; AdmissionClass kind; };
+	for (unsigned seed = 0; seed < 3000; ++seed) {
+		const StorageResources C{1 + random() % 50, 1 + random() % 5}, R{1 + random() % 80, 1 + random() % 8};
+		const auto hard = resources_add(resources_add(C, R), {random() % 60, random() % 6});
+		const AdmissionLimits shape{hard, C, R, 8, 1 + random() % 2};
+		// From whole pools (used = hard - C - R) to empty ones, and now and then over the limit.
+		auto opening = [&] {
+			return random() % 8 == 0 ? pick(resources_add(hard, {3, 1})) : resources_add(resources_subtract(hard, resources_add(C, R)), pick(resources_add(C, R)));
+		};
+		std::optional<Admission> ledger; std::vector<Held> held; std::optional<AdmissionStats> episode;
+		// A close (or crash) and a new census; held permits stay with the old ledger and cancel there.
+		auto reopen = [&](StorageResources used) {
+			ledger.emplace(census(used), shape); held.clear(); episode.reset();
+			auto T = resources_fit(used, hard) ? resources_subtract(hard, used) : StorageResources{};
+			return ledger->stats().control_available == resources_min(C, T);
+		};
+		bool opened = reopen(opening());
+		for (unsigned step = 0; step < 200; ++step) {
+			if (!episode && held.empty() && random() % 6 == 0) { episode = ledger->stats(); }
+			auto roll = random() % 100;
+			if (episode) { roll = random() % 3 == 0 ? 70 + random() % 20 : random() % 55; }  // reserve, grow or cancel only
+			if (roll < 50) {
+				auto kind = roll < 25 ? AdmissionClass::Replacement : (roll < 42 ? AdmissionClass::Control : AdmissionClass::Normal);
+				auto peak = pick(kind == AdmissionClass::Replacement ? resources_add(R, {2, 1}) : (kind == AdmissionClass::Control ? resources_add(C, {1, 1}) : StorageResources{30, 3}));
+				if (peak == StorageResources{}) { peak = {1, 0}; }
+				if (auto permit = ledger->reserve(kind, peak)) { held.push_back({std::move(*permit), kind}); }
+			} else if (roll < 55) {
+				for (auto& h : held) {
+					if (h.kind == AdmissionClass::Replacement) { ledger->grow_replacement(h.permit, resources_add(h.permit.peak(), pick({20, 3}))); break; }
+				}
+			} else if (roll < 70) {
+				if (!held.empty()) {
+					auto i = random() % held.size(); auto& h = held[i]; auto used = ledger->stats().used;
+					h.permit.mark_started();
+					h.permit.settle(pick(h.permit.peak()), h.kind == AdmissionClass::Replacement ? resources_min(pick(used), used) : StorageResources{});
+					held.erase(held.begin() + static_cast<long>(i));
+				}
+			} else if (roll < 90) {
+				if (!held.empty()) { held.erase(held.begin() + static_cast<long>(random() % held.size())); }  // before IO: a cancellation
+			} else if (roll < 97) {
+				ledger->credit_durable_reclaim(pick(ledger->stats().used));
+			} else {
+				opened = reopen(random() % 2 ? ledger->stats().used : opening());
+			}
+			auto s = ledger->stats(); StorageResources control_held, replacement_held, outstanding;
+			for (auto& h : held) {
+				outstanding = resources_add(outstanding, h.permit.peak());
+				if (h.kind == AdmissionClass::Control) { control_held = resources_add(control_held, h.permit.peak()); }
+				if (h.kind == AdmissionClass::Replacement) { replacement_held = resources_add(replacement_held, h.permit.peak()); }
+			}
+			const auto where = "seed " + std::to_string(seed) + " step " + std::to_string(step) + ": ";
+			bool ok = true;
+			auto holds = [&](bool value, const char* what) { ++checks; if (!value && ok) { ok = false; check(false, where + what); } };
+			holds(opened, "a census funds control first, as today");
+			holds(s.outstanding == outstanding && s.tickets == held.size(), "outstanding and tickets match the live permits");
+			holds(resources_fit(resources_add(s.control_available, control_held), C), "control never passes its pool");
+			holds(resources_fit(resources_add(s.replacement_available, replacement_held), R), "replacement never passes its pool");
+			if (resources_fit(resources_add(s.used, s.outstanding), hard)) {
+				holds(resources_fit(resources_add(resources_add(s.used, s.outstanding), resources_add(s.control_available, s.replacement_available)), hard), "the pools fit the hard limit");
+			}
+			holds(!s.tainted, "known outcomes never taint");
+			if (episode && held.empty()) {
+				holds(s.used == episode->used && s.control_available == episode->control_available && s.replacement_available == episode->replacement_available &&
+					s.outstanding == episode->outstanding && s.tickets == episode->tickets && s.normal_ready == episode->normal_ready,
+					"reserve, grow and cancel round-trip the ledger");
+				episode.reset();
+			}
+			if (!ok) { break; }
+		}
+	}
 }
 void schedules() {
 	Admission ledger(census({100, 10}), limits); std::mt19937 random(0x504f4f4c); std::vector<StoragePermit> held;
@@ -335,10 +423,13 @@ void schedules() {
 }
 }
 int main(int argc, char** argv) {
-	// One case by name (`recovery`), or every case.
+	// One case by name (`recovery`, `claim`, `short_schedules`), or every case.
 	try {
-		if (argc > 1 && std::string_view(argv[1]) == "recovery") { recovery(); }
-		else { replacement_growth(); pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); recovery(); claim(); schedules(); }
+		const std::string_view only = argc > 1 ? argv[1] : "";
+		if (only == "recovery") { recovery(); }
+		else if (only == "claim") { claim(); }
+		else if (only == "short_schedules") { short_schedules(); }
+		else { replacement_growth(); pools(); uncertainty(); slots(); interleaved_replacement(); control_pack_slots(); recovery(); claim(); short_schedules(); schedules(); }
 	} catch (const std::exception& error) { check(false, error.what()); }
 	std::cout << checks << " admission checks, " << failures << " failures\n"; return failures ? 1 : 0;
 }
