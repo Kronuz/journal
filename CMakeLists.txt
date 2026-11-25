@@ -6,16 +6,16 @@ project(journal LANGUAGES CXX)
 include(FetchContent)
 # The coroutine drivers run on task (blocking_scheduler, the wheel). Declared first, so this pin
 # wins over the one completion declares (task:18eb516, an ancestor of this pin); no Asio.
-FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 95798a02f68c86f070401329a05c78d326ac2579)
+FetchContent_Declare(task GIT_REPOSITORY https://github.com/Kronuz/task.git GIT_TAG 477a7d3f15a8951f2047616b834753177d838a8b)
 set(TASK_ASIO OFF)
 # completion::task: completion_ref, InlineCompletion and HeldCompletion over task.hh.
 set(COMPLETION_TASK ON)
 set(COMPLETION_ASIO OFF)
-FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG b4600a82a8d30d4f63541d9c322a4ac5eceaee95)
+FetchContent_Declare(completion GIT_REPOSITORY https://github.com/Kronuz/completion.git GIT_TAG 30615161bebf6adb8297a8a16b338cb1952ce692)
 # Fixed-vector reservation accounting shared with managed local storage.
-FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG 07de45d180f23e2552b9504a6b4d506651594d1e)
+FetchContent_Declare(allocators GIT_REPOSITORY https://github.com/Kronuz/allocators.git GIT_TAG ae775ab995db8e9875e97eae0f01cf634383cd97)
 # CRC-32C: one implementation, header-only, no dependencies.
-FetchContent_Declare(crc32c GIT_REPOSITORY https://github.com/Kronuz/crc32c.git GIT_TAG 0d5460d277170e92f33ffc148746f1a7c03eabe1)
+FetchContent_Declare(crc32c GIT_REPOSITORY https://github.com/Kronuz/crc32c.git GIT_TAG 52889db30c9902c3ca42c932a4e6f4ca4f8da87b)
 FetchContent_MakeAvailable(completion allocators crc32c)
 
 add_library(journal INTERFACE)
